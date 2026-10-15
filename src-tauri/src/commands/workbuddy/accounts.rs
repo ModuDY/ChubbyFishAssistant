@@ -10,9 +10,9 @@ use crate::state::AppState;
 
 use super::cli::{load_cli_rotate_state, save_cli_rotate_state};
 use super::common::{
-    account_id_of, as_str, as_ts_seconds, auth_file_path_of, extract_access_token, is_running,
-    load_pool, save_pool, snapshot_json_path, upsert_token_store, wb_data_dir, wb_renew_locks,
-    WorkBuddyAccount, WbPool,
+    account_id_of, as_str, as_ts_seconds, auth_file_path_of, dig_plain_string,
+    extract_access_token, is_running, load_pool, save_pool, snapshot_json_path, upsert_token_store,
+    wb_data_dir, wb_renew_locks, WorkBuddyAccount, WbPool,
 };
 
 // ── 数据结构 ────────────────────────────────────────────────────────────────
@@ -278,10 +278,11 @@ pub fn workbuddy_scan_auth_file(state: State<AppState>) -> Result<Option<WorkBud
     Ok(Some(WorkBuddyScanResult {
         id,
         uid,
-        nickname: as_str(fs_utils::dig(&raw, &["nickname", "displayName", "name"])).unwrap_or_default(),
+        // 5.8.2+ nickname 同样可能是 $wbEncrypted 包装，走透明解密
+        nickname: dig_plain_string(&raw, &["nickname", "displayName", "name"]).unwrap_or_default(),
         edition_type: as_str(fs_utils::dig(&raw, &["editionType", "edition"])).unwrap_or_default(),
         has_access_token: true,
-        has_refresh_token: as_str(fs_utils::dig(&raw, &["refreshToken", "refresh_token"])).is_some(),
+        has_refresh_token: dig_plain_string(&raw, &["refreshToken", "refresh_token"]).is_some(),
         // expires 键对齐 creds_of 超集：as_ts_seconds 自动识别毫秒级（>1e12 折算秒）
         access_token_expires_at: as_ts_seconds(fs_utils::dig(
             &raw,
@@ -428,12 +429,13 @@ pub fn workbuddy_account_import_auth(state: State<AppState>, name: Option<String
     let raw = fs_utils::read_json::<serde_json::Value>(&path);
     // token 键对齐 creds_of 超集 + 失败分类报错（issue #58，与 scan 同口径）
     let access = extract_access_token(&raw)?;
-    let refresh = as_str(fs_utils::dig(&raw, &["refreshToken", "refresh_token"]));
+    // 5.8.2+ refreshToken 为 $wbEncrypted 包装时透明解密
+    let refresh = dig_plain_string(&raw, &["refreshToken", "refresh_token"]);
     let id = account_id_of(&access);
     let uid = as_str(fs_utils::dig(&raw, &["uid"])).unwrap_or_default();
     let nickname = name
         .clone()
-        .or_else(|| as_str(fs_utils::dig(&raw, &["nickname", "displayName", "name"])))
+        .or_else(|| dig_plain_string(&raw, &["nickname", "displayName", "name"]))
         .unwrap_or_else(|| uid.chars().take(8).collect());
 
     // 池读-改-写互斥（wb_pool_lock）：仅罩住池段；凭证副本落库（token store 锁）在锁外
@@ -552,7 +554,8 @@ pub fn workbuddy_refresh_token(
         let fuid = as_str(fs_utils::dig(&auth_raw, &["uid"]));
         if fuid.as_deref() == Some(acct.uid.as_str()) && !acct.uid.is_empty() {
             (
-                as_str(fs_utils::dig(&auth_raw, &["refreshToken", "refresh_token"])),
+                // 5.8.2+ auth 文件 refreshToken 为加密包装，透明解密后参与新旧取源比较
+                dig_plain_string(&auth_raw, &["refreshToken", "refresh_token"]),
                 as_ts_seconds(fs_utils::dig(&auth_raw, &["refreshExpiresAt", "refresh_expires_at"]))
                     .or_else(|| as_ts_seconds(fs_utils::dig(&auth_raw, &["expiresAtMs", "expiresAt"]))),
             )
@@ -1104,6 +1107,34 @@ mod tests {
     fn extract_access_token_envelope_hit() {
         let raw = serde_json::json!({ "auth": { "accessToken": "tok-1" } });
         assert_eq!(extract_access_token(&raw).unwrap(), "tok-1");
+    }
+
+    /// 5.8.2+ 静态加密包装：auth.accessToken 为 object 时透明解出明文（合成信封，
+    /// DEK 为测试注入；不触碰真机 keyblob/凭证），不再误报「值为 object 请重新登录」
+    #[test]
+    fn extract_access_token_encrypted_wrapper_decrypts() {
+        let wrapped =
+            super::super::atrest::wrapped_field_value("tok-synthetic-encrypted-9f3k");
+        let raw = serde_json::json!({
+            "auth": { "accessToken": wrapped, "refreshToken": null },
+            "account": { "uid": "u-syn-1" }
+        });
+        assert_eq!(extract_access_token(&raw).unwrap(), "tok-synthetic-encrypted-9f3k");
+
+        // 透明解密辅助同样适用于 refreshToken / nickname
+        let refresh_wrapped = super::super::atrest::wrapped_field_value("rt-synthetic-77");
+        let raw2 = serde_json::json!({
+            "auth": { "refreshToken": refresh_wrapped },
+            "account": { "nickname": super::super::atrest::wrapped_field_value("昵称-合成") }
+        });
+        assert_eq!(
+            super::super::common::dig_plain_string(&raw2, &["refreshToken", "refresh_token"]),
+            Some("rt-synthetic-77".into())
+        );
+        assert_eq!(
+            super::super::common::dig_plain_string(&raw2, &["nickname", "displayName", "name"]),
+            Some("昵称-合成".into())
+        );
     }
 
     /// 候选键全未命中：保留「结构可能已变更」+ 键名诊断（含类型）

@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use tauri::{AppHandle, State};
 
+use super::atrest;
 use crate::fs_utils;
 use crate::state::AppState;
 
@@ -256,6 +257,18 @@ pub(super) fn as_str(v: Option<&serde_json::Value>) -> Option<String> {
     v.and_then(|x| x.as_str()).map(|s| s.to_string())
 }
 
+/// dig 候选键并透明解开 WorkBuddy 5.8.2+ 静态加密包装：
+/// 普通字符串原样返回；命中 `{$wbEncrypted:1,envelope}` 用本机 DEK 解出明文；
+/// null/其他类型/解密失败 → None（仅用于非致命字段 refreshToken/nickname，
+/// 失败不阻断主流程；accessToken 的失败分类走 extract_access_token）。
+pub(super) fn dig_plain_string(raw: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    let v = fs_utils::dig(raw, keys)?;
+    if let Ok(Some(plain)) = atrest::decrypt_if_wrapped(v) {
+        return Some(plain);
+    }
+    v.as_str().map(|s| s.to_string())
+}
+
 pub(super) fn as_ts_seconds(v: Option<&serde_json::Value>) -> Option<i64> {
     let raw = v?;
     if let Some(ms) = raw.as_i64() {
@@ -311,11 +324,30 @@ pub(super) fn auth_key_names(raw: &serde_json::Value) -> String {
 
 /// auth 文件 access token 提取 + 失败原因分类（issue #58）：
 /// 对候选键逐个 dig，命中即决（语义与 dig 一致，null 不回退尝试后续候选键，避免误采其他 token 字段串号）：
-/// 命中且为非空字符串 → Ok；命中但为 null/非字符串/空串 → 「未登录/凭证为空」类错误（不再误报结构变更）；
+/// 命中且为非空字符串 → Ok；命中 `{$wbEncrypted:1,envelope}` 加密包装（5.8.2+）→ 用本机 keyblob/DEK 透明解密；
+/// 命中但为 null/非字符串/空串 → 「未登录/凭证为空」类错误（不再误报结构变更）；
+/// 加密包装存在但解密失败 → 明确「新版加密无法解密」原因（不得误报未登录）；
 /// 全部候选键未命中 → 「结构可能已变更」+ 键名诊断（含值类型）。
 pub(super) fn extract_access_token(raw: &serde_json::Value) -> Result<String, String> {
     for k in ["accessToken", "access_token", "token"] {
         let Some(v) = fs_utils::dig(raw, &[k]) else { continue };
+        // WorkBuddy 5.8.2+ 静态加密包装优先识别（包装是 object，必须先于类型报错分支）
+        match atrest::decrypt_if_wrapped(v) {
+            Ok(Some(plain)) => {
+                if !plain.is_empty() {
+                    return Ok(plain);
+                }
+                return Err(format!(
+                    "auth 文件 accessToken 解密后为空（可能未登录）：键 {k} 的加密信封无有效内容，请先在 WorkBuddy 客户端登录后重试"
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "auth 文件凭证为 WorkBuddy 新版静态加密格式但无法解密：{e}（登录态本身有效，请勿反复退出重登；多为客户端升级更换了加密密钥，请升级 AI Work 助手后重试）"
+                ));
+            }
+            Ok(None) => {}
+        }
         if let Some(s) = v.as_str() {
             if !s.is_empty() {
                 return Ok(s.to_string());

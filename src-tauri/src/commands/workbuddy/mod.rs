@@ -15,6 +15,9 @@
 //! - `env_reset`：环境重置 / 彻底登出
 
 mod accounts;
+// 5.8.2+ 静态加密凭证兼容解密（keyblob 解包 + $wbEncrypted 字段信封），
+// 被同模块 commands 与 tasks::wb_common 共用，故提升为 pub(crate)。
+pub(crate) mod atrest;
 mod chatdata;
 mod checkin;
 mod cli;

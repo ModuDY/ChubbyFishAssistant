@@ -59,8 +59,18 @@ pub struct Creds {
     pub edition: String,
 }
 
+/// 字符串字段提取：兼容 WorkBuddy 5.8.2+ 静态加密包装
+/// （auth 文件中 accessToken/refreshToken/nickname 为 `{$wbEncrypted:1,envelope}`）；
+/// token store 记录由本工具写入、恒为明文字符串，走 as_str 原样返回。
+/// 解密失败回退空串（与历史「字段缺失」同语义，上层按 no_credential 处理，fail-secure）。
 fn s_of(v: Option<&Value>) -> String {
-    v.and_then(Value::as_str).unwrap_or("").to_string()
+    let Some(v) = v else {
+        return String::new();
+    };
+    if let Ok(Some(plain)) = crate::commands::workbuddy::atrest::decrypt_if_wrapped(v) {
+        return plain;
+    }
+    v.as_str().unwrap_or("").to_string()
 }
 
 /// 宽容整数：数字或数字字符串（对齐 python int(v) 兜底）

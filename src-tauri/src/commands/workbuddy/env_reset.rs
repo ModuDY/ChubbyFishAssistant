@@ -12,7 +12,9 @@ use tauri::{AppHandle, State};
 use crate::fs_utils;
 use crate::state::AppState;
 
-use super::common::{as_str, auth_file_path, auth_file_path_of, push_notify, wb_data_dir};
+use super::common::{
+    as_str, auth_file_path, auth_file_path_of, dig_plain_string, push_notify, wb_data_dir,
+};
 use super::oauth::{jwt_claims, open_in_browser};
 
 const WB_ACCESS_TOKEN_SECRET_KEY: &str =
@@ -346,8 +348,9 @@ fn state_vscdb_backup_exists() -> bool {
 /// 当前生效 accessToken：auth 文件优先，回退 token store 中有效期最新的账号凭证（仅用于解析 Keycloak iss）
 fn current_access_token(state: &AppState) -> Option<String> {
     let raw = fs_utils::read_json::<serde_json::Value>(&auth_file_path_of(state));
-    // token 键对齐 creds_of 超集（issue #51）：原仅 accessToken，access_token/token 命中不了
-    if let Some(t) = as_str(fs_utils::dig(&raw, &["accessToken", "access_token", "token"])) {
+    // token 键对齐 creds_of 超集（issue #51）：原仅 accessToken，access_token/token 命中不了；
+    // 5.8.2+ 加密包装经 dig_plain_string 透明解密（此处仅用于解析 iss，失败静默回退 token store）
+    if let Some(t) = dig_plain_string(&raw, &["accessToken", "access_token", "token"]) {
         if !t.is_empty() {
             return Some(t);
         }
