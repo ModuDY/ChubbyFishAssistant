@@ -89,3 +89,7 @@ opt-level = 2
 # 仅桌面端
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+
+# 发行构建：剥离调试符号（减小体积 + 不暴露函数名/结构等内部信息）
+[profile.release]
+strip = true

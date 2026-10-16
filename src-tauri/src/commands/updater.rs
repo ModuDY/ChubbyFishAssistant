@@ -19,9 +19,10 @@ use std::io::{Read, Write};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
-const RELEASES_API: &str =
-    "https://api.github.com/repos/smart-open/TraeWorkAssistant/releases?per_page=100";
-const RELEASES_PAGE: &str = "https://github.com/smart-open/TraeWorkAssistant/releases";
+/// 发布源仓库（本产品线自有仓库，勿指回上游原作者仓库——否则用户「检查更新」
+/// 会拉到上游版本并覆盖本发行版）
+const RELEASES_API: &str = "https://api.github.com/repos/ModuDY/DY-Work/releases?per_page=100";
+const RELEASES_PAGE: &str = "https://github.com/ModuDY/DY-Work/releases";
 
 /// 发布校验清单资产名（scripts/rename_release.mjs 生成，随 Release 上传）：
 /// `{ "version": "x.y.z", "assets": { "<资产文件名>": "<sha256hex>" } }`

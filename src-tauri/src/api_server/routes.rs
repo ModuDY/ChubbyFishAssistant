@@ -833,45 +833,6 @@ pub async fn chat_completions(
 /// Codex Responses API 端点（T4.1/F-40）：POST /v1/responses
 ///
 /// 请求投影为 OpenAI 内部格式后复用 WB 上游既有管线（取号/重试/粘性/脱敏一份）。
-/// 【临时诊断】把本次 `/v1/responses` 请求声明的 tools 摘要（type/name，namespace 记内层数）
-/// 写入 app.log，用于定位「模型拿不到可调用工具、改用文本 XML 语法」的真实原因
-/// （如 Codex 声明了 local_shell / custom / apply_patch 等适配器当前不转换的类型）。
-/// 只输出类型与工具名，不含请求正文与任何凭据；定位完成后应移除本函数与调用点。
-fn log_responses_tools(state: &ApiSharedState, model: &str, body: &Value) {
-    let Some(tools) = body.get("tools").and_then(|v| v.as_array()) else {
-        crate::fs_utils::app_log(
-            &state.data_dir,
-            &format!("[/v1/responses] model={model} tools=0（请求未声明 tools）"),
-        );
-        return;
-    };
-    let mut parts: Vec<String> = Vec::with_capacity(tools.len());
-    for t in tools {
-        let ty = t.get("type").and_then(|v| v.as_str()).unwrap_or("?");
-        let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        if ty == "namespace" {
-            let inner = t
-                .get("tools")
-                .and_then(|v| v.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0);
-            parts.push(format!("namespace(name={name},inner={inner})"));
-        } else if name.is_empty() {
-            parts.push(ty.to_string());
-        } else {
-            parts.push(format!("{ty}:{name}"));
-        }
-    }
-    crate::fs_utils::app_log(
-        &state.data_dir,
-        &format!(
-            "[/v1/responses] model={model} tools={} [{}]",
-            tools.len(),
-            parts.join(", ")
-        ),
-    );
-}
-
 /// 仅支持 WB 上游模型（Codex CLI `wire_api="responses"` 直配 base_url 的目标场景）；
 /// 脱敏沿用全局 `wb_sanitize` 开关，审核命中按既有分级重试表退回重试。
 pub async fn responses_api(
@@ -908,8 +869,6 @@ pub async fn responses_api(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(&state.default_model)
         .to_string();
-    // 【临时诊断】记录本次请求声明的 tools 类型/名字（见 log_responses_tools 注释）
-    log_responses_tools(&state, &model, &peek);
     // issue #26 白名单准入（空名单不限）
     if let Some(resp) = whitelist_check(&state, &model, Protocol::Responses) {
         return resp;

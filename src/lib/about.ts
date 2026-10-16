@@ -13,8 +13,8 @@ export const APP_COPYRIGHT = `Copyright © 2026 ${APP_AUTHOR} · MIT License`;
 export const APP_DISCLAIMER =
   '本工具与 Trae / WorkBuddy / 豆包等官方均无关联，仅供学习研究，请仅管理本人合法持有的账号，风险自担。';
 
-export const LINK_GITHUB = 'https://github.com/smart-open';
+export const LINK_GITHUB = 'https://github.com/ModuDY';
 export const LINK_BLOG = 'https://blog.sopenai.cn/';
-export const LINK_REPO = 'https://github.com/smart-open/TraeWorkAssistant';
+export const LINK_REPO = 'https://github.com/ModuDY/DY-Work';
 
 export { promoBanner };
