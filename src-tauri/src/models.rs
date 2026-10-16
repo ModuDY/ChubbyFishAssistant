@@ -774,6 +774,19 @@ pub struct ApiPoolFile {
     /// 覆盖 qoder_sticky store 的 EXPLICIT_TTL_SECS 常量（旧版硬编码不可配）
     #[serde(default = "default_sticky_ttl_secs")]
     pub qoder_sticky_ttl_secs: u64,
+    /// 豆包上游开关（E-01）：开启后豆包目录模型路由到豆包账号池。
+    /// 默认 false（安全默认）——未部署豆包的环境不产生空池噪音（健康告警/目录徽章）
+    #[serde(default)]
+    pub doubao_enabled: bool,
+    /// 豆包池调度策略（取值同上）；空 = 沿用 strategy（跟随 Trae 池，同 Buddy/Qoder 语义）
+    #[serde(default)]
+    pub doubao_strategy: String,
+    /// 豆包池账号并发上限（per-pool 三参数之一，默认 1；0 = 不限）
+    #[serde(default = "default_account_concurrency_limit")]
+    pub doubao_account_concurrency_limit: u32,
+    /// 豆包池粘性 TTL 秒（per-pool 三参数之一，默认 300）
+    #[serde(default = "default_pool_sticky_ttl_secs")]
+    pub doubao_pool_sticky_ttl_secs: u64,
 }
 
 fn default_hedge_threshold_ms() -> u64 {
@@ -835,6 +848,10 @@ impl Default for ApiPoolFile {
             qoder_strategy: String::new(),
             qoder_enabled_uids: Vec::new(),
             qoder_group_ids: Vec::new(),
+            doubao_enabled: false,
+            doubao_strategy: String::new(),
+            doubao_account_concurrency_limit: default_account_concurrency_limit(),
+            doubao_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
             trae_tag_ids: Vec::new(),
             wb_tag_ids: Vec::new(),
             qoder_tag_ids: Vec::new(),

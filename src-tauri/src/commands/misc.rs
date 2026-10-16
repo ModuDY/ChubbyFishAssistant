@@ -27,6 +27,67 @@ pub fn device_reset(state: State<AppState>, user_id: String) -> Result<(), Strin
     Ok(())
 }
 
+/// 把给定 uid 全部重派为 `derive_device(uid)` 的完整三元组，返回 `(total, changed)`。
+///
+/// 纯函数（不依赖 AppState），便于单测。语义：
+/// - 空 uid 跳过、不计入 `total`；
+/// - 整三元组替换为派生值（与 `trae_checkin::get_device_for` 写回、device_proxy 的
+///   `[签到改写]` 同口径，保证 device/market/session 三者同源）；
+/// - 与目标值逐字段相同则不改（幂等，二次执行为 0 变更）。
+///
+/// 背景：多账号在同一台机器上被写成同一个真实设备号时，服务端按 device_id 去重，
+/// 当天只有第一个账号能签到（`code=9095`「当前设备今日已经签到」）；按 uid 派生的
+/// 设备号每账号唯一，可避免该撞车。
+pub fn redispatch_derived(map: &mut DeviceMap, uids: &[String]) -> (usize, usize) {
+    let mut total = 0usize;
+    let mut changed = 0usize;
+    for uid in uids {
+        if uid.is_empty() {
+            continue;
+        }
+        total += 1;
+        let dev = crate::commands::accounts::derive_device(uid);
+        // DeviceEntry 未派生 PartialEq，逐字段比较（避免为此改 models.rs）
+        let same = map
+            .get(uid)
+            .map(|e| {
+                e.device_id == dev.device_id
+                    && e.market_user_id == dev.market_user_id
+                    && e.session_id == dev.session_id
+            })
+            .unwrap_or(false);
+        if same {
+            continue;
+        }
+        map.insert(uid.clone(), dev);
+        changed += 1;
+    }
+    (total, changed)
+}
+
+/// 为**全部 Trae 账号**一键重派设备号（解决多账号同设备签到的 9095）。
+/// uid 列表取 `vault::load_accounts`（与 OAuth / 设备路径同源；vault 打不开时其内部
+/// 已静默降级为纯 JSON 账号）。整表读写持 `DEVICE_MAP_LOCK`（叶子锁），
+/// 防与签到写回 / OAuth 回写互相整表覆盖。
+#[tauri::command]
+pub fn device_reassign_all(state: State<AppState>) -> Result<serde_json::Value, String> {
+    let uids: Vec<String> = crate::vault::load_accounts(&state)
+        .accounts
+        .iter()
+        .filter_map(|a| a.user_id.clone().filter(|u| !u.is_empty()))
+        .collect();
+    let store = crate::store::db(&state.data_dir);
+    let _g = crate::store::docs::DEVICE_MAP_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut map: DeviceMap = crate::store::docs::device_map_load(&store);
+    let (total, changed) = redispatch_derived(&mut map, &uids);
+    if changed > 0 {
+        crate::store::docs::device_map_save(&store, &map)?;
+    }
+    Ok(serde_json::json!({ "total": total, "changed": changed }))
+}
+
 // ---------------- 开机自启（T11，tauri-plugin-autostart：Windows 写注册表 Run 项） ----------------
 
 /// 查询开机自启状态
@@ -1276,6 +1337,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// 重派：两个 uid 共设备 → 各自变为按 uid 派生的唯一设备号
+    #[test]
+    fn redispatch_derived_splits_shared_device() {
+        let mut map: DeviceMap = std::collections::HashMap::new();
+        let shared = crate::models::DeviceEntry {
+            device_id: "111111111111111".into(),
+            market_user_id: Some("shared-market".into()),
+            session_id: Some("shared-session".into()),
+        };
+        map.insert("u1".into(), shared.clone());
+        map.insert("u2".into(), shared);
+        let (total, changed) = redispatch_derived(&mut map, &["u1".into(), "u2".into()]);
+        assert_eq!((total, changed), (2, 2));
+        let d1 = crate::commands::accounts::derive_device("u1");
+        let d2 = crate::commands::accounts::derive_device("u2");
+        assert_eq!(map["u1"].device_id, d1.device_id);
+        assert_eq!(map["u2"].device_id, d2.device_id);
+        assert_ne!(map["u1"].device_id, map["u2"].device_id, "派生设备号必须互不相同");
+        assert_ne!(map["u1"].device_id, "111111111111111");
+    }
+
+    /// 重派幂等：已是派生三元组时 changed=0 且内容逐字段不变
+    #[test]
+    fn redispatch_derived_is_idempotent() {
+        let mut map: DeviceMap = std::collections::HashMap::new();
+        map.insert("u1".into(), crate::commands::accounts::derive_device("u1"));
+        let before = map.clone();
+        let (total, changed) = redispatch_derived(&mut map, &["u1".into()]);
+        assert_eq!((total, changed), (1, 0));
+        assert_eq!(map["u1"].device_id, before["u1"].device_id);
+        assert_eq!(map["u1"].market_user_id, before["u1"].market_user_id);
+        assert_eq!(map["u1"].session_id, before["u1"].session_id);
+    }
+
+    /// 空 uid 跳过；真实登录三元组被整体替换为派生值（三者同源）
+    #[test]
+    fn redispatch_derived_skips_empty_and_replaces_triple() {
+        let mut map: DeviceMap = std::collections::HashMap::new();
+        map.insert(
+            "u1".into(),
+            crate::models::DeviceEntry {
+                device_id: "999999999999999".into(),
+                market_user_id: Some("real-market".into()),
+                session_id: Some("real-session".into()),
+            },
+        );
+        let (total, changed) = redispatch_derived(&mut map, &["".into(), "u1".into()]);
+        assert_eq!((total, changed), (1, 1));
+        assert!(!map.contains_key(""), "空 uid 不得插入");
+        let d = crate::commands::accounts::derive_device("u1");
+        assert_eq!(map["u1"].device_id, d.device_id);
+        assert_eq!(map["u1"].market_user_id, d.market_user_id, "market 应同源替换");
+        assert_eq!(map["u1"].session_id, d.session_id, "session 应同源替换");
     }
 
     /// 拒绝写入启动文件夹下的 .json（拦截的是位置而非扩展名）

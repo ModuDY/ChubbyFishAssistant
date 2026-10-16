@@ -326,6 +326,20 @@ pub(crate) fn dispatch_error_response(
                 "no_healthy_account",
                 "api_error",
             ),
+            DispatchError::DoubaoDisabled => (
+                StatusCode::BAD_REQUEST,
+                "doubao",
+                "该模型属豆包上游，但豆包池未启用（api_pool.json doubao_enabled）".to_string(),
+                "doubao_upstream_disabled",
+                "invalid_request_error",
+            ),
+            DispatchError::DoubaoUnverified(id) => (
+                StatusCode::BAD_REQUEST,
+                "doubao",
+                format!("模型 {id} 未启用（待验证）"),
+                "doubao_model_unverified",
+                "invalid_request_error",
+            ),
         };
     // issue #29 修复1：uid/acct 置空（调度阶段未取号），error 携带失败原因
     let key_name = super::api_keys::key_name_for(&state.data_dir, key_str);
@@ -370,6 +384,7 @@ pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_st
         TargetPool::Trae => &state.pool,
         TargetPool::Buddy => &state.wb_pool,
         TargetPool::Qoder => &state.qoder_pool,
+        TargetPool::Doubao => &state.doubao_pool,
         // 不可达：custom 在 resolve_target 顶部短路返回（匹配穷尽兜底）
         TargetPool::Custom => return "no healthy account available".to_string(),
     };
@@ -611,6 +626,9 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     // Qoder 源旗标（p3-3）：条目始终入表（开关关闭时徽章置灰）
     let qoder_enabled = state.qoder_enabled.load(std::sync::atomic::Ordering::Relaxed);
     let qoder_ok = state.qoder_pool.has_selectable();
+    // 豆包源旗标（E-01）：条目始终入表（开关关闭/占位模型时徽章置灰）
+    let doubao_enabled = state.doubao_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let doubao_ok = state.doubao_pool.has_selectable();
     let data_dir = state.data_dir.clone();
     // issue #90 修复③a：来源标识开关（dispatch_policy.model_source_labels）——
     // 开启后为多源同名模型附带池前缀别名条目（trae/xxx / buddy/xxx / qoder/xxx），
@@ -624,6 +642,7 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             trae_ok,
             buddy_ok,
             Some((qoder_enabled, qoder_ok)),
+            Some((doubao_enabled, doubao_ok)),
         )
     })
     .await
@@ -768,6 +787,14 @@ pub async fn chat_completions(
                 }
                 return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await;
             }
+            TargetPool::Doubao => {
+                // 豆包上游（E-01）：请求体由执行路径按模型表构造（消息合并），
+                // 无 effort/后缀预处理（档位由模型表 deep_think/auto_cot 决定）
+                if stream {
+                    return super::doubao_route::doubao_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard);
+                }
+                return super::doubao_route::doubao_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await;
+            }
             TargetPool::Trae => {
                 // issue #31 T3.2/T3.3：Trae 池 effort 通道（默认思考两池对齐）——
                 // 显式 reasoning_effort / 路由级提示 / 默认思考 → wire 档位注入
@@ -806,6 +833,45 @@ pub async fn chat_completions(
 /// Codex Responses API 端点（T4.1/F-40）：POST /v1/responses
 ///
 /// 请求投影为 OpenAI 内部格式后复用 WB 上游既有管线（取号/重试/粘性/脱敏一份）。
+/// 【临时诊断】把本次 `/v1/responses` 请求声明的 tools 摘要（type/name，namespace 记内层数）
+/// 写入 app.log，用于定位「模型拿不到可调用工具、改用文本 XML 语法」的真实原因
+/// （如 Codex 声明了 local_shell / custom / apply_patch 等适配器当前不转换的类型）。
+/// 只输出类型与工具名，不含请求正文与任何凭据；定位完成后应移除本函数与调用点。
+fn log_responses_tools(state: &ApiSharedState, model: &str, body: &Value) {
+    let Some(tools) = body.get("tools").and_then(|v| v.as_array()) else {
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!("[/v1/responses] model={model} tools=0（请求未声明 tools）"),
+        );
+        return;
+    };
+    let mut parts: Vec<String> = Vec::with_capacity(tools.len());
+    for t in tools {
+        let ty = t.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+        let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if ty == "namespace" {
+            let inner = t
+                .get("tools")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            parts.push(format!("namespace(name={name},inner={inner})"));
+        } else if name.is_empty() {
+            parts.push(ty.to_string());
+        } else {
+            parts.push(format!("{ty}:{name}"));
+        }
+    }
+    crate::fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "[/v1/responses] model={model} tools={} [{}]",
+            tools.len(),
+            parts.join(", ")
+        ),
+    );
+}
+
 /// 仅支持 WB 上游模型（Codex CLI `wire_api="responses"` 直配 base_url 的目标场景）；
 /// 脱敏沿用全局 `wb_sanitize` 开关，审核命中按既有分级重试表退回重试。
 pub async fn responses_api(
@@ -842,6 +908,8 @@ pub async fn responses_api(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(&state.default_model)
         .to_string();
+    // 【临时诊断】记录本次请求声明的 tools 类型/名字（见 log_responses_tools 注释）
+    log_responses_tools(&state, &model, &peek);
     // issue #26 白名单准入（空名单不限）
     if let Some(resp) = whitelist_check(&state, &model, Protocol::Responses) {
         return resp;
@@ -1106,6 +1174,13 @@ pub async fn messages(
                 }
                 return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await;
             }
+            TargetPool::Doubao => {
+                // 豆包上游（E-01）：Anthropic 入参已在端点层投影为 OpenAI 内部格式
+                if stream {
+                    return super::doubao_route::doubao_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard);
+                }
+                return super::doubao_route::doubao_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await;
+            }
             TargetPool::Trae => {
                 // issue #31 T3.2/T3.3：Anthropic thinking 参数视为显式请求
                 //（enabled → high 档；disabled → 空串短路默认思考与路由提示）
@@ -1258,6 +1333,13 @@ pub async fn completions(
                     return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard);
                 }
                 return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await;
+            }
+            TargetPool::Doubao => {
+                // 豆包上游（E-01）：text completions 入参已在端点层投影为内部格式
+                if stream {
+                    return super::doubao_route::doubao_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard);
+                }
+                return super::doubao_route::doubao_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await;
             }
             TargetPool::Trae => {
                 // issue #31 T3.2/T3.3：text completions 无 effort 字段 → 仅默认思考生效
@@ -3094,6 +3176,11 @@ mod tests {
             qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
             qoder_sticky: super::super::wb_sticky::StickyStore::default(),
             trae_sticky: super::super::wb_sticky::StickyStore::default(),
+            doubao_pool: super::super::pool::ApiPool::new(),
+            doubao_enabled: std::sync::atomic::AtomicBool::new(false),
+            doubao_identity: None,
+            doubao_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            doubao_quota: super::super::doubao_route::DoubaoQuota::new(),
             listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
         });
         WlFixture { dir, state }

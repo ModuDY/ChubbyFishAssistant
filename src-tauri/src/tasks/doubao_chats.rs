@@ -19,8 +19,8 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 
-/// IM API 网关 UA（缺客户端标识会被拒）
-const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+/// IM API 网关 UA（缺客户端标识会被拒）；网关（api_server）复用同一 UA
+pub(crate) const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 SamanthaDoubao/2.27.12";
 /// 会话列表查询串（设备指纹参数缺 web_id/tea_uuid/fp 会被网关判 712010702，实测对照确认）
 const RECENT_QS: &str = "version_code=20800&language=zh&device_platform=web&doubao_device_platform=desktop\
@@ -30,8 +30,9 @@ const RECENT_QS: &str = "version_code=20800&language=zh&device_platform=web&doub
 &client_platform=pc_client&chromium_version=147.0.7727.149&channel=win\
 &web_id=7681679574816589346&tea_uuid=199439841787403&fp=verify_199439841787403\
 &web_tab_id=4db30b53-185f-4e73-99aa-6d29921381fc";
-/// 单会话消息查询串（RECENT_QS 替换 aid/web_platform，与 python 同款）
-const SINGLE_QS: &str = "version_code=20800&language=zh&device_platform=web&doubao_device_platform=web\
+/// 单会话消息查询串（RECENT_QS 替换 aid/web_platform，与 python 同款）；
+/// 网关（api_server/doubao_upstream）复用同一静态设备指纹 query
+pub(crate) const SINGLE_QS: &str = "version_code=20800&language=zh&device_platform=web&doubao_device_platform=web\
 &aid=497858&real_aid=497858&pkg_type=release_version&device_id=199439841787403\
 &pc_version=2.27.12&doubao_pc_version=2.27.12&region=CN&sys_region=CN&samantha_web=1\
 &web_platform=web&use-olympus-account=1&runtime=web&runtime_version=3.35.4\
@@ -692,7 +693,7 @@ pub fn check_login_cookie(profile_dir: &Path) -> Value {
 //   POST https://www.doubao.com/im/chain/single?…       cmd=3100  单会话消息
 // 正文：content_block[].content.text_block.text；兜底 brief / tts_content
 
-fn uuid_v4() -> String {
+pub(crate) fn uuid_v4() -> String {
     use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
@@ -880,7 +881,7 @@ fn load_account(state: &AppState, uid: &str) -> Result<Value, String> {
 /// 豆包 IM 网关要求 ttwid / sid_guard 以 URL 编码形式出现（| → %7C 等）；
 /// 传原始 | / , / : 会报 712010702。账号池统一存原始（可读）形式，发送前编码；
 /// 已含 % 的值视为已编码原样透传，避免双重编码
-fn cookie_enc(v: &str) -> String {
+pub(crate) fn cookie_enc(v: &str) -> String {
     if v.contains('%') {
         v.to_string()
     } else {
@@ -888,7 +889,7 @@ fn cookie_enc(v: &str) -> String {
     }
 }
 
-fn build_cookie(acc: &Value) -> Result<String, String> {
+pub(crate) fn build_cookie(acc: &Value) -> Result<String, String> {
     let uid = acc.get("user_id").and_then(Value::as_str).unwrap_or("");
     let sid = acc.get("session_id").and_then(Value::as_str).unwrap_or("");
     if sid.is_empty() {
@@ -1103,5 +1104,831 @@ mod tests {
     fn cookie_enc_rules() {
         assert_eq!(cookie_enc("a|b"), "a%7Cb");
         assert_eq!(cookie_enc("a%7Cb"), "a%7Cb");
+    }
+}
+
+/// 豆包对话网关可行性探针（批次 0）——**手动触发**，`#[ignore]`。
+/// 目的：用本机已录入的豆包会话凭证，直接 POST `/samantha/chat/completion`，
+/// **不带 msToken / a_bogus**，观察上游是否返回可用数据流，据此判定签名是否为硬门槛。
+/// 安全：只打印非敏感元数据（HTTP 状态 / 响应类型 / 长度 / SSE event_type 集合 / 风控码），
+/// 绝不回显任何凭证明文（sessionid / sid_guard / ttwid / cookie）。
+/// 运行：`cargo test --no-default-features doubao_completion_probe -- --ignored --nocapture`
+#[cfg(test)]
+mod probe {
+    use super::*;
+
+    fn probe_data_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(std::env::var("APPDATA").expect("APPDATA 环境变量缺失"))
+            .join(crate::state::DATA_DIR_NAME)
+    }
+
+    /// cookie 组装（复用生产同款规则；仅内存使用，不落盘不回显）
+    fn cookie_from(cred: &Value) -> Option<String> {
+        let sid = cred.get("session_id").and_then(Value::as_str).filter(|s| !s.is_empty())?;
+        let mut parts = vec![
+            format!("sessionid={sid}"),
+            format!("sessionid_ss={sid}"),
+            format!("sid_tt={sid}"),
+        ];
+        if let Some(g) = cred.get("sid_guard").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            parts.push(format!("sid_guard={}", cookie_enc(g)));
+        }
+        if let Some(t) = cred.get("ttwid").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            parts.push(format!("ttwid={}", cookie_enc(t)));
+        }
+        Some(parts.join("; "))
+    }
+
+    /// 从 vault 逐账号回填凭证（DB 行均为占位），返回第一个可用 cookie 及其 uid
+    fn first_available_cookie(dd: &std::path::Path) -> Option<(String, String)> {
+        let conn = crate::store::db(dd);
+        let pool = crate::store::docs::doubao_pool_load(&conn);
+        for a in &pool.accounts {
+            if let Some(sec) = crate::vault::ns_get(dd, "doubao", &a.user_id) {
+                let cred = json!({
+                    "session_id": sec.get("session_id"),
+                    "sid_guard": sec.get("sid_guard"),
+                    "ttwid": sec.get("ttwid"),
+                });
+                if let Some(c) = cookie_from(&cred) {
+                    return Some((c, a.user_id.clone()));
+                }
+            }
+        }
+        // 兜底：全局抓包凭证
+        if let Some(sec) = crate::vault::ns_get(dd, "doubao", "captured") {
+            let cred = json!({
+                "session_id": sec.get("session_id"),
+                "sid_guard": sec.get("sid_guard"),
+                "ttwid": sec.get("ttwid"),
+            });
+            if let Some(c) = cookie_from(&cred) {
+                let uid = sec.get("uid").and_then(Value::as_str).unwrap_or("").to_string();
+                return Some((c, uid));
+            }
+        }
+        None
+    }
+
+    /// 非敏感响应摘要（只输出结构元数据，绝不回显回答正文/凭证）
+    fn summarize(status: u16, ctype: &str, body: &str) -> String {
+        use std::collections::BTreeSet;
+        let scan = |marker: &str| -> BTreeSet<u64> {
+            let mut s = BTreeSet::new();
+            for seg in body.split(marker).skip(1) {
+                let d: String = seg
+                    .chars()
+                    .skip_while(|c| !c.is_ascii_digit())
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(n) = d.parse::<u64>() {
+                    s.insert(n);
+                }
+            }
+            s
+        };
+        let tok = |k: &str| -> Option<String> {
+            let idx = body.find(k)?;
+            let rest = &body[idx + k.len()..];
+            let d: String = rest
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if d.is_empty() { None } else { Some(d) }
+        };
+        let known = ["710012001", "710022004", "712010702"];
+        let hits: Vec<&str> = known.iter().copied().filter(|k| body.contains(*k)).collect();
+        // 双层序列化：内层文本键形如 \"text\":\"，只累计字符数，不回显正文
+        let answer_len = {
+            let marker = "\\\"text\\\":\\\"";
+            let mut total = 0usize;
+            let mut rest = body;
+            while let Some(i) = rest.find(marker) {
+                let after = &rest[i + marker.len()..];
+                match after.find("\\\"") {
+                    Some(j) => {
+                        total += after[..j].chars().count();
+                        rest = &after[j + 2..];
+                    }
+                    None => break,
+                }
+            }
+            total
+        };
+        format!(
+            "HTTP {status} | type={} | len={} | event_type={:?} | content_type={:?} | 已知风控码={:?} | 含conversation_id={} | 含fin_reason={} | 回答正文总字符数={} | tokens in/out={:?}/{:?}",
+            if ctype.is_empty() { "-" } else { ctype },
+            body.chars().count(),
+            scan("event_type"),
+            scan("content_type"),
+            hits,
+            body.contains("conversation_id"),
+            body.contains("fin_reason"),
+            answer_len,
+            tok("input_tokens"),
+            tok("output_tokens")
+        )
+    }
+
+    #[test]
+    #[ignore]
+    fn doubao_completion_probe() {
+        let dd = probe_data_dir();
+        let Some((cookie, uid)) = first_available_cookie(&dd) else {
+            eprintln!("[probe] 未找到可用豆包凭证（vault 空或全部缺 sessionid）——先保存登录态/抓包后再试");
+            return;
+        };
+        eprintln!("[probe] 账号 uid 长度（脱敏）: {}", uid.chars().count());
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let local_id = |tag: &str| format!("{now_ms}_{tag}");
+        let body = json!({
+            "messages": [{
+                "content": "{\"text\":\"你好\"}",
+                "content_type": 2001,
+                "local_message_id": local_id("00000000000000000000000000000000"),
+            }],
+            "conversation_id": "0",
+            "local_conversation_id": local_id("00000000000000000000000000000000"),
+            "bot_id": "7338286299411103781",
+            "completion_option": {
+                "is_regen": false,
+                "with_suggest": false,
+                "need_create_conversation": true,
+                "launch_stage": 1,
+                "memory_type": 1,
+                "use_deep_think": false,
+                "use_auto_cot": false,
+            }
+        });
+
+        let url = format!("https://www.doubao.com/samantha/chat/completion?{SINGLE_QS}");
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(10))
+            .timeout_read(std::time::Duration::from_secs(45))
+            .build();
+        eprintln!("[probe] 发送无签名请求（不带 msToken/a_bogus）…");
+        let out = agent
+            .post(&url)
+            .set("content-type", "application/json; encoding=utf-8")
+            .set("cookie", &cookie)
+            .set("agw-js-conv", "str")
+            .set("user-agent", UA)
+            .set("accept", "application/json, text/event-stream, */*")
+            .set("referer", "https://www.doubao.com/")
+            .send_string(&body.to_string());
+
+        let (status, ctype, text) = match out {
+            Ok(r) => {
+                let status = r.status();
+                let ctype = r.header("content-type").unwrap_or("").to_string();
+                let t = r.into_string().unwrap_or_default();
+                (status, ctype, t)
+            }
+            Err(ureq::Error::Status(code, r)) => {
+                let ctype = r.header("content-type").unwrap_or("").to_string();
+                let t = r.into_string().unwrap_or_default();
+                (code, ctype, t)
+            }
+            Err(e) => {
+                eprintln!("[probe] 传输层错误: {e}");
+                return;
+            }
+        };
+        eprintln!("[probe] 结果: {}", summarize(status, &ctype, &text));
+        // 结构诊断：原始 SSE 响应体（仅含 conversation_id / message_id / 回答文本，无凭证）落临时文件
+        let dump = std::env::temp_dir().join("doubao_probe_body.txt");
+        let _ = std::fs::write(&dump, &text);
+        eprintln!("[probe] 原始响应体已写入: {}", dump.display());
+    }
+
+    // ── 协议实验共用件（A 多轮 / B 思考模式 / C 风控容忍度）─────────────────
+
+    fn probe_agent() -> ureq::Agent {
+        ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(10))
+            .timeout_read(std::time::Duration::from_secs(60))
+            .build()
+    }
+
+    fn new_local_id() -> String {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        format!("{now_ms}_00000000000000000000000000000000")
+    }
+
+    /// 单次对话请求（可指定会话续聊 / 思考·专家模式）
+    fn chat(
+        agent: &ureq::Agent,
+        cookie: &str,
+        conversation_id: &str,
+        local_conv_id: &str,
+        text: &str,
+        deep_think: bool,
+        auto_cot: bool,
+    ) -> Option<(u16, String, String)> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let body = json!({
+            "messages": [{
+                "content": json!({"text": text}).to_string(),
+                "content_type": 2001,
+                "local_message_id": format!("{now_ms}_00000000000000000000000000000000"),
+            }],
+            "conversation_id": conversation_id,
+            "local_conversation_id": local_conv_id,
+            "bot_id": "7338286299411103781",
+            "completion_option": {
+                "is_regen": false,
+                "with_suggest": false,
+                "need_create_conversation": true,
+                "launch_stage": 1,
+                "memory_type": 1,
+                "use_deep_think": deep_think,
+                "use_auto_cot": auto_cot,
+            }
+        });
+        let url = format!("https://www.doubao.com/samantha/chat/completion?{SINGLE_QS}");
+        let out = agent
+            .post(&url)
+            .set("content-type", "application/json; encoding=utf-8")
+            .set("cookie", cookie)
+            .set("agw-js-conv", "str")
+            .set("user-agent", UA)
+            .set("accept", "application/json, text/event-stream, */*")
+            .set("referer", "https://www.doubao.com/")
+            .send_string(&body.to_string());
+        match out {
+            Ok(r) => {
+                let st = r.status();
+                let ct = r.header("content-type").unwrap_or("").to_string();
+                Some((st, ct, r.into_string().unwrap_or_default()))
+            }
+            Err(ureq::Error::Status(code, r)) => {
+                let ct = r.header("content-type").unwrap_or("").to_string();
+                Some((code, ct, r.into_string().unwrap_or_default()))
+            }
+            Err(e) => {
+                eprintln!("[probe] 传输层错误: {e}");
+                None
+            }
+        }
+    }
+
+    /// 抽取单层转义字段（形如 \"key\":\"value\"）
+    fn extract_escaped(body: &str, key: &str) -> Option<String> {
+        let marker = format!("{key}\\\":\\\"");
+        let i = body.find(&marker)?;
+        let after = &body[i + marker.len()..];
+        let j = after.find("\\\"")?;
+        Some(after[..j].to_string())
+    }
+
+    fn scan_num(body: &str, key: &str) -> std::collections::BTreeSet<u64> {
+        let mut s = std::collections::BTreeSet::new();
+        for seg in body.split(key).skip(1) {
+            let d: String = seg
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(n) = d.parse::<u64>() {
+                s.insert(n);
+            }
+        }
+        s
+    }
+
+    fn known_risk(body: &str) -> Vec<&'static str> {
+        ["710012001", "710022004", "712010702"]
+            .into_iter()
+            .filter(|k| body.contains(k))
+            .collect()
+    }
+
+    fn answer(body: &str) -> String {
+        extract_escaped(body, "tts_content")
+            .or_else(|| extract_escaped(body, "text"))
+            .unwrap_or_else(|| "<无正文>".into())
+    }
+
+    /// 实验 A：多轮续聊——首轮建会话，次轮带上返回的 conversation_id + 同一 local_conversation_id，
+    /// 校验模型是否记住首轮内容
+    #[test]
+    #[ignore]
+    fn doubao_multiturn_probe() {
+        let dd = probe_data_dir();
+        let Some((cookie, _)) = first_available_cookie(&dd) else {
+            eprintln!("[A] 无可用凭证");
+            return;
+        };
+        let agent = probe_agent();
+        let lcid = new_local_id();
+
+        let Some((st1, ct1, b1)) = chat(&agent, &cookie, "0", &lcid, "请记住：我的幸运数字是 42。", false, false) else {
+            return;
+        };
+        let conv1 = extract_escaped(&b1, "conversation_id").unwrap_or_default();
+        eprintln!(
+            "[A] 首轮 HTTP {st1} {ct1} conversation_id={conv1:?} message_id={:?} event_type={:?}",
+            extract_escaped(&b1, "message_id"),
+            scan_num(&b1, "event_type")
+        );
+        eprintln!("[A] 首轮回答: {}", answer(&b1));
+
+        let Some((st2, ct2, b2)) = chat(&agent, &cookie, &conv1, &lcid, "我刚才让你记住的幸运数字是多少？", false, false) else {
+            return;
+        };
+        eprintln!("[A] 次轮 HTTP {st2} {ct2} event_type={:?} 风控={:?}", scan_num(&b2, "event_type"), known_risk(&b2));
+        let a2 = answer(&b2);
+        eprintln!("[A] 次轮回答: {a2}");
+        eprintln!("[A] 是否记住 42 = {}", a2.contains("42"));
+    }
+
+    /// 实验 A2：真实会话续聊——首轮建会话后经 IM recent_conv 取真实 conversation_id 再续聊，
+    /// 校验 context 是否被服务端保留（判定网关会话桥接该用哪条路径）
+    #[test]
+    #[ignore]
+    fn doubao_multiturn_via_conv_id_probe() {
+        let dd = probe_data_dir();
+        let Some((cookie, _)) = first_available_cookie(&dd) else {
+            eprintln!("[A2] 无可用凭证");
+            return;
+        };
+        let agent = probe_agent();
+        let lcid = new_local_id();
+        let Some((st1, _c1, b1)) = chat(&agent, &cookie, "0", &lcid, "请记住：我的幸运数字是 42。", false, false) else {
+            return;
+        };
+        eprintln!("[A2] 首轮 HTTP {st1} 回答: {}", answer(&b1));
+
+        let convs = fetch_recent_convs(&agent, &cookie, 5);
+        let conv_id = match &convs {
+            Ok(v) => v
+                .first()
+                .and_then(|c| c.get("conversation_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            Err(e) => {
+                eprintln!("[A2] recent_conv 失败: {e}");
+                String::new()
+            }
+        };
+        eprintln!(
+            "[A2] IM recent_conv 数量={} 最新 conversation_id 长度={}",
+            convs.as_ref().map(|v| v.len()).unwrap_or(0),
+            conv_id.chars().count()
+        );
+        if conv_id.is_empty() {
+            eprintln!("[A2] 未取到真实 conversation_id，终止");
+            return;
+        }
+
+        let Some((st2, _c2, b2)) = chat(&agent, &cookie, &conv_id, &conv_id, "我刚才让你记住的幸运数字是多少？", false, false) else {
+            return;
+        };
+        eprintln!("[A2] 次轮 HTTP {st2} event_type={:?} 风控={:?}", scan_num(&b2, "event_type"), known_risk(&b2));
+        let a2 = answer(&b2);
+        eprintln!("[A2] 次轮回答: {a2}");
+        eprintln!("[A2] 是否记住 42 = {}", a2.contains("42"));
+    }
+
+    /// 实验 A3：无状态「消息合并」兜底——把多轮对话合并成单条 user 消息发送，
+    /// 校验是否被正确理解（设计文档 §2.1 兜底路径），以判定网关多轮桥接可行性
+    #[test]
+    #[ignore]
+    fn doubao_merge_probe() {
+        let dd = probe_data_dir();
+        let Some((cookie, _)) = first_available_cookie(&dd) else {
+            eprintln!("[A3] 无可用凭证");
+            return;
+        };
+        let agent = probe_agent();
+        let before = fetch_recent_convs(&agent, &cookie, 5).map(|v| v.len()).unwrap_or(0);
+        eprintln!("[A3] 发送前 IM recent_conv 数量={before}");
+
+        let merged = "用户：请记住：我的幸运数字是 42。\n助手：好的，我记下了。\n用户：我刚才让你记住的幸运数字是多少？";
+        let lcid = new_local_id();
+        let Some((st, _ct, b)) = chat(&agent, &cookie, "0", &lcid, merged, false, false) else {
+            return;
+        };
+        let after = fetch_recent_convs(&agent, &cookie, 5).map(|v| v.len()).unwrap_or(0);
+        let a = answer(&b);
+        eprintln!("[A3] 合并消息 HTTP {st} 回答: {a}");
+        eprintln!("[A3] 是否理解 42 = {} | 发送后 IM 会话数={after}", a.contains("42"));
+    }
+
+    /// 实验 A4：messages[] 传多轮历史（user/assistant/user 三条，无 role 字段，靠位置），
+    /// 校验数组是否被上游当作多轮上下文处理
+    #[test]
+    #[ignore]
+    fn doubao_history_array_probe() {
+        let dd = probe_data_dir();
+        let Some((cookie, _)) = first_available_cookie(&dd) else {
+            eprintln!("[A4] 无可用凭证");
+            return;
+        };
+        let agent = probe_agent();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let body = json!({
+            "messages": [
+                {"content": json!({"text": "请记住：我的幸运数字是 42。"}).to_string(), "content_type": 2001, "local_message_id": format!("{now_ms}_00000000000000000000000000000000")},
+                {"content": json!({"text": "好的，我记下了。"}).to_string(), "content_type": 2001, "local_message_id": format!("{now_ms}_00000000000000000000000000000001")},
+                {"content": json!({"text": "我刚才让你记住的幸运数字是多少？"}).to_string(), "content_type": 2001, "local_message_id": format!("{now_ms}_00000000000000000000000000000002")},
+            ],
+            "conversation_id": "0",
+            "local_conversation_id": new_local_id(),
+            "bot_id": "7338286299411103781",
+            "completion_option": {
+                "is_regen": false, "with_suggest": false, "need_create_conversation": true,
+                "launch_stage": 1, "memory_type": 1, "use_deep_think": false, "use_auto_cot": false,
+            }
+        });
+        let url = format!("https://www.doubao.com/samantha/chat/completion?{SINGLE_QS}");
+        let out = agent
+            .post(&url)
+            .set("content-type", "application/json; encoding=utf-8")
+            .set("cookie", &cookie)
+            .set("agw-js-conv", "str")
+            .set("user-agent", UA)
+            .set("accept", "application/json, text/event-stream, */*")
+            .set("referer", "https://www.doubao.com/")
+            .send_string(&body.to_string());
+        let (st, b) = match out {
+            Ok(r) => {
+                let st = r.status();
+                (st, r.into_string().unwrap_or_default())
+            }
+            Err(ureq::Error::Status(code, r)) => (code, r.into_string().unwrap_or_default()),
+            Err(e) => {
+                eprintln!("[A4] 传输层错误: {e}");
+                return;
+            }
+        };
+        let a = answer(&b);
+        eprintln!("[A4] 历史数组 HTTP {st} event_type={:?} 风控={:?}", scan_num(&b, "event_type"), known_risk(&b));
+        eprintln!("[A4] 回答: {a}");
+        eprintln!("[A4] 是否理解 42 = {}", a.contains("42"));
+    }
+
+    /// 实验 B：三模式对比（快速 / 思考 / 专家）——观察 event_type 与 content_type 集合差异
+    /// （思考模式预期出现 content_type 2008 思考链增量）
+    #[test]
+    #[ignore]
+    fn doubao_think_probe() {
+        let dd = probe_data_dir();
+        let Some((cookie, _)) = first_available_cookie(&dd) else {
+            eprintln!("[B] 无可用凭证");
+            return;
+        };
+        let agent = probe_agent();
+        for (name, dt, ac) in [
+            ("快速 doubao", false, false),
+            ("思考 doubao-think", true, false),
+            ("专家 doubao-expert", true, true),
+        ] {
+            let lcid = new_local_id();
+            let Some((st, ct, b)) = chat(&agent, &cookie, "0", &lcid, "用一句话解释什么是量子纠缠。", dt, ac) else {
+                continue;
+            };
+            eprintln!(
+                "[B] {name}: HTTP {st} {ct} event_type={:?} content_type={:?} 回答字数={} 风控={:?}",
+                scan_num(&b, "event_type"),
+                scan_num(&b, "content_type"),
+                answer(&b).chars().count(),
+                known_risk(&b)
+            );
+        }
+    }
+
+    /// 实验 C：风控容忍度——连续 N 次串行请求（间隔约 1.2s），观察何时出现风控码
+    #[test]
+    #[ignore]
+    fn doubao_ratelimit_probe() {
+        let dd = probe_data_dir();
+        let Some((cookie, _)) = first_available_cookie(&dd) else {
+            eprintln!("[C] 无可用凭证");
+            return;
+        };
+        let agent = probe_agent();
+        for i in 1..=10u32 {
+            let lcid = new_local_id();
+            let Some((st, _ct, b)) = chat(&agent, &cookie, "0", &lcid, "1+1=?", false, false) else {
+                continue;
+            };
+            let risk = known_risk(&b);
+            eprintln!("[C] 第 {i} 次: HTTP {st} event_type={:?} 风控={:?}", scan_num(&b, "event_type"), risk);
+            if !risk.is_empty() {
+                eprintln!("[C] 命中风控于第 {i} 次，停止");
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+        }
+    }
+
+    /// 只读探针：拉取本机账号 IM 会话/消息元数据，查「工作任务」模式是否带模型 / bot 标识。
+    /// 只走只读端点（im/chain/recent_conv、im/chain/single），不触发 completion 风控；
+    /// 仅打印结构性字段，绝不回显会话标题等用户正文（非白名单字符串只打印长度）。
+    /// 运行：`cargo test --no-default-features doubao_im_meta_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn doubao_im_meta_probe() {
+        use std::collections::BTreeSet;
+        let dd = probe_data_dir();
+        let Some((cookie, _)) = first_available_cookie(&dd) else {
+            eprintln!("[IM] 无可用凭证");
+            return;
+        };
+        let agent = probe_agent();
+        let convs = match fetch_recent_convs(&agent, &cookie, 40) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[IM] recent_conv 失败: {e}");
+                return;
+            }
+        };
+        eprintln!("[IM] 会话数={}", convs.len());
+        let mut keys: BTreeSet<String> = BTreeSet::new();
+        for c in &convs {
+            if let Some(o) = c.as_object() {
+                keys.extend(o.keys().cloned());
+            }
+        }
+        eprintln!("[IM] conversation 字段集合={:?}", keys);
+
+        // 只展示 bot/model/agent/type 类字段；仅白名单键回显原值（均为平台标识，非用户内容）
+        let show = |o: &Value, tag: &str, i: usize| {
+            let Some(map) = o.as_object() else { return };
+            let mut meta: Vec<String> = Vec::new();
+            for (k, v) in map {
+                let lk = k.to_ascii_lowercase();
+                if !(lk.contains("bot")
+                    || lk.contains("model")
+                    || lk.contains("agent")
+                    || lk.contains("type")
+                    || lk.contains("extra")
+                    || lk.contains("project")
+                    || lk.contains("device")
+                    || lk.contains("tag")
+                    || lk.contains("time"))
+                {
+                    continue;
+                }
+                let raw_ok = matches!(
+                    lk.as_str(),
+                    "bot_id"
+                        | "model"
+                        | "model_id"
+                        | "model_name"
+                        | "conversation_type"
+                        | "agent_id"
+                        | "type"
+                        | "create_time"
+                        | "update_time"
+                        | "pinned_time"
+                );
+                let shown = match v {
+                    Value::String(s) if raw_ok && s.chars().count() <= 64 => s.clone(),
+                    Value::String(s) => format!("str(len={})", s.chars().count()),
+                    Value::Number(n) => n.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    Value::Array(a) => format!("arr(len={})", a.len()),
+                    Value::Object(m) => format!("obj(keys={:?})", m.keys().collect::<Vec<_>>()),
+                    Value::Null => "null".to_string(),
+                };
+                meta.push(format!("{k}={shown}"));
+            }
+            eprintln!("[IM] {tag}#{i}: {}", meta.join(" "));
+        };
+        // conv_extra 里的模式/模型选择字段取值（平台标识，非用户内容）
+        let extra_whitelist = [
+            "mode_id",
+            "model_item_key",
+            "reasoning_effort",
+            "reply_mode",
+            "agent_mode_last_used",
+            "conversation_biz_type",
+            "conv_create_scene",
+        ];
+        for (i, c) in convs.iter().enumerate() {
+            show(c, "conv", i);
+            let sc = |k: &str| -> String {
+                c.get(k)
+                    .map(|v| match v {
+                        Value::String(s) => s.clone(),
+                        Value::Number(n) => n.to_string(),
+                        Value::Bool(b) => b.to_string(),
+                        _ => "-".to_string(),
+                    })
+                    .unwrap_or_else(|| "-".to_string())
+            };
+            let ce = c.get("conv_extra").and_then(Value::as_object);
+            let ec = |k: &str| -> String {
+                ce.and_then(|m| m.get(k))
+                    .map(|v| match v {
+                        Value::String(s) => s.clone(),
+                        Value::Number(n) => n.to_string(),
+                        Value::Bool(b) => b.to_string(),
+                        _ => "-".to_string(),
+                    })
+                    .unwrap_or_else(|| "-".to_string())
+            };
+            eprintln!(
+                "[IM] SUM#{i} bot_id={} bot_type={} ctype={} create={} update={} | mode={} key={} effort={} reply={} last={}",
+                sc("bot_id"),
+                sc("bot_type"),
+                sc("conversation_type"),
+                sc("create_time"),
+                sc("update_time"),
+                ec("mode_id"),
+                ec("model_item_key"),
+                ec("reasoning_effort"),
+                ec("reply_mode"),
+                ec("agent_mode_last_used"),
+            );
+            if let Some(ce) = c.get("conv_extra").and_then(Value::as_object) {
+                let mut kv: Vec<String> = Vec::new();
+                for k in extra_whitelist {
+                    if let Some(v) = ce.get(k) {
+                        let s = match v {
+                            Value::String(s) if s.chars().count() <= 64 => s.clone(),
+                            Value::String(s) => format!("str(len={})", s.chars().count()),
+                            Value::Number(n) => n.to_string(),
+                            Value::Bool(b) => b.to_string(),
+                            Value::Array(a) => format!("arr(len={})", a.len()),
+                            Value::Object(_) => "obj".to_string(),
+                            Value::Null => "null".to_string(),
+                        };
+                        kv.push(format!("{k}={s}"));
+                    }
+                }
+                if !kv.is_empty() {
+                    eprintln!("[IM] conv#{i} extra: {}", kv.join(" "));
+                }
+            }
+        }
+        if let Some(c0) = convs.first() {
+            let cid = c0.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            if !cid.is_empty() {
+                match fetch_messages(&agent, &cookie, cid, 1) {
+                    Ok(msgs) => {
+                        let mut mk: BTreeSet<String> = BTreeSet::new();
+                        for m in &msgs {
+                            if let Some(o) = m.as_object() {
+                                mk.extend(o.keys().cloned());
+                            }
+                        }
+                        eprintln!("[IM] 首会话消息数={} 字段集合={:?}", msgs.len(), mk);
+                        for (i, m) in msgs.iter().enumerate().take(4) {
+                            show(m, "msg", i);
+                        }
+                    }
+                    Err(e) => eprintln!("[IM] chain/single 失败: {e}"),
+                }
+            }
+        }
+        // 额外观察一个「非默认 bot」的会话（bot_type != 3），看模式选择是否还有独立标识
+        if let Some(cx) = convs
+            .iter()
+            .find(|c| c.get("bot_type").and_then(Value::as_i64).map(|t| t != 3).unwrap_or(false))
+        {
+            let cid = cx.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+            if !cid.is_empty() {
+                match fetch_messages(&agent, &cookie, cid, 1) {
+                    Ok(msgs) => {
+                        let mut mk: BTreeSet<String> = BTreeSet::new();
+                        for m in &msgs {
+                            if let Some(o) = m.as_object() {
+                                mk.extend(o.keys().cloned());
+                            }
+                        }
+                        eprintln!("[IM] 非默认 bot 会话消息数={} 字段集合={:?}", msgs.len(), mk);
+                        for (i, m) in msgs.iter().enumerate().take(4) {
+                            show(m, "nbmsg", i);
+                        }
+                    }
+                    Err(e) => eprintln!("[IM] 非默认 bot chain/single 失败: {e}"),
+                }
+            }
+        }
+    }
+
+    /// 实验 D：模型选择字段的「位置 + 字段名」是否被上游接受。
+    /// 做法：带 mode_id / model_item_key / reasoning_effort / reply_mode 新建一个会话
+    /// （放在 completion_option 内，1 次 completion 请求），随后用只读接口把该会话读回，
+    /// 校验 conv_extra 是否记录了指定的 key。
+    /// 判定：读回 key 与指定值一致 = 字段与位置正确；仍是 9（自动）= 字段被忽略，需换位置/换名。
+    /// 运行：`cargo test --no-default-features doubao_model_select_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn doubao_model_select_probe() {
+        use std::collections::BTreeSet;
+        let dd = probe_data_dir();
+        let Some((cookie, _)) = first_available_cookie(&dd) else {
+            eprintln!("[D] 无可用凭证");
+            return;
+        };
+        let agent = probe_agent();
+        let before: BTreeSet<String> = fetch_recent_convs(&agent, &cookie, 20)
+            .map(|v| {
+                v.iter()
+                    .filter_map(|c| c.get("conversation_id").and_then(Value::as_str).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let lcid = new_local_id();
+        let body = json!({
+            "messages": [{
+                "content": json!({"text": "1"}).to_string(),
+                "content_type": 2001,
+                "local_message_id": format!("{now_ms}_00000000000000000000000000000000"),
+            }],
+            "conversation_id": "0",
+            "local_conversation_id": lcid,
+            "bot_id": "7338286299411103781",
+            "completion_option": {
+                "is_regen": false,
+                "with_suggest": false,
+                "need_create_conversation": true,
+                "launch_stage": 1,
+                "memory_type": 1,
+                "use_deep_think": false,
+                "use_auto_cot": false,
+                "mode_id": 3,
+                "model_item_key": "seed-lite-7b",
+                "reasoning_effort": 5,
+                "reply_mode": 10001,
+            }
+        });
+        let url = format!("https://www.doubao.com/samantha/chat/completion?{SINGLE_QS}");
+        let out = agent
+            .post(&url)
+            .set("content-type", "application/json; encoding=utf-8")
+            .set("cookie", &cookie)
+            .set("agw-js-conv", "str")
+            .set("user-agent", UA)
+            .set("accept", "application/json, text/event-stream, */*")
+            .set("referer", "https://www.doubao.com/")
+            .send_string(&body.to_string());
+        match out {
+            Ok(r) => {
+                let st = r.status();
+                let ct = r.header("content-type").unwrap_or("").to_string();
+                let b = r.into_string().unwrap_or_default();
+                let dump = std::env::temp_dir().join("doubao_model_probe_body.txt");
+                let _ = std::fs::write(&dump, &b);
+                eprintln!("[D] 原始体已写入 {}", dump.display());
+                eprintln!("[D] 建会话请求 HTTP {st} type={ct} len={}", b.len());
+                eprintln!("[D] event_type={:?} 风控={:?}", scan_num(&b, "event_type"), known_risk(&b));
+                eprintln!("[D] 回答={}", answer(&b));
+            }
+            Err(e) => {
+                eprintln!("[D] 请求失败（未发出去/被拒）: {e}");
+                return;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        match fetch_recent_convs(&agent, &cookie, 20) {
+            Ok(convs) => {
+                for (i, c) in convs.iter().enumerate().take(6) {
+                    let cid = c.get("conversation_id").and_then(Value::as_str).unwrap_or("");
+                    let is_new = !before.contains(cid);
+                    let ce = c.get("conv_extra").and_then(Value::as_object);
+                    let ec = |k: &str| {
+                        ce.and_then(|m| m.get(k))
+                            .map(|v| match v {
+                                Value::String(s) => s.clone(),
+                                _ => v.to_string(),
+                            })
+                            .unwrap_or_else(|| "-".to_string())
+                    };
+                    eprintln!(
+                        "[D] 读回 conv#{i} new={is_new} create={} | mode={} key={} effort={} reply={}",
+                        c.get("create_time").map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+                        ec("mode_id"),
+                        ec("model_item_key"),
+                        ec("reasoning_effort"),
+                        ec("reply_mode"),
+                    );
+                }
+            }
+            Err(e) => eprintln!("[D] 读回失败: {e}"),
+        }
     }
 }

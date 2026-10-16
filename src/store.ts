@@ -149,6 +149,8 @@ interface AppState {
   removeGroup: (id: string) => Promise<void>;
   moveAccount: (userId: string, groupId: string | null) => Promise<void>;
   resetDevice: (userId: string) => Promise<void>;
+  /** 为全部 Trae 账号一键重派设备号（按 uid 派生的唯一设备号） */
+  reassignAllDevices: () => Promise<void>;
   switchTo: (userId: string, targetApp?: 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') => Promise<void>;
   /** issue #44：看门狗超时后清空切换/保存进行中状态——解除 spinner/「切换中…」永挂；
       迟到的 done 事件仍会正常提示结果（onSwitchDone 对 null 幂等） */
@@ -949,6 +951,15 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().pushToast('success', '设备 ID 已重置');
     } catch (err) {
       get().pushToast('error', `重置失败：${String(err)}`);
+    }
+  },
+  reassignAllDevices: async () => {
+    try {
+      const r = await api.misc.deviceReassignAll();
+      await get().refreshAccounts();
+      get().pushToast('success', `已重派设备号：${r.total} 个账号，变更 ${r.changed} 个`);
+    } catch (err) {
+      get().pushToast('error', `重派设备号失败：${String(err)}`);
     }
   },
   switchTo: async (userId, targetApp) => {

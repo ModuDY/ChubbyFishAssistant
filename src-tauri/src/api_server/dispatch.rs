@@ -44,6 +44,8 @@ pub enum TargetPool {
     Custom,
     /// Qoder 上游（p3-3，gateway.qoder.com.cn 推理网关；Qoder 目录命中即源）
     Qoder,
+    /// 豆包上游（E-01，www.doubao.com/samantha/chat/completion；豆包目录命中即源）
+    Doubao,
 }
 
 impl TargetPool {
@@ -53,6 +55,7 @@ impl TargetPool {
             TargetPool::Buddy => "buddy",
             TargetPool::Custom => "custom",
             TargetPool::Qoder => "qoder",
+            TargetPool::Doubao => "doubao",
         }
     }
 
@@ -61,6 +64,7 @@ impl TargetPool {
             "trae" => Some(TargetPool::Trae),
             "buddy" => Some(TargetPool::Buddy),
             "qoder" => Some(TargetPool::Qoder),
+            "doubao" => Some(TargetPool::Doubao),
             _ => None,
         }
     }
@@ -209,6 +213,10 @@ pub enum DispatchError {
     ModelCooling(i64),
     /// 首选（唯一可用）池耗尽：无健康账号 / 全冷却
     NoHealthy(TargetPool),
+    /// 仅豆包源模型且 doubao_enabled=false（E-01，默认关；同族镜像）
+    DoubaoDisabled,
+    /// 豆包占位模型（verified=false，待 MITM 抓包定参）：识别但拒绝（400 不打上游）
+    DoubaoUnverified(&'static str),
 }
 
 /// 选池结果
@@ -304,6 +312,8 @@ impl ModelSources {
             TargetPool::Buddy => self.buddy.is_some() && wb_enabled,
             TargetPool::Qoder => self.qoder.is_some() && qoder_enabled,
             TargetPool::Custom => false,
+            // 豆包走 resolve_target 顶部单源短路，不进入源集合判定——恒 false 仅匹配穷尽
+            TargetPool::Doubao => false,
         }
     }
 }
@@ -390,6 +400,26 @@ pub fn resolve_target(
                 fallback_from: None,
             });
         }
+    }
+
+    // ⓪⁻ 豆包单源短路（E-01）：豆包目录命中 → 单源，不进入 ModelSources / smart
+    // 重排 / per_model / 跨池回退。`doubao_enabled=false` 报 DoubaoDisabled；
+    // `verified=false` 占位模型报 DoubaoUnverified（400，不打上游）。
+    // 池前缀 `doubao/xxx` 同样命中（forced_pool 锁池与目录一致，无需额外处理）。
+    if let Some(dm) = super::doubao_payload::lookup(model) {
+        if !state.doubao_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(DispatchError::DoubaoDisabled);
+        }
+        if !dm.verified {
+            return Err(DispatchError::DoubaoUnverified(dm.id));
+        }
+        return Ok(Resolved {
+            pool: TargetPool::Doubao,
+            model: dm.id.to_string(),
+            effort_hint: None,
+            max_mode_hint: false,
+            fallback_from: None,
+        });
     }
 
     // ② 模型名归一化（四段管线）+ Buddy 源判定：管线命中目录 → Buddy 源存在
@@ -766,6 +796,8 @@ fn smart_pool_order(
             TargetPool::Buddy => (wb_stats, buddy_rate),
             TargetPool::Qoder => (qoder_stats, qoder_rate),
             TargetPool::Custom => ((None, 0.0), None),
+            // 豆包单源短路不可达（匹配穷尽兜底）
+            TargetPool::Doubao => ((None, 0.0), None),
         };
         (
             earliest.unwrap_or(i64::MAX),
@@ -827,6 +859,8 @@ fn pool_health(
         }
         // 不可达：custom 在 resolve_target 顶部短路返回（匹配穷尽兜底）
         TargetPool::Custom => Ok(()),
+        // 不可达：豆包在 resolve_target 顶部单源短路返回（匹配穷尽兜底）
+        TargetPool::Doubao => Ok(()),
     }
 }
 
@@ -856,6 +890,8 @@ fn final_model_for(pool: TargetPool, sources: &ModelSources, request_model: &str
         // Qoder：目录归一化 id（去空白形态，执行路径据此 resolve 请求素材）
         TargetPool::Qoder => sources.qoder.clone().unwrap_or_default(),
         TargetPool::Custom => request_model.to_string(),
+        // 豆包单源短路不可达：透传原名即可（档位由模型表决定）
+        TargetPool::Doubao => request_model.to_string(),
     }
 }
 
@@ -867,6 +903,8 @@ fn effort_for(pool: TargetPool, sources: &ModelSources) -> Option<String> {
         // Qoder：v1 无路由级 effort 通道（思考档位由执行路径按目录条目解析）
         TargetPool::Qoder => None,
         TargetPool::Custom => None,
+        // 豆包：档位由模型表（deep_think/auto_cot）决定，无路由级 effort
+        TargetPool::Doubao => None,
     }
 }
 
@@ -875,7 +913,7 @@ fn effort_for(pool: TargetPool, sources: &ModelSources) -> Option<String> {
 fn max_mode_for(pool: TargetPool, sources: &ModelSources) -> bool {
     match pool {
         TargetPool::Trae => sources.trae_final.2,
-        TargetPool::Buddy | TargetPool::Custom | TargetPool::Qoder => false,
+        TargetPool::Buddy | TargetPool::Custom | TargetPool::Qoder | TargetPool::Doubao => false,
     }
 }
 
@@ -909,6 +947,7 @@ fn pool_sticky_ttl_secs(state: &ApiSharedState, pool: TargetPool) -> u64 {
         TargetPool::Trae | TargetPool::Custom => &state.trae_pool_sticky_ttl_secs,
         TargetPool::Buddy => &state.wb_pool_sticky_ttl_secs,
         TargetPool::Qoder => &state.qoder_pool_sticky_ttl_secs,
+        TargetPool::Doubao => &state.doubao_pool_sticky_ttl_secs,
     };
     cell.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -1026,6 +1065,11 @@ mod tests {
             qoder_sticky_enabled: AtomicBool::new(false),
             qoder_sticky: super::super::wb_sticky::StickyStore::default(),
             trae_sticky: super::super::wb_sticky::StickyStore::default(),
+            doubao_pool: super::super::pool::ApiPool::new(),
+            doubao_enabled: AtomicBool::new(false),
+            doubao_identity: None,
+            doubao_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            doubao_quota: super::super::doubao_route::DoubaoQuota::new(),
             listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
         });
         Fixture { dir, state }

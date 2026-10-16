@@ -230,18 +230,20 @@ impl DayStats {
 }
 
 /// 用量分桶（资源池维度分账）：Trae = Trae 模型请求；Wb = WB 上游请求；
-/// Custom = 自定义模型（custom_models.json 命中直达）请求；Qoder = Qoder 上游请求（阶段 3）
+/// Custom = 自定义模型（custom_models.json 命中直达）请求；Qoder = Qoder 上游请求（阶段 3）；
+/// Doubao = 豆包上游请求（E-01）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UsageBucket {
     Trae,
     Wb,
     Custom,
     Qoder,
+    Doubao,
 }
 
 /// 用量数据根结构：日期 → 单日统计。
 /// 按资源池分桶：days = Trae 模型请求；wb_days = WB 上游请求；custom_days = 自定义模型请求；
-/// qoder_days = Qoder 上游请求
+/// qoder_days = Qoder 上游请求；doubao_days = 豆包上游请求
 /// （serde default，旧文件无对应桶时视为空——历史混入数据无法追溯分离，从启用时点起分账）。
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct UsageFile {
@@ -253,6 +255,8 @@ pub struct UsageFile {
     pub custom_days: HashMap<String, DayStats>,
     #[serde(default)]
     pub qoder_days: HashMap<String, DayStats>,
+    #[serde(default)]
+    pub doubao_days: HashMap<String, DayStats>,
 }
 
 impl UsageFile {
@@ -262,6 +266,7 @@ impl UsageFile {
             UsageBucket::Wb => &mut self.wb_days,
             UsageBucket::Custom => &mut self.custom_days,
             UsageBucket::Qoder => &mut self.qoder_days,
+            UsageBucket::Doubao => &mut self.doubao_days,
         }
     }
 
@@ -272,6 +277,7 @@ impl UsageFile {
             UsageBucket::Wb => &self.wb_days,
             UsageBucket::Custom => &self.custom_days,
             UsageBucket::Qoder => &self.qoder_days,
+            UsageBucket::Doubao => &self.doubao_days,
         };
         b.get(day)
     }
@@ -403,7 +409,13 @@ impl UsageFile {
     pub fn trim(&mut self, keep_days: i64) {
         let cutoff = chrono::Local::now().date_naive() - chrono::Duration::days(keep_days);
         let cutoff_str = cutoff.format("%Y-%m-%d").to_string();
-        for bucket in [&mut self.days, &mut self.wb_days, &mut self.custom_days, &mut self.qoder_days] {
+        for bucket in [
+            &mut self.days,
+            &mut self.wb_days,
+            &mut self.custom_days,
+            &mut self.qoder_days,
+            &mut self.doubao_days,
+        ] {
             bucket.retain(|d, _| d.as_str() >= cutoff_str.as_str());
         }
     }
@@ -418,6 +430,7 @@ impl UsageFile {
             UsageBucket::Wb => &self.wb_days,
             UsageBucket::Custom => &self.custom_days,
             UsageBucket::Qoder => &self.qoder_days,
+            UsageBucket::Doubao => &self.doubao_days,
         };
         // 窗口含今日：days=7 → 今日与此前 6 个日历天（字符串比较口径对齐 trim）
         let cutoff = (chrono::Local::now().date_naive()
@@ -489,6 +502,7 @@ pub fn save_day(data_dir: &Path, bucket: UsageBucket, day: &str, stats: &DayStat
         UsageBucket::Wb => "wb",
         UsageBucket::Custom => "custom",
         UsageBucket::Qoder => "qoder",
+        UsageBucket::Doubao => "doubao",
     };
     crate::store::docs::api_usage_upsert_day(&crate::store::db(data_dir), b, day, &text).is_ok()
 }

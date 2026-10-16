@@ -5,6 +5,10 @@ pub mod config_cache;
 pub mod custom_models;
 pub mod custom_route;
 pub mod dispatch;
+pub mod doubao_payload;
+pub mod doubao_route;
+pub mod doubao_sse;
+pub mod doubao_upstream;
 pub mod efforts;
 pub mod gateway_settings;
 pub mod models_sync;
@@ -147,6 +151,22 @@ pub struct ApiSharedState {
     /// sticky_bindings 表，键命名空间 "t:" 隔离；会话→账号绑定供 Trae 取号粘住
     ///（显式 conversationId / 消息指纹双模式，TTL 经 trae_sticky_ttl_secs 配置）
     pub trae_sticky: wb_sticky::StickyStore,
+    // ── 豆包上游（E-01，www.doubao.com/samantha/chat/completion）──────────
+    /// 豆包上游账号池：独立池实例与 SOLO/WB/Qoder 并列；凭证正文不在池内
+    ///（jwt 恒空），请求时经 doubao_identity 回调按需从 vault 解析
+    pub doubao_pool: ApiPool,
+    /// 豆包上游开关（api_pool.json.doubao_enabled，默认关；安全默认）：
+    /// 关闭时豆包模型不参与路由
+    pub doubao_enabled: std::sync::atomic::AtomicBool,
+    /// 豆包凭证解析回调（网关层无 AppState 引用，由启动方注入）：
+    /// 入参账号 uid，从 vault::ns_get("doubao", uid) 解析 session_id/sid_guard/ttwid；
+    /// 空池时兜底 "captured"。None（单测/未启用豆包）时豆包池不参与路由
+    pub doubao_identity:
+        Option<std::sync::Arc<dyn Fn(&str) -> Result<doubao_upstream::DoubaoCreds, String> + Send + Sync>>,
+    /// 豆包池粘性 TTL 秒（per-pool，默认 300）
+    pub doubao_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
+    /// 豆包账号级令牌桶（固定窗口 8 次/小时 + 验证码长冷却；实证 ~8 次/小时/账号）
+    pub doubao_quota: doubao_route::DoubaoQuota,
     /// 实际绑定的监听地址（2026-10-12 审查 M3）：服务启动时从 gateway 配置读入
     /// 一次注入。auth 层的 /health 环回豁免判定改读本字段——与 server.rs 的 bind
     /// 物理同源，改配置未重启时不再出现「配置值 vs 实际监听值」分离导致的
@@ -244,6 +264,40 @@ impl ApiSharedState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((usage::UsageBucket::Custom, day));
+    }
+
+    /// 记录一次豆包上游请求用量（独立 doubao_days 桶，E-01）；uid 为豆包账号 uid，
+    /// 落盘策略与 record_usage 相同。带 TTFT（F-76 同构），无首字语义的失败传 None
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_usage_doubao(
+        &self,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        ttfb_ms: Option<u64>,
+    ) {
+        let day = usage::today_key();
+        let mut guard = self
+            .usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.record_in_ttfb_on(
+            usage::UsageBucket::Doubao,
+            &day,
+            model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
+            ttfb_ms,
+        );
+        // 批次 C 削峰：同 record_usage_custom，仅标脏不落盘
+        drop(guard);
+        self.usage_dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((usage::UsageBucket::Doubao, day));
     }
 
     /// 记录一次上游缓存读 tokens 测量（M4 审查修复：DayStats 新增 cached_tokens
@@ -775,6 +829,11 @@ mod inflight_tests {
             qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
             qoder_sticky: wb_sticky::StickyStore::default(),
             trae_sticky: wb_sticky::StickyStore::default(),
+            doubao_pool: pool::ApiPool::new(),
+            doubao_enabled: std::sync::atomic::AtomicBool::new(false),
+            doubao_identity: None,
+            doubao_pool_sticky_ttl_secs: AtomicU64::new(0),
+            doubao_quota: super::doubao_route::DoubaoQuota::new(),
             listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
         };
         {

@@ -187,19 +187,22 @@ pub async fn do_start(
     pool.set_strategy(strategy);
     let wb_pool = ApiPool::new();
     let qoder_pool = ApiPool::new();
-    // 冷却/禁用标记落 app.log（F-80）：三池注入 (data_dir, 池标签)，
+    let doubao_pool = ApiPool::new();
+    // 冷却/禁用标记落 app.log（F-80）：各池注入 (data_dir, 池标签)，
     // note_error 打冷却/禁用时同步写 `account cooldown: pool=…` 便于排查跨池回退链路
     pool.set_log_ctx(&state.data_dir, "trae");
     wb_pool.set_log_ctx(&state.data_dir, "buddy");
     qoder_pool.set_log_ctx(&state.data_dir, "qoder");
-    // 账号保留剩余积分（issue #91）：调度策略统一配置，启动时三池应用
+    doubao_pool.set_log_ctx(&state.data_dir, "doubao");
+    // 账号保留剩余积分（issue #91）：调度策略统一配置，启动时各池应用
     //（credits=0 时无过滤；Qoder 池 credits 恒 None 不受影响，保持口径一致仍设置）
     let reserve_credits = crate::api_server::dispatch::load_policy(&state.data_dir).reserve_credits;
     pool.set_reserve_credits(reserve_credits);
     wb_pool.set_reserve_credits(reserve_credits);
     qoder_pool.set_reserve_credits(reserve_credits);
-    let (pool_count, wb_uids_len, wb_accounts_total, qoder_count) =
-        apply_pool_snapshot(state, &pool, &wb_pool, &qoder_pool);
+    doubao_pool.set_reserve_credits(reserve_credits);
+    let (pool_count, wb_uids_len, wb_accounts_total, qoder_count, doubao_count) =
+        apply_pool_snapshot(state, &pool, &wb_pool, &qoder_pool, &doubao_pool);
 
     let healthy_count = pool.diagnose().iter().filter(|d| d.reason.starts_with("healthy")).count();
     fs_utils::app_log(
@@ -239,6 +242,21 @@ pub async fn do_start(
             pool_file.qoder_enabled,
             qoder_count,
             qoder_strategy.as_str(),
+        ),
+    );
+
+    // 豆包池启动概况（E-01）：开关默认 false，未启用时不产生告警噪音；
+    // doubao_strategy 空 = 跟随 Trae 池策略（与 Buddy/Qoder 同语义）
+    let doubao_strategy =
+        crate::api_server::pool::PoolStrategy::resolve_doubao(&pool_file.strategy, &pool_file.doubao_strategy);
+    doubao_pool.set_strategy(doubao_strategy);
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "API服务启动-豆包上游池: enabled={} accounts={} strategy={}",
+            pool_file.doubao_enabled,
+            doubao_count,
+            doubao_strategy.as_str(),
         ),
     );
 
@@ -376,6 +394,33 @@ pub async fn do_start(
         ),
         qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(pool_file.qoder_sticky_enabled),
         qoder_sticky: crate::api_server::wb_sticky::StickyStore::load_ns(&state.data_dir, "q:"),
+        // 豆包上游（E-01）：专用池 + identity 回调注入。回调从 vault ns "doubao"
+        // 按 uid 解析 session_id/sid_guard/ttwid（凭证正文不入池结构，仅内存）；
+        // 空 uid 兜底全局抓包 "captured" 槽；未启用豆包时本回调不触发
+        doubao_pool,
+        doubao_enabled: std::sync::atomic::AtomicBool::new(pool_file.doubao_enabled),
+        doubao_identity: Some({
+            let data_dir = state.data_dir.clone();
+            std::sync::Arc::new(move |uid: &str| {
+                let key = if uid.is_empty() { "captured" } else { uid };
+                let v = crate::vault::ns_get(&data_dir, "doubao", key)
+                    .ok_or_else(|| format!("doubao 凭证缺失(uid={uid})"))?;
+                let pick = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let session_id = pick("session_id");
+                if session_id.is_empty() {
+                    return Err(format!("doubao session_id 缺失(uid={uid})"));
+                }
+                Ok(crate::api_server::doubao_upstream::DoubaoCreds {
+                    session_id,
+                    sid_guard: pick("sid_guard"),
+                    ttwid: pick("ttwid"),
+                })
+            })
+        }),
+        doubao_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(
+            pool_file.doubao_pool_sticky_ttl_secs,
+        ),
+        doubao_quota: crate::api_server::doubao_route::DoubaoQuota::new(),
     });
 
     // per-pool 三参数热应用（F-76②/F-77 拆分版）：账号并发上限 / 池粘性 TTL /
@@ -389,6 +434,9 @@ pub async fn do_start(
     shared
         .qoder_pool
         .set_concurrency_limit(pool_file.qoder_account_concurrency_limit);
+    shared
+        .doubao_pool
+        .set_concurrency_limit(pool_file.doubao_account_concurrency_limit);
     shared
         .trae_sticky
         .set_explicit_ttl(pool_file.trae_sticky_ttl_secs as i64);
@@ -726,14 +774,16 @@ fn merge_pool_expire_times(rc: &RemainingCreditsFile) -> std::collections::HashM
 }
 
 /// 池装配公共逻辑（do_start 构建 / 凭据变更热重载共用）：
-/// 读取 vault 账号 + 池配置 + 分组 + 冷却 + 积分 + 设备映射，全量重建三池内条目。
-/// 返回 (trae 池条目数, wb 白名单长度, wb 账号总数, qoder 池条目数) 供调用方记日志。
+/// 读取 vault 账号 + 池配置 + 分组 + 冷却 + 积分 + 设备映射，全量重建四池内条目。
+/// 返回 (trae 池条目数, wb 白名单长度, wb 账号总数, qoder 池条目数, doubao 池条目数)
+/// 供调用方记日志。
 fn apply_pool_snapshot(
     state: &AppState,
     pool: &ApiPool,
     wb_pool: &ApiPool,
     qoder_pool: &ApiPool,
-) -> (usize, usize, usize, usize) {
+    doubao_pool: &ApiPool,
+) -> (usize, usize, usize, usize, usize) {
     let accounts = crate::vault::load_accounts(state);
     let pool_file = load_pool_file(&state.data_dir);
     let groups_file: crate::models::GroupsFile =
@@ -860,7 +910,28 @@ fn apply_pool_snapshot(
     let qoder_ids: Vec<String> = qoder_sync.iter().map(|a| a.uid.clone()).collect();
     let qoder_uids = effective_qoder_uids(&pool_file, &qoder_ids);
     qoder_pool.sync_from_qoder(&qoder_sync, &qoder_uids);
-    (pool.count(), wb_uids.len(), wb_accounts.len(), qoder_pool.count())
+    // 豆包池装配（E-01 v1）：账号池行（doubao_accounts）→ DoubaoAccountSync；
+    // v1 无白名单/分组筛选概念，全部行入池（凭证由 identity 回调按次从 vault 解析，
+    // 池内仅存「是否已有凭证」作为 disabled 门槛）。needs_captcha 由 DoubaoQuota 独立透出。
+    let doubao_accounts = crate::store::docs::doubao_pool_load(&crate::store::db(&state.data_dir));
+    let doubao_sync: Vec<crate::api_server::pool::DoubaoAccountSync> = doubao_accounts
+        .accounts
+        .iter()
+        .map(|a| crate::api_server::pool::DoubaoAccountSync {
+            uid: a.user_id.clone(),
+            name: if a.name.is_empty() { a.user_id.clone() } else { a.name.clone() },
+            has_credentials: crate::vault::ns_get(&state.data_dir, "doubao", &a.user_id).is_some(),
+        })
+        .collect();
+    let doubao_uids: Vec<String> = doubao_sync.iter().map(|a| a.uid.clone()).collect();
+    doubao_pool.sync_from_doubao(&doubao_sync, &doubao_uids);
+    (
+        pool.count(),
+        wb_uids.len(),
+        wb_accounts.len(),
+        qoder_pool.count(),
+        doubao_pool.count(),
+    )
 }
 
 /// 网关运行中热重载两池（凭据/成员变更联动）：OAuth 重登、refresh_token 刷新、
@@ -874,12 +945,17 @@ pub fn reload_pools_if_running(
 ) {
     let guard = safe_lock(runtime);
     let Some(rt) = guard.as_ref() else { return };
-    let (trae, wb_uids, wb_total, qoder) =
-        apply_pool_snapshot(state, &rt.shared.pool, &rt.shared.wb_pool, &rt.shared.qoder_pool);
+    let (trae, wb_uids, wb_total, qoder, doubao) = apply_pool_snapshot(
+        state,
+        &rt.shared.pool,
+        &rt.shared.wb_pool,
+        &rt.shared.qoder_pool,
+        &rt.shared.doubao_pool,
+    );
     fs_utils::app_log(
         &state.data_dir,
         &format!(
-            "API服务池热重载(凭据/成员变更联动): trae_pool={trae} wb_whitelist={wb_uids} wb_accounts={wb_total} qoder_pool={qoder}"
+            "API服务池热重载(凭据/成员变更联动): trae_pool={trae} wb_whitelist={wb_uids} wb_accounts={wb_total} qoder_pool={qoder} doubao_pool={doubao}"
         ),
     );
 }
@@ -951,6 +1027,14 @@ fn merge_pool_set(
     // Qoder 池内调度策略；空串 = 跟随 Trae 池（同 wb_strategy 语义）；None = 保留原值
     qoder_strategy: Option<String>,
     trae_enabled: Option<bool>,
+    // 豆包池内调度策略；空串 = 跟随 Trae 池（同 qoder_strategy 语义）；None = 保留原值
+    doubao_strategy: Option<String>,
+    // 豆包上游开关（E-01，默认 false 安全默认）；None = 保留原值
+    doubao_enabled: Option<bool>,
+    // 豆包池账号并发上限；None = 保留原值
+    doubao_account_concurrency_limit: Option<u32>,
+    // 豆包池粘性 TTL（秒）；None = 保留原值
+    doubao_pool_sticky_ttl_secs: Option<u64>,
 ) -> ApiPoolFile {
     // Trae 池白名单剥离 wb- 前缀条目：WB 账号归属独立白名单 wb_enabled_uids，
     // 旧版混存于共享 enabled_uids（历史兼容形态），保存时迁移归位防丢失
@@ -1010,6 +1094,12 @@ fn merge_pool_set(
         qoder_enabled_uids: qoder_uids.unwrap_or_else(|| existing.qoder_enabled_uids.clone()),
         qoder_group_ids: qoder_group_ids.unwrap_or_else(|| existing.qoder_group_ids.clone()),
         qoder_strategy: qoder_strategy.unwrap_or_else(|| existing.qoder_strategy.clone()),
+        doubao_strategy: doubao_strategy.unwrap_or_else(|| existing.doubao_strategy.clone()),
+        doubao_enabled: doubao_enabled.unwrap_or(existing.doubao_enabled),
+        doubao_account_concurrency_limit: doubao_account_concurrency_limit
+            .unwrap_or(existing.doubao_account_concurrency_limit),
+        doubao_pool_sticky_ttl_secs: doubao_pool_sticky_ttl_secs
+            .unwrap_or(existing.doubao_pool_sticky_ttl_secs),
         // 标签筛选不参与 merge_pool_set（pool_set 命令在 merge 后追加应用），原样保留
         trae_tag_ids: existing.trae_tag_ids.clone(),
         wb_tag_ids: existing.wb_tag_ids.clone(),
@@ -1065,6 +1155,14 @@ pub fn pool_set(
     qoder_group_ids: Option<Vec<String>>,
     // Qoder 池内调度策略（空串 = 跟随 Trae 池）；None = 保留原值
     qoder_strategy: Option<String>,
+    // 豆包池内调度策略（空串 = 跟随 Trae 池）；None = 保留原值
+    doubao_strategy: Option<String>,
+    // 豆包上游开关（E-01）；None = 保留原值
+    doubao_enabled: Option<bool>,
+    // 豆包池账号并发上限；None = 保留原值
+    doubao_account_concurrency_limit: Option<u32>,
+    // 豆包池粘性 TTL（秒）；None = 保留原值
+    doubao_pool_sticky_ttl_secs: Option<u64>,
     // Trae 池参与调度开关（默认开）；None = 保留原值
     trae_enabled: Option<bool>,
     // 各池共享标签筛选（tag_ 前缀 id）；None = 保留原值，Some(list) = 覆盖
@@ -1110,6 +1208,10 @@ pub fn pool_set(
         qoder_group_ids,
         qoder_strategy,
         trae_enabled,
+        doubao_strategy,
+        doubao_enabled,
+        doubao_account_concurrency_limit,
+        doubao_pool_sticky_ttl_secs,
     );
     // 标签筛选在 merge 后追加应用（merge_pool_set 纯函数签名不动，存量单测零改动）：
     // 显式空数组 = 清空标签筛选，None = 保留
@@ -1136,6 +1238,13 @@ pub fn pool_set(
         rt.shared.qoder_pool.set_strategy(
             crate::api_server::pool::PoolStrategy::resolve_qoder(&pool_file.strategy, &pool_file.qoder_strategy),
         );
+        // 豆包池策略热应用（E-01，空 = 跟随 Trae 池，与启动逻辑一致）
+        rt.shared.doubao_pool.set_strategy(
+            crate::api_server::pool::PoolStrategy::resolve_doubao(
+                &pool_file.strategy,
+                &pool_file.doubao_strategy,
+            ),
+        );
         // per-pool 三参数热应用（F-76②/F-77 拆分版）：并发上限 / 池粘性 TTL /
         // 显式会话粘性 TTL 三池各自生效
         rt.shared
@@ -1147,6 +1256,9 @@ pub fn pool_set(
         rt.shared
             .qoder_pool
             .set_concurrency_limit(pool_file.qoder_account_concurrency_limit);
+        rt.shared
+            .doubao_pool
+            .set_concurrency_limit(pool_file.doubao_account_concurrency_limit);
         rt.shared
             .trae_sticky
             .set_explicit_ttl(pool_file.trae_sticky_ttl_secs as i64);
@@ -1179,6 +1291,10 @@ pub fn pool_set(
             pool_file.qoder_pool_sticky_ttl_secs,
             std::sync::atomic::Ordering::Relaxed,
         );
+        rt.shared.doubao_pool_sticky_ttl_secs.store(
+            pool_file.doubao_pool_sticky_ttl_secs,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // Buddy 资源开关热应用（此前仅启动时读取，改动需重启服务生效）
         rt.shared
             .wb_enabled
@@ -1201,6 +1317,11 @@ pub fn pool_set(
         // Qoder 上游开关热应用（p3-3）
         rt.shared.qoder_enabled.store(
             pool_file.qoder_enabled,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // 豆包上游开关热应用（E-01）
+        rt.shared.doubao_enabled.store(
+            pool_file.doubao_enabled,
             std::sync::atomic::Ordering::Relaxed,
         );
         // Qoder 竞速对冲阈值 + 会话粘性热应用（F-80-余 v2）
@@ -1247,6 +1368,22 @@ pub fn qoder_pool_status(runtime: State<'_, Mutex<Option<ApiServerRuntime>>>) ->
     let guard = safe_lock(&runtime);
     match guard.as_ref() {
         Some(rt) => rt.shared.qoder_pool.status_list(),
+        None => vec![],
+    }
+}
+
+/// 返回运行中豆包池的实时状态（E-01 可观测）：账号运行时状态与小时配额快照
+/// （`needs_captcha` 经 `DoubaoQuota::snapshot()` 透出）合并；服务未运行时返回空数组
+#[tauri::command]
+pub fn doubao_pool_status(
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+) -> Vec<crate::api_server::doubao_route::DoubaoPoolStatus> {
+    let guard = safe_lock(&runtime);
+    match guard.as_ref() {
+        Some(rt) => crate::api_server::doubao_route::DoubaoPoolStatus::merge(
+            &rt.shared.doubao_pool.status_list(),
+            &rt.shared.doubao_quota.snapshot(),
+        ),
         None => vec![],
     }
 }
@@ -1568,26 +1705,39 @@ pub fn api_unified_models(
     runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
     available_only: Option<bool>,
 ) -> Vec<crate::api_server::unified_catalog::UnifiedModel> {
-    let (wb_enabled, qoder_enabled, trae_ok, buddy_ok, qoder_ok) = match safe_lock(&runtime).as_ref() {
-        Some(rt) => {
-            let s = &rt.shared;
-            (
-                s.wb_enabled
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                s.qoder_enabled
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                // Trae 开关（默认开）参与可用性：关闭时 Trae 源徽章置灰
-                s.trae_enabled.load(std::sync::atomic::Ordering::Relaxed)
-                    && s.pool.has_selectable(),
-                s.wb_pool.has_selectable(),
-                s.qoder_pool.has_selectable(),
-            )
-        }
-        None => {
-            let pf: ApiPoolFile = crate::store::db(&state.data_dir).kv_get("api_pool");
-            (pf.wb_enabled, pf.qoder_enabled, pf.trae_enabled, true, true)
-        }
-    };
+    let (wb_enabled, qoder_enabled, doubao_enabled, trae_ok, buddy_ok, qoder_ok, doubao_ok) =
+        match safe_lock(&runtime).as_ref() {
+            Some(rt) => {
+                let s = &rt.shared;
+                (
+                    s.wb_enabled
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    s.qoder_enabled
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    // 豆包开关（E-01，默认关）；池健康作启用徽章
+                    s.doubao_enabled
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    // Trae 开关（默认开）参与可用性：关闭时 Trae 源徽章置灰
+                    s.trae_enabled.load(std::sync::atomic::Ordering::Relaxed)
+                        && s.pool.has_selectable(),
+                    s.wb_pool.has_selectable(),
+                    s.qoder_pool.has_selectable(),
+                    s.doubao_pool.has_selectable(),
+                )
+            }
+            None => {
+                let pf: ApiPoolFile = crate::store::db(&state.data_dir).kv_get("api_pool");
+                (
+                    pf.wb_enabled,
+                    pf.qoder_enabled,
+                    pf.doubao_enabled,
+                    pf.trae_enabled,
+                    true,
+                    true,
+                    true,
+                )
+            }
+        };
     let data_dir = state.data_dir.clone();
     let mut list = crate::api_server::unified_catalog::unified_models_ex(
         &data_dir,
@@ -1595,6 +1745,7 @@ pub fn api_unified_models(
         trae_ok,
         buddy_ok,
         Some((qoder_enabled, qoder_ok)),
+        Some((doubao_enabled, doubao_ok)),
     );
     if available_only.unwrap_or(false) {
         list.retain(|m| m.sources.iter().any(|s| s.enabled));
@@ -1634,13 +1785,16 @@ pub fn dispatch_policy_set(
     policy: crate::api_server::dispatch::DispatchPolicy,
 ) -> Result<crate::api_server::dispatch::DispatchPolicy, String> {
     crate::api_server::dispatch::save_policy(&state.data_dir, &policy)?;
-    // 账号保留剩余积分（issue #91）热应用：保存后三池即时生效
+    // 账号保留剩余积分（issue #91）热应用：保存后各池即时生效
     //（配置锁外，与 pool_set 热应用同模式；负值由 set_reserve_credits 防御归零）
     if let Some(rt) = safe_lock(&runtime).as_ref() {
         rt.shared.pool.set_reserve_credits(policy.reserve_credits);
         rt.shared.wb_pool.set_reserve_credits(policy.reserve_credits);
         rt.shared
             .qoder_pool
+            .set_reserve_credits(policy.reserve_credits);
+        rt.shared
+            .doubao_pool
             .set_reserve_credits(policy.reserve_credits);
     }
     Ok(crate::api_server::dispatch::load_policy(&state.data_dir))
@@ -1921,6 +2075,10 @@ mod pool_merge_tests {
             qoder_strategy: "p2c".into(),
             qoder_enabled_uids: vec!["qd-1".into()],
             qoder_group_ids: Vec::new(),
+            doubao_enabled: true,
+            doubao_strategy: "credit_first".into(),
+            doubao_account_concurrency_limit: 4,
+            doubao_pool_sticky_ttl_secs: 480,
             trae_tag_ids: Vec::new(),
             wb_tag_ids: Vec::new(),
             qoder_tag_ids: Vec::new(),
@@ -1936,6 +2094,7 @@ mod pool_merge_tests {
             None, None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None,
+            None, None, None, None,
         );
         assert_eq!(m.enabled_uids, vec!["u2".to_string()]);
         assert_eq!(m.strategy, "weighted");
@@ -1967,6 +2126,11 @@ mod pool_merge_tests {
         assert_eq!(m.qoder_hedge_threshold_ms, 4000);
         assert!(m.qoder_sticky_enabled);
         assert!(m.trae_enabled);
+        // 豆包池参数未传 → 保留原值（E-01）
+        assert!(m.doubao_enabled);
+        assert_eq!(m.doubao_strategy, "credit_first");
+        assert_eq!(m.doubao_account_concurrency_limit, 4);
+        assert_eq!(m.doubao_pool_sticky_ttl_secs, 480);
     }
 
     #[test]
@@ -1982,6 +2146,7 @@ mod pool_merge_tests {
             None, None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None,
+            None, None, None, None,
         );
         // Trae 白名单剥离 wb- 条目
         assert_eq!(m.enabled_uids, vec!["1001".to_string(), "1002".to_string()]);
@@ -2089,6 +2254,10 @@ mod pool_merge_tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
         );
         assert_eq!(m.wb_enabled_uids, vec!["wb-new".to_string()]);
         assert_eq!(m.enabled_uids, vec!["u1".to_string()]);
@@ -2177,6 +2346,10 @@ mod pool_merge_tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
         );
         assert_eq!(m.strategy, "p2c");
         assert_eq!(m.wb_strategy, "");
@@ -2211,6 +2384,7 @@ mod pool_merge_tests {
             None, None, Some(vec!["g2".into()]), None, None, None, None,
             None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None,
         );
         assert_eq!(m.enabled_uids.len(), 2);
         assert_eq!(m.group_ids, vec!["g2".to_string()]);
@@ -2227,8 +2401,8 @@ mod pool_merge_tests {
             &ApiPoolFile::default(),
             vec!["u1".into()],
             None, None, None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None,
         );
         assert_eq!(m.strategy, "");
         assert_eq!(m.wb_strategy, "");

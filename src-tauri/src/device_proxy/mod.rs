@@ -7,6 +7,7 @@ pub mod ca;
 #[cfg(test)]
 mod e2e;
 pub mod handler;
+pub mod doubao_capture;
 pub mod local_capture;
 pub mod logger;
 pub mod upstream;

@@ -221,17 +221,27 @@ pub async fn do_start(
 
     fs_utils::app_log(&state.data_dir, &format!("代理已启动: port={port}, 进程内代理"));
 
-    // 同步把 Windows 系统代理指向本机端口，使 TRAE 鉴权请求(api.trae.cn)汇入本代理
-    match set_win_proxy(&proxy_addr) {
-        Ok(()) => {
-            let _ = app.emit(
-                "proxy-log",
-                &format!("已设置系统代理 -> {proxy_addr}（TRAE 鉴权流量将汇入本代理）"),
-            );
-            fs_utils::app_log(&state.data_dir, &format!("已设置系统代理 -> {proxy_addr}"));
-        }
-        Err(e) => {
-            let _ = app.emit("proxy-log", &format!("[warn] 设置系统代理失败: {e}"));
+    // 诊断开关 AIWORK_NO_SYSPROXY=1：跳过系统代理设置。代理仅服务显式 --proxy-server 的
+    // 客户端（豆包），避免把本机全域流量（含 IDE/Agent 自身后端域）一并劫持导致本机网络中断。
+    let skip_sys_proxy = std::env::var("AIWORK_NO_SYSPROXY")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if skip_sys_proxy {
+        let _ = app.emit("proxy-log", "已跳过系统代理设置（AIWORK_NO_SYSPROXY=1）");
+        fs_utils::app_log(&state.data_dir, "已跳过系统代理设置（AIWORK_NO_SYSPROXY=1）");
+    } else {
+        // 同步把 Windows 系统代理指向本机端口，使 TRAE 鉴权请求(api.trae.cn)汇入本代理
+        match set_win_proxy(&proxy_addr) {
+            Ok(()) => {
+                let _ = app.emit(
+                    "proxy-log",
+                    &format!("已设置系统代理 -> {proxy_addr}（TRAE 鉴权流量将汇入本代理）"),
+                );
+                fs_utils::app_log(&state.data_dir, &format!("已设置系统代理 -> {proxy_addr}"));
+            }
+            Err(e) => {
+                let _ = app.emit("proxy-log", &format!("[warn] 设置系统代理失败: {e}"));
+            }
         }
     }
 

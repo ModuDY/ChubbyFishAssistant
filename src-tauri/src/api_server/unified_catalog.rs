@@ -248,7 +248,7 @@ pub fn unified_models_whitelisted(
     trae_ok: bool,
     buddy_ok: bool,
 ) -> Vec<UnifiedModel> {
-    unified_models_whitelisted_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None)
+    unified_models_whitelisted_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None, None)
 }
 
 /// 同 [`unified_models_whitelisted`]，`qoder = Some((开关, 池健康))` 时合并
@@ -259,9 +259,10 @@ pub fn unified_models_whitelisted_ex(
     trae_ok: bool,
     buddy_ok: bool,
     qoder: Option<(bool, bool)>,
+    doubao: Option<(bool, bool)>,
 ) -> Vec<UnifiedModel> {
     let wl = load_whitelist(data_dir);
-    unified_models_ex(data_dir, wb_enabled, trae_ok, buddy_ok, qoder)
+    unified_models_ex(data_dir, wb_enabled, trae_ok, buddy_ok, qoder, doubao)
         .into_iter()
         .filter(|m| whitelist_allows(&wl, &m.id))
         .collect()
@@ -384,10 +385,11 @@ pub fn unified_models(
     trae_ok: bool,
     buddy_ok: bool,
 ) -> Vec<UnifiedModel> {
-    unified_models_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None)
+    unified_models_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None, None)
 }
 
-/// 同 [`unified_models`]，`qoder = Some((开关, 池健康))` 时合并 Qoder 目录：
+/// 同 [`unified_models`]，`qoder = Some((开关, 池健康))` 时合并 Qoder 目录、
+/// `doubao = Some((开关, 池健康))` 时合并豆包目录（E-01）：
 /// 条目始终入表（镜像 WB 内置目录语义），`enabled` 徽章 = 开关 && 池健康
 pub fn unified_models_ex(
     data_dir: &Path,
@@ -395,6 +397,7 @@ pub fn unified_models_ex(
     trae_ok: bool,
     buddy_ok: bool,
     qoder: Option<(bool, bool)>,
+    doubao: Option<(bool, bool)>,
 ) -> Vec<UnifiedModel> {
     let l1 = load_meta(data_dir);
     // 注（issue #38-4 排查决策）：Trae 侧快照（kv api_models）无条件参与聚合，
@@ -411,6 +414,8 @@ pub fn unified_models_ex(
         TargetPool::Custom => true,
         // Qoder：开关 && 池健康（调用方未提供旗标时该源不参与聚合）
         TargetPool::Qoder => qoder.map_or(false, |(e, ok)| e && ok),
+        // 豆包（E-01）：开关 && 池健康；占位模型（verified=false）在源注入处另收敛
+        TargetPool::Doubao => doubao.map_or(false, |(e, ok)| e && ok),
     };
 
     let mut order: Vec<String> = Vec::new();
@@ -703,6 +708,50 @@ pub fn unified_models_ex(
                                 rate: qrate,
                                 enabled: enabled_of(TargetPool::Qoder),
                             }],
+                            manual: false,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    // 源5：豆包（E-01，doubao_payload 静态目录；对外标识 doubao）——
+    // 开关关闭或调用方未提供旗标时不合并。占位模型（verified=false）仍列出，
+    // display 自带「（未启用·待验证）」注记，enabled 徽章另按 verified 收敛
+    if let Some(_doubao) = doubao {
+        for m in super::doubao_payload::catalog() {
+            let canonical = canonical_id(m.id);
+            if canonical.is_empty() {
+                continue;
+            }
+            let src = UnifiedSource {
+                pool: "doubao",
+                rate: None,
+                enabled: enabled_of(TargetPool::Doubao) && m.verified,
+            };
+            match acc.get_mut(&canonical) {
+                Some(u) => {
+                    if !u.sources.iter().any(|s| s.pool == "doubao") {
+                        u.sources.push(src);
+                    }
+                }
+                None => {
+                    order.push(canonical.clone());
+                    acc.insert(
+                        canonical.clone(),
+                        UnifiedModel {
+                            id: m.id.to_string(),
+                            display: m.display.to_string(),
+                            vendor: vendor_of(&canonical).to_string(),
+                            region: None,
+                            rate: None,
+                            efforts: Vec::new(),
+                            max_mode: false,
+                            context_length: None,
+                            max_tokens: None,
+                            supports_image: None,
+                            sources: vec![src],
                             manual: false,
                         },
                     );

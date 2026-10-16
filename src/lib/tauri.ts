@@ -276,6 +276,8 @@ export const api = {
   },
   misc: {
     deviceReset: (userId: string) => invoke('device_reset', { userId }),
+    // 为全部 Trae 账号一键重派设备号（解决多账号同设备签到 9095）
+    deviceReassignAll: () => invoke<{ total: number; changed: number }>('device_reassign_all'),
     // T11：开机自启（开关即时生效）
     autostartStatus: () => invoke<boolean>('autostart_status'),
     autostartSet: (enabled: boolean) => invoke('autostart_set', { enabled }),

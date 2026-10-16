@@ -54,6 +54,11 @@ impl PoolStrategy {
         Self::resolve_wb(strategy, qoder_strategy)
     }
 
+    /// 豆包池生效策略（E-01）：doubao_strategy 独立配置优先；空 = 跟随 Trae 池策略
+    pub fn resolve_doubao(strategy: &str, doubao_strategy: &str) -> Self {
+        Self::resolve_wb(strategy, doubao_strategy)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ExpireFirst => "expire_first",
@@ -541,6 +546,54 @@ impl ApiPool {
                     reason: String::new(),
                     device_id: String::new(),
                     machine_id: a.machine_id.clone(),
+                    hard_until: 0,
+                    last_used: 0,
+                    successes: 0,
+                    failures: 0,
+                    cb_trips: 0,
+                    domain: String::new(),
+                    enterprise_id: String::new(),
+                    global_region: false,
+                    refresh_invalid: false,
+                },
+            );
+        }
+        // F-77：清理已不在池内的在途计数条目（在途请求经 Arc 独立释放，不受影响）
+        {
+            let mut inflight = safe_lock(&self.inflight);
+            inflight.retain(|uid, _| entries.contains_key(uid));
+        }
+    }
+
+    /// 从豆包账号同步池（E-01）：豆包专用池实例（`ApiSharedState.doubao_pool`），
+    /// 全量重建语义同 sync_from_qoder。凭证不进池结构——jwt 恒空，请求时由
+    /// 网关 identity 回调（`ApiSharedState.doubao_identity`）按需从 vault 解析；
+    /// `has_credentials=false` 的账号入池但标记 disabled（不可调度，避免必失败取号）。
+    /// 豆包无积分/到期快照概念（credits 恒 None，selectable 不触发零积分过滤）
+    pub fn sync_from_doubao(&self, accounts: &[DoubaoAccountSync], enabled: &[String]) {
+        let mut entries = safe_lock(&self.entries);
+        entries.clear();
+        let enabled_set: HashSet<&str> = enabled.iter().map(|s| s.as_str()).collect();
+        for a in accounts {
+            if !enabled_set.contains(a.uid.as_str()) {
+                continue;
+            }
+            entries.insert(
+                a.uid.clone(),
+                PoolEntry {
+                    uid: a.uid.clone(),
+                    name: a.name.clone(),
+                    // 凭证由 identity 回调解析，池内不存（与 Qoder 的 access_token 快照语义不同）
+                    jwt: String::new(),
+                    credits: None,
+                    credits_expire_at: None,
+                    credits_fetched_at: None,
+                    disabled: !a.has_credentials,
+                    err_count: 0,
+                    until: 0,
+                    reason: String::new(),
+                    device_id: String::new(),
+                    machine_id: String::new(),
                     hard_until: 0,
                     last_used: 0,
                     successes: 0,
@@ -1118,6 +1171,18 @@ pub struct QoderSyncAccount {
     pub credits_expire_at: Option<i64>,
     /// 余额快照采集时间（Unix 秒）：reserve 过滤新鲜度门槛（issue #91 口径）
     pub credits_fetched_at: Option<i64>,
+}
+
+/// 豆包账号入池同步结构（E-01）：uid 即豆包 user_id。
+///
+/// 凭证（session_id/sid_guard/ttwid）不进池结构——池内 jwt 恒空，请求时的真凭证
+/// 由网关 identity 回调按需从 vault 解析（`ApiSharedState.doubao_identity`），
+/// 保证新鲜度与机密隔离（与 Qoder「池内存 access_token 快照」的模式不同）。
+pub struct DoubaoAccountSync {
+    pub uid: String,
+    pub name: String,
+    /// vault 中是否已具备可解析凭证：false 时账号仍入池但标记 disabled（不可调度）
+    pub has_credentials: bool,
 }
 
 /// 候选过滤：healthy + 未 tried + 积分未过期 + 非零积分 + 非 hard_credit 冷却

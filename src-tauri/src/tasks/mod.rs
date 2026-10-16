@@ -14,6 +14,7 @@
 //! 不启动 Tauri（分支在 Builder 之前，天然绕开单实例插件）。任务名随批次扩展：
 //! P1 `doubao-quota`；P2 `wb-checkin`/`wb-renew`/`checkin`；P3 `doubao-renew`。
 
+pub mod doubao_abogus;
 pub mod doubao_chats;
 pub mod doubao_quota;
 pub mod doubao_session;

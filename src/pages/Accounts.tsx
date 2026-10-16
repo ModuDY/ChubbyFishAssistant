@@ -66,6 +66,7 @@ export default function Accounts() {
   const removeGroup = useAppStore((s) => s.removeGroup);
   const moveAccount = useAppStore((s) => s.moveAccount);
   const resetDevice = useAppStore((s) => s.resetDevice);
+  const reassignAllDevices = useAppStore((s) => s.reassignAllDevices);
   const switchTo = useAppStore((s) => s.switchTo);
   const switchingTo = useAppStore((s) => s.switchingTo);
   const saveCurrentLogin = useAppStore((s) => s.saveCurrentLogin);
@@ -121,6 +122,9 @@ export default function Accounts() {
   const [refreshBusy, setRefreshBusy] = useState(false);
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [rowOpUid, setRowOpUid] = useState<string | null>(null);
+  // 重派设备号（危险批量操作）：确认弹窗 + busy 防连点
+  const [reassignOpen, setReassignOpen] = useState(false);
+  const [reassignBusy, setReassignBusy] = useState(false);
   // 导出凭证确认（审查 P0-2；禁 window.confirm，红线）：Trae 导出恒含明文 JWT / refreshToken
   const [exportConfirming, setExportConfirming] = useState(false);
   // 切换/保存 90s 看门狗（对齐 BuddyAccounts）：switch-done / save-login-done 事件异常缺失
@@ -397,6 +401,13 @@ export default function Accounts() {
               title="刷新账号列表、套餐与积分数据"
             >
               {refreshBusy ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />} 刷新
+            </button>
+            <button
+              onClick={() => setReassignOpen(true)}
+              className="btn-outline"
+              title="为全部账号按 uid 派生唯一设备号（解决多账号同设备导致的签到失败）"
+            >
+              <RotateCcw size={15} /> 重派设备号
             </button>
             <button onClick={() => setOAuthOpen(true)} className="btn-outline" title="通过 OAuth 授权登录添加账号">
               <Globe size={15} /> OAuth 登录
@@ -812,6 +823,41 @@ export default function Accounts() {
         onClose={() => setDeleteSlot(null)}
         onConfirm={() => void confirmDeleteSlot()}
       />
+      {/* 重派设备号确认弹框（禁 window.confirm，红线） */}
+      <Modal
+        open={reassignOpen}
+        onClose={() => {
+          if (!reassignBusy) setReassignOpen(false);
+        }}
+        title="重派设备号"
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setReassignOpen(false)} disabled={reassignBusy}>
+              取消
+            </button>
+            <button
+              className="btn-primary !bg-rose-600 hover:!bg-rose-500"
+              disabled={reassignBusy}
+              onClick={() => {
+                setReassignBusy(true);
+                void reassignAllDevices().finally(() => {
+                  setReassignBusy(false);
+                  setReassignOpen(false);
+                });
+              }}
+            >
+              {reassignBusy ? '重派中…' : '确认重派'}
+            </button>
+          </>
+        }
+      >
+        <div className="text-sm">
+          将为全部账号重派为按账号派生的唯一设备号，覆盖现有设备号。
+          <div className="mt-1 text-xs text-slate-400">
+            用于解决多账号共用同一设备导致的「当前设备今日已经签到」失败。注意：之后若用本机客户端重新登录某账号，其设备号可能再次被登录设备覆盖，届时再点一次即可。
+          </div>
+        </div>
+      </Modal>
       {/* 导出凭证确认弹框（审查 P0-2；禁 window.confirm，红线） */}
       <Modal
         open={exportConfirming}

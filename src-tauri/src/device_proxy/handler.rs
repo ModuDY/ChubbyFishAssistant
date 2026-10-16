@@ -533,6 +533,15 @@ fn update_account_jwt_and_refresh(
             if write_accounts(ctx, &cfg).is_err() {
                 ctx.log.log("  [accounts] 写入失败");
             }
+            // 同步落 vault 加密备份：行内明文只是「最新一份」缓写副本，账号行一旦被重建
+            //（删除后自动发现重加、迁移等）明文即随行丢失、且 vault 无备份 → 该账号会恒报
+            //「未配置 jwt」（2026-10-16 实测）。行内明文保留，供上面的 exp 防降级比较使用。
+            let jwt_for_vault = if jwt_status == "updated" { jwt_full } else { "" };
+            if let Err(e) =
+                crate::vault::upsert_account_secret(&ctx.data_dir, user_id, jwt_for_vault, refresh_token)
+            {
+                ctx.log.log(&format!("  [vault] 凭据加密备份失败（行内明文仍可用）: {e}"));
+            }
             if jwt_status == "updated" {
                 clear_cooldown(ctx, user_id);
             }
@@ -752,6 +761,156 @@ pub(crate) fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
     msgs.join(" <- ")
 }
 
+/// 诊断：是否开启 a_bogus 重编码验证（环境变量 `DOUBAO_ABOGUS_REENCODE=1`）。
+fn abogus_reencode_enabled() -> bool {
+    std::env::var("DOUBAO_ABOGUS_REENCODE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// 诊断补丁规格（由 `abogus_patch.json` 决定）
+enum PayloadPatch {
+    /// 不补丁（只做重编码）
+    None,
+    /// 绝对偏移置值：`{"sets":[[off,val],...]}`
+    Sets(Vec<(usize, u8)>),
+    /// 把 payload 末尾最后一段连续 ASCII 数字整体替换：`{"tail_digits":"000"}`
+    TailDigits(Vec<u8>),
+}
+
+/// 诊断：读取 payload 补丁（`%APPDATA%\<数据目录>\abogus_patch.json`）。用途：逐字段
+/// 验证服务端是否校验该字段——改了某字段仍 200 = 该字段不被校验（生成时可任意填）；
+/// 被拒 = 必须精确复现。文件不存在/解析失败一律返回 `None`（等价于只做重编码）。
+fn load_payload_patch() -> PayloadPatch {
+    let Ok(dir) = std::env::var("APPDATA") else {
+        return PayloadPatch::None;
+    };
+    let path = std::path::Path::new(&dir)
+        .join(crate::state::DATA_DIR_NAME)
+        .join("abogus_patch.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return PayloadPatch::None;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return PayloadPatch::None;
+    };
+    if let Some(s) = v.get("tail_digits").and_then(|x| x.as_str()) {
+        if !s.is_empty() {
+            return PayloadPatch::TailDigits(s.bytes().collect());
+        }
+    }
+    if let Some(arr) = v.get("sets").and_then(|s| s.as_array()) {
+        let sets: Vec<(usize, u8)> = arr
+            .iter()
+            .filter_map(|it| {
+                let a = it.as_array()?;
+                let off = a.first()?.as_u64()? as usize;
+                let val = a.get(1)?.as_u64()? as u8;
+                Some((off, val))
+            })
+            .collect();
+        return PayloadPatch::Sets(sets);
+    }
+    PayloadPatch::None
+}
+
+/// 定位 payload 末尾的最后一段连续 ASCII 数字（允许末尾有一个非数字分隔符，如真机
+/// 出现过的 `…Win3267,`）；返回 `(start, end)` 半开区间。
+fn tail_digit_run(payload: &[u8]) -> Option<(usize, usize)> {
+    let mut end = payload.len();
+    if end > 0 && !payload[end - 1].is_ascii_digit() {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0 && payload[start - 1].is_ascii_digit() {
+        start -= 1;
+    }
+    if start == end {
+        None
+    } else {
+        Some((start, end))
+    }
+}
+
+/// 应用补丁到 payload（就地修改）
+fn apply_payload_patch(payload: &mut Vec<u8>, patch: &PayloadPatch) {
+    match patch {
+        PayloadPatch::None => {}
+        PayloadPatch::Sets(sets) => {
+            for (off, val) in sets {
+                if *off < payload.len() {
+                    payload[*off] = *val;
+                }
+            }
+        }
+        PayloadPatch::TailDigits(digits) => {
+            if let Some((start, end)) = tail_digit_run(payload) {
+                payload.splice(start..end, digits.iter().copied());
+            }
+        }
+    }
+}
+
+/// 把请求目标里 `a_bogus` 参数解码→（可选）按补丁改写 payload→重编码后替换。
+/// 用途：验证本仓 `tasks::doubao_abogus` 编解码器与服务端是否兼容、以及哪些 payload
+/// 字段被服务端校验；任一步失败返回 None（保持原请求不变，链路不受影响）。
+fn rewrite_a_bogus(path: &str, patch: &PayloadPatch) -> Option<(String, usize)> {
+    let (base, query) = path.split_once('?')?;
+    let mut parts: Vec<String> = Vec::with_capacity(32);
+    let mut hit = false;
+    let mut payload_len = 0usize;
+    for kv in query.split('&') {
+        if let Some(v) = kv.strip_prefix("a_bogus=") {
+            let raw = percent_decode(v);
+            let mut decoded = crate::tasks::doubao_abogus::decode(&raw).ok()?;
+            payload_len = decoded.payload.len();
+            apply_payload_patch(&mut decoded.payload, patch);
+            let re = crate::tasks::doubao_abogus::encode(&decoded);
+            parts.push(format!("a_bogus={}", percent_encode(&re)));
+            hit = true;
+        } else {
+            parts.push(kv.to_string());
+        }
+    }
+    if !hit {
+        return None;
+    }
+    Some((format!("{base}?{}", parts.join("&")), payload_len))
+}
+
+/// 百分号解码（仅本诊断钩子使用，避免为一个开关引入新依赖）
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 百分号编码（unreserved 之外的字节一律 %XX；a_bogus 只含 unreserved 与 `/` `-`）
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// 一次转发结果：false 表示上游要求关闭连接或出错（对齐 Python keep-alive 语义）
 async fn forward_upstream<S: AsyncRead + AsyncWrite + Unpin>(
     io: &mut tokio_rustls::server::TlsStream<S>,
@@ -773,8 +932,38 @@ async fn forward_upstream<S: AsyncRead + AsyncWrite + Unpin>(
         req.body.len()
     ));
 
+    // 豆包签名材料抓取（无论诊断开关是否开启）：**已签名的豆包请求**（query 带 `a_bogus=`）命中即落盘。
+    // ⚠️ 端点是敏感的：`aid`/`fp` 等指纹键随端点族变化（账号 SDK 端点用 aid=497858，
+    // `/chat/completion` 用 aid=582478），故 capture 内部只从 `/chat/completion` 采集指纹/msToken
+    //（a_bogus 模板仍端点无关），避免跨端点覆盖污染 completion 指纹。
+    // 采集失败绝不拖累转发（capture 内部吞错并记 warning）。仅看 query，不碰凭据头/体。
+    if host.ends_with("doubao.com") && req.path.contains("a_bogus=") {
+        crate::device_proxy::doubao_capture::capture_from_signed_request(&req.path);
+    }
+
+    // 诊断开关（DOUBAO_ABOGUS_REENCODE=1）：把 /chat/completion 的 a_bogus 解码后重编码
+    // 再塞回 query（payload 不变、仅重掷 garble 随机位），用于验证本仓编解码器与服务端的
+    // 兼容性。默认关闭，正常链路不受影响。
+    let mut forward_path = req.path.clone();
+    if abogus_reencode_enabled() && req.path.contains("/chat/completion") {
+        let patch = load_payload_patch();
+        if let Some((rewritten, plen)) = rewrite_a_bogus(&req.path, &patch) {
+            let mode = match &patch {
+                PayloadPatch::None => "none",
+                PayloadPatch::Sets(_) => "sets",
+                PayloadPatch::TailDigits(_) => "tail_digits",
+            };
+            ctx.log.log(&format!(
+                "  [abogus] 已重编码 a_bogus（payload {plen} 字节，补丁 {mode}）"
+            ));
+            forward_path = rewritten;
+        } else {
+            ctx.log.log("  [abogus] 重编码失败，保持原请求");
+        }
+    }
+
     // 组装上游请求：过滤跳过头 + accept-encoding 降级（br/zstd 无解压支持，对齐 Python）
-    let uri = format!("https://{host}:{port}{}", req.path);
+    let uri = format!("https://{host}:{port}{forward_path}");
     let mut builder = Request::builder()
         .method(method.as_str())
         .uri(&uri)

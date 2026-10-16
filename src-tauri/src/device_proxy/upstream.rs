@@ -230,12 +230,33 @@ async fn socks5_handshake(s: &mut TcpStream, host: &str, port: u16) -> Result<()
     Ok(())
 }
 
-/// 直连目标（MITM/WS 上游与回退路径共用）
+/// 直连目标（MITM/WS 上游与回退路径共用）。
+/// 本机 IPv6 常见「TCP 可连但数据黑洞」（见模块注释：VPN 接管路由/DNS 时），
+/// 而 `TcpStream::connect((host, port))` 走系统 DNS 会拿到 AAAA 并按序优先尝试，
+/// 导致每次转发都卡在 IPv6 上直至超时（实测：强制 IPv4 0.09s 通、IPv6 8s 超时）。
+/// 故此处解析后**显式优先 IPv4**、IPv6 兜底，逐个短超时尝试。
 pub async fn connect_direct(host: &str, port: u16) -> Result<TcpStream, String> {
-    timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port)))
-        .await
-        .map_err(|_| format!("连接 {host}:{port} 超时"))?
-        .map_err(|e| format!("连接 {host}:{port} 失败: {e}"))
+    let addrs: Vec<std::net::SocketAddr> =
+        match timeout(CONNECT_TIMEOUT, tokio::net::lookup_host((host, port))).await {
+            Ok(Ok(it)) => it.collect(),
+            Ok(Err(e)) => return Err(format!("解析 {host} 失败: {e}")),
+            Err(_) => return Err(format!("解析 {host} 超时")),
+        };
+    if addrs.is_empty() {
+        return Err(format!("解析 {host} 无可用地址"));
+    }
+    let mut ordered: Vec<std::net::SocketAddr> =
+        addrs.iter().copied().filter(std::net::SocketAddr::is_ipv4).collect();
+    ordered.extend(addrs.iter().copied().filter(std::net::SocketAddr::is_ipv6));
+    let mut last = String::new();
+    for addr in ordered {
+        match timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+            Ok(Ok(s)) => return Ok(s),
+            Ok(Err(e)) => last = format!("{addr}: {e}"),
+            Err(_) => last = format!("{addr}: 超时"),
+        }
+    }
+    Err(format!("连接 {host}:{port} 失败（{last}）"))
 }
 
 /// 在既有 TCP 流上完成 TLS 握手（webpki roots + ALPN http/1.1，与 MITM 转发路径

@@ -1453,6 +1453,7 @@ fn bucket_name(b: UsageBucket) -> &'static str {
         UsageBucket::Wb => "wb",
         UsageBucket::Custom => "custom",
         UsageBucket::Qoder => "qoder",
+        UsageBucket::Doubao => "doubao",
     }
 }
 
@@ -1462,6 +1463,7 @@ fn bucket_of(name: &str) -> Option<UsageBucket> {
         "wb" => Some(UsageBucket::Wb),
         "custom" => Some(UsageBucket::Custom),
         "qoder" => Some(UsageBucket::Qoder),
+        "doubao" => Some(UsageBucket::Doubao),
         _ => None,
     }
 }
@@ -1472,6 +1474,7 @@ fn bucket_map_mut<'a>(f: &'a mut UsageFile, b: UsageBucket) -> &'a mut std::coll
         UsageBucket::Wb => &mut f.wb_days,
         UsageBucket::Custom => &mut f.custom_days,
         UsageBucket::Qoder => &mut f.qoder_days,
+        UsageBucket::Doubao => &mut f.doubao_days,
     }
 }
 
@@ -1505,6 +1508,7 @@ pub fn api_usage_save(s: &Store, f: &UsageFile) -> Result<(), String> {
         // 四桶对称（审查修复清单 v1.4.9 B8）：漏 Qoder 桶会使 JSON→SQLite 迁移时
         // Qoder 历史用量整表丢弃（api_usage_load 侧 bucket_map_mut 四桶齐全）
         (UsageBucket::Qoder, &f.qoder_days),
+        (UsageBucket::Doubao, &f.doubao_days),
     ]
     .into_iter()
     .flat_map(|(b, map)| {

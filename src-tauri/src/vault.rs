@@ -417,6 +417,51 @@ fn merge_entry(existing: Option<SecretEntry>, jwt_new: &str, rt_new: &str) -> Se
     entry
 }
 
+/// 单账号凭据增量写入 vault（字段级合并：空值不覆盖旧值；最后快照落盘）。
+///
+/// 用途：代理捕获 Cloud-IDE-JWT / refresh_token 时，与 `accounts` 表行的明文写入**并行**
+/// 同步一份加密备份。此前捕获只明文写行、不经 vault；账号行一旦被重建（删除后自动发现重加、
+/// 迁移等）明文即随行丢失且 vault 无备份，该账号会恒报「未配置 jwt」（2026-10-16 实测）。
+/// 行内明文**保留**（`device_proxy::handler::update_account_jwt_and_refresh` 依赖它做 exp
+/// 防降级比较），此处只补一份耐久加密副本，供 `load_accounts` 回填。
+pub fn upsert_account_secret(
+    data_dir: &Path,
+    uid: &str,
+    jwt: &str,
+    refresh_token: Option<&str>,
+) -> Result<(), String> {
+    if uid.is_empty() {
+        return Err("账号 uid 为空".into());
+    }
+    let jwt_new = jwt.trim();
+    let rt_new = refresh_token.unwrap_or("").trim();
+    // 无凭据可写（占位账号）→ 与 write_vault_secrets 同口径，直接 no-op
+    if jwt_new.is_empty() && rt_new.is_empty() {
+        return Ok(());
+    }
+    with_open(data_dir, |sh| {
+        let client = sh
+            .get_client(CLIENT_PATH.to_vec())
+            .map_err(|e| format!("获取 vault client 失败: {e}"))?;
+        let entry = merge_entry(
+            client
+                .store()
+                .get(uid.as_bytes())
+                .ok()
+                .flatten()
+                .and_then(|v| serde_json::from_slice::<SecretEntry>(&v).ok()),
+            jwt_new,
+            rt_new,
+        );
+        let value = serde_json::to_vec(&entry).map_err(|e| format!("凭据序列化失败: {e}"))?;
+        client
+            .store()
+            .insert(uid.as_bytes().to_vec(), value, None)
+            .map_err(|e| format!("vault 写入失败: {e}"))?;
+        sh.save().map_err(|e| format!("vault 快照落盘失败: {e}"))
+    })
+}
+
 /// 删除账号时同步清理 vault 记录（失败仅记录，不阻断账号删除）
 pub fn remove_secret(state: &AppState, uid: &str) {
     let result = with_open(&state.data_dir, |sh| {
@@ -709,6 +754,48 @@ mod tests {
         assert_ne!(blob, plain.to_vec());
         let round = dpapi::unprotect(&blob).expect("unprotect");
         assert_eq!(round, plain.to_vec());
+    }
+
+    /// 单账号凭据增量写入 vault（代理捕获 JWT 的加密备份路径）：
+    /// 写入可读回；空字段不覆盖旧值；全空为 no-op。
+    #[test]
+    fn upsert_account_secret_roundtrip_and_no_empty_overwrite() {
+        let dir = std::env::temp_dir().join(format!("vault_upsert_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let read = |d: &std::path::Path| -> SecretEntry {
+            with_open(d, |sh| {
+                let client = sh
+                    .get_client(CLIENT_PATH.to_vec())
+                    .map_err(|e| e.to_string())?;
+                Ok(client
+                    .store()
+                    .get("uid-x".as_bytes())
+                    .ok()
+                    .flatten()
+                    .and_then(|v| serde_json::from_slice::<SecretEntry>(&v).ok())
+                    .unwrap_or_default())
+            })
+            .expect("读取 vault")
+        };
+
+        upsert_account_secret(&dir, "uid-x", "jwt-1", None).expect("写入 jwt");
+        let e = read(&dir);
+        assert_eq!(e.jwt, "jwt-1");
+        assert_eq!(e.refresh_token, "");
+
+        // 只提供 rt（jwt 传空）→ jwt 保留、rt 补上（字段级合并不互相覆盖）
+        upsert_account_secret(&dir, "uid-x", "", Some("rt-1")).expect("写入 rt");
+        let e = read(&dir);
+        assert_eq!(e.jwt, "jwt-1", "空 jwt 不得覆盖旧值");
+        assert_eq!(e.refresh_token, "rt-1");
+
+        // 全空 → no-op，旧值保持不变
+        upsert_account_secret(&dir, "uid-x", "", None).expect("空写入应为 no-op");
+        let e = read(&dir);
+        assert_eq!(e.jwt, "jwt-1");
+        assert_eq!(e.refresh_token, "rt-1");
     }
 
     #[cfg(windows)]
