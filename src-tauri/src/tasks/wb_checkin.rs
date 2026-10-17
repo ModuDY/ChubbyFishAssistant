@@ -26,9 +26,8 @@ const LOTTERY_MAX_DRAWS: usize = 20;
 #[derive(Clone, Default)]
 pub struct CheckinOpts {
     pub uids: Vec<String>,
-    /// 对齐 python --skip-checked 形参（python 侧同样声明未消费：
-    /// 「今日已签」实际由 checkin_status 预检兜底返回 already）；保留字段维持调用方契约
-    #[allow(dead_code)]
+    /// 跳过今日已签到账号（本地记录优先命中直接跳过、不发上游预检；
+    /// 未命中则走 `checkin_status` 上游预检兜底，见 `checked_today_local`）
     pub skip_checked: bool,
     pub skip_expired: bool,
     pub lazy_hours: i64,
@@ -526,8 +525,39 @@ fn append_results(state: &AppState, events: &[Value]) {
 
 // ── 签到主流程 ─────────────────────────────────────────────────────────────
 
-/// 处理单账号签到（含 401 刷新一次重试）。返回 account 事件（不含 index）
-fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &CheckinOpts) -> Value {
+/// 取本地记录中该账号**当日 success 记录的最大 reward**（无则 None）。
+///
+/// 语义（审查 P1-3）：结果表为纯 append，同日同账号可能多条——取最大值，
+/// 防早前无奖励记录遮蔽后来的有效记录。供「已签回填」与「本地优先跳过」共用。
+fn local_reward_today(state: &AppState, aid: &str) -> Option<f64> {
+    let results: Value = crate::store::docs::wb_checkin_results_load(&crate::store::db(&state.data_dir));
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    results.get("results").and_then(Value::as_array).and_then(|arr| {
+        arr.iter()
+            .filter(|r| {
+                r.get("date").and_then(Value::as_str) == Some(today.as_str())
+                    && r.get("user_id").and_then(Value::as_str) == Some(aid)
+                    && r.get("status").and_then(Value::as_str) == Some("success")
+            })
+            .filter_map(|r| r.get("reward").and_then(Value::as_f64))
+            .fold(None::<f64>, |acc, v| Some(match acc {
+                Some(a) if a >= v => a,
+                _ => v,
+            }))
+    })
+}
+
+/// 处理单账号签到（含 401 刷新一次重试）。返回 account 事件（不含 index）。
+/// `local_checked`：本地记录判定今日已签的账号集合（skip_checked 开启时非空）——
+/// 命中即直接返回 already，不进任何上游请求（本地优先）；未命中则照常走
+/// `checkin_status` 上游预检兜底（权威口径，覆盖本地记录缺失的情形）。
+fn process_account(
+    state: &AppState,
+    agent: &ureq::Agent,
+    acct: &Value,
+    opts: &CheckinOpts,
+    local_checked: &std::collections::HashSet<String>,
+) -> Value {
     let aid = s_of(acct.get("id"));
     let name = first_str(&[
         acct.get("nickname").and_then(Value::as_str).map(str::to_string),
@@ -537,6 +567,19 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
     let base_ev = json!({"user_id": aid, "name": name});
     if opts.skip_expired && py_truthy(acct.get("needs_relogin")) {
         return json!({ "user_id": aid, "name": base_ev["name"], "status": "fail", "message": "需重新登录，已跳过" });
+    }
+    // 本地优先：今日已有 success/already 记录 → 直接跳过（不发上游状态预检）。
+    // 保留「回填当日积分」语义：从本地记录取当日 success 的最大 reward 一并展示
+    if opts.skip_checked && local_checked.contains(&aid) {
+        let reward = local_reward_today(state, &aid);
+        let mut ev = json!({
+            "user_id": aid, "name": base_ev["name"], "status": "already",
+            "message": "今日已签到（本地记录，已跳过请求）"
+        });
+        if let Some(r) = reward {
+            ev["reward"] = json!(r);
+        }
+        return ev;
     }
     let (creds, refreshed, note) = wb_common::ensure_fresh(state, agent, acct, opts.lazy_hours);
     if creds.access_token.is_empty() {
@@ -632,28 +675,9 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
         _ => "fail",
     };
     // 「已签」回填：签到奖励当日只发一次，今日早前成功记录若已捕获奖励则同步展示
-    //（用户语义：无论成功还是已签，获取积分列都应显示当日所得）
-    //（审查 P1-3：结果表为纯 append，同日同账号可能多条——取当日 success 记录中的
-    // 最大 reward，防早前无奖励记录遮蔽后来的有效记录）
+    //（用户语义：无论成功还是已签，获取积分列都应显示当日所得）；取值口径见 local_reward_today
     if status_txt == "already" && reward.is_none() {
-        let results: Value = crate::store::docs::wb_checkin_results_load(&crate::store::db(&state.data_dir));
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        reward = results
-            .get("results")
-            .and_then(Value::as_array)
-            .and_then(|arr| {
-                arr.iter()
-                    .filter(|r| {
-                        r.get("date").and_then(Value::as_str) == Some(today.as_str())
-                            && r.get("user_id").and_then(Value::as_str) == Some(aid.as_str())
-                            && r.get("status").and_then(Value::as_str) == Some("success")
-                    })
-                    .filter_map(|r| r.get("reward").and_then(Value::as_f64))
-                    .fold(None::<f64>, |acc, v| Some(match acc {
-                        Some(a) if a >= v => a,
-                        _ => v,
-                    }))
-            });
+        reward = local_reward_today(state, &aid);
     }
     // 诊断（脱敏红线：只输出键路径不含值）：成功但三层提取（精确键/深挖/双差值）
     // 均未命中时记录响应键路径，便于按真实结构校准奖励键
@@ -677,6 +701,32 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
     ev
 }
 
+/// 今日已签到账号集合（本地记录口径）：`wb_checkin_results` 中当天状态为
+/// success / already 的 user_id。
+///
+/// 用途：`skip_checked` 开启时「本地优先」跳过——已签过的账号不再打上游
+/// `checkin_status` 预检（对齐 Trae 侧 `skip_checked_in` 的过滤语义，省请求）。
+/// 本地无记录（首用/记录被清）时仍走上游预检兜底，故不会误判。
+fn checked_today_local(state: &AppState) -> std::collections::HashSet<String> {
+    let data: Value = crate::store::docs::wb_checkin_results_load(&crate::store::db(&state.data_dir));
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    data.get("results")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter(|r| r.get("date").and_then(Value::as_str) == Some(today.as_str()))
+                .filter(|r| {
+                    matches!(
+                        r.get("status").and_then(Value::as_str),
+                        Some("success") | Some("already")
+                    )
+                })
+                .filter_map(|r| r.get("user_id").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// 签到整轮：逐账号串行处理，事件经 emit 回调逐条输出（NDJSON 管线复用）。
 /// 返回 done 事件（ok/already/failed 计数），供启动补签/托盘静默路径直接消费。
 pub fn run_checkin_round(state: &AppState, opts: &CheckinOpts, emit: &mut dyn FnMut(&Value)) -> Value {
@@ -690,6 +740,12 @@ pub fn run_checkin_round(state: &AppState, opts: &CheckinOpts, emit: &mut dyn Fn
     if !opts.uids.is_empty() {
         accounts.retain(|a| opts.uids.iter().any(|u| s_of(a.get("id")) == *u));
     }
+    // skip_checked：本地已签账号本轮直接判 already（不发上游预检）——见 checked_today_local
+    let local_checked = if opts.skip_checked {
+        checked_today_local(state)
+    } else {
+        std::collections::HashSet::new()
+    };
     emit(&json!({"type": "start", "total": accounts.len()}));
 
     // 多账号签到间隔（任务配置页可改，默认 3s，0=关闭）：防上游频控，账号间串行等待
@@ -700,7 +756,7 @@ pub fn run_checkin_round(state: &AppState, opts: &CheckinOpts, emit: &mut dyn Fn
             std::thread::sleep(std::time::Duration::from_secs(gap_secs));
         }
         // 单账号失败不中断整轮（python try/except 语义；Rust 直调无异常路径）
-        let mut ev = process_account(state, &agent, acct, opts);
+        let mut ev = process_account(state, &agent, acct, opts, &local_checked);
         ev["index"] = json!(i + 1);
         emit(&ev);
         events.push(ev);
@@ -977,6 +1033,15 @@ fn sync_task_reports(
     urls: &Urls,
     tasks: &[Value],
 ) -> (String, String) {
+    // 缺 uid 时整体跳过：桌面包与 Web 包两套指纹的 userId 都取自 creds.uid，
+    // 空值会让服务端无法把事件归属到账号，上报必定不计分。此前这类上报照发
+    // 且被计入 ok_codes，结果行谎报「已上报 N 个任务判据」——实际一个都没生效
+    if !reports_effective(&creds.uid) {
+        return (
+            "skip".into(),
+            "缺少 uid，跳过任务判据上报（空 userId 不计分）".into(),
+        );
+    }
     let mut ok_codes: Vec<&str> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
     for t in tasks {
@@ -1034,20 +1099,30 @@ fn sync_task_reports(
                     return ("auth".into(), m);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(800));
-                let (st1, _b1, _r1) =
+                let (st1, _b1, raw1) =
                     wb_common::post_json_raw(agent, &urls.buddy_agreement, headers, &json!({}));
                 if st1 == 401 {
                     return ("auth".into(), "登录态失效（401）".into());
                 }
-                let (st2, _b2, raw2) =
-                    wb_common::post_json_raw(agent, &urls.buddy_first, headers, &json!({}));
-                if st2 == 401 {
-                    return ("auth".into(), "登录态失效（401）".into());
-                }
-                if (200..=201).contains(&st2) {
-                    Ok(())
+                // 协议是领取的前置条件：它没生效时下游必然回
+                // 「please accept buddy adoption agreement first」，把失败定位到
+                // 真因（此前 st1 的结果被丢弃，用户只看到下游那句误导性的 400）
+                if !(200..=201).contains(&st1) {
+                    Err(format!(
+                        "同意领养协议失败 HTTP {st1} {}",
+                        body_head(&raw1)
+                    ))
                 } else {
-                    Err(format!("领取 Buddy HTTP {st2} {}", raw2.chars().take(60).collect::<String>()))
+                    let (st2, _b2, raw2) =
+                        wb_common::post_json_raw(agent, &urls.buddy_first, headers, &json!({}));
+                    if st2 == 401 {
+                        return ("auth".into(), "登录态失效（401）".into());
+                    }
+                    if (200..=201).contains(&st2) {
+                        Ok(())
+                    } else {
+                        Err(format!("领取 Buddy HTTP {st2} {}", body_head(&raw2)))
+                    }
                 }
             }
             // 桌面端完整对话链
@@ -1295,6 +1370,20 @@ fn growth_report(
     report_chat_event(agent, headers, urls, uid, &format!("aiwork-{now}"), "deepseek-v4-flash", "DeepSeek V4 Flash")
 }
 
+/// 事件上报能否真正计分。
+///
+/// 桌面包（`wb_report::desktop_fingerprint`）与 Web 包（`report_web_event`）
+/// 的 `userId` 均取自 `creds.uid`；空值时服务端无法把事件归属到账号，
+/// 上报必定不计分。宁可跳过也不能发出去——否则结果行会谎报成功。
+fn reports_effective(uid: &str) -> bool {
+    !uid.trim().is_empty()
+}
+
+/// 响应体摘要（错误定位用）：截断到 60 字符，防超长响应体污染结果行
+fn body_head(raw: &str) -> String {
+    raw.chars().take(60).collect()
+}
+
 /// 单条对话活跃事件上报（可指定会话 id 与模型，供 chat_5 / 模型体验类任务复用）
 fn report_chat_event(
     agent: &ureq::Agent,
@@ -1305,7 +1394,7 @@ fn report_chat_event(
     model_id: &str,
     model_name: &str,
 ) -> (String, String) {
-    if uid.trim().is_empty() {
+    if !reports_effective(uid) {
         return ("skip".into(), "缺少 uid，跳过活跃上报".into());
     }
     let now = chrono::Utc::now().timestamp_millis();
@@ -1354,8 +1443,7 @@ fn report_chat_event(
     if (200..=201).contains(&st) {
         return ("ok".into(), "已上报对话活跃".into());
     }
-    let head: String = raw.chars().take(60).collect();
-    ("fail".into(), format!("活跃上报失败（HTTP {st}）{head}"))
+    ("fail".into(), format!("活跃上报失败（HTTP {st}）{}", body_head(&raw)))
 }
 
 /// 能量与连签天数（页面附注展示；对象响应归一为标量，防 [object Object]）
@@ -1522,6 +1610,30 @@ pub fn run_renew_only(state: &AppState, lazy_hours: i64) -> Value {
 #[cfg(test)]
 mod wb_checkin_tests {
     use super::*;
+
+    /// 空 uid 的事件不可计分：桌面/Web 两套指纹的 userId 都取自 creds.uid，
+    /// 缺失时上报无法归属到账号（此前照发并被计入成功，结果行谎报「已上报」）
+    #[test]
+    fn reports_effective_requires_uid() {
+        assert!(reports_effective("u-1"));
+        assert!(!reports_effective(""));
+        assert!(!reports_effective("   "));
+        assert!(!reports_effective(" "));
+        // 两端空白不影响判定
+        assert!(reports_effective(" u-1 "));
+    }
+
+    /// 响应摘要截断到 60 字符（防超长响应体污染结果行），按字符而非字节切
+    #[test]
+    fn body_head_truncates_by_chars() {
+        assert_eq!(body_head(""), "");
+        assert_eq!(body_head("short"), "short");
+        let long = "x".repeat(200);
+        assert_eq!(body_head(&long).chars().count(), 60);
+        // 多字节字符不被切成半个：中文按字符计数
+        let zh = "错".repeat(100);
+        assert_eq!(body_head(&zh).chars().count(), 60);
+    }
 
     #[test]
     fn scalar_of_unwraps_common_keys() {
