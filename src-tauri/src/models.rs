@@ -875,6 +875,9 @@ pub struct PoolStatus {
     #[serde(default)]
     pub hard_credit: bool,
     pub disabled: bool,
+    /// 暂停选号（账号级运维态）：账号健康但退出选号，签到/保活照常
+    #[serde(default)]
+    pub paused: bool,
     pub err_count: i32,
     /// 账号五态机（T2.2/F-29 v1.2）：Available/QuotaProtection/RateLimited/Forbidden/ProxyDisabled
     #[serde(default)]

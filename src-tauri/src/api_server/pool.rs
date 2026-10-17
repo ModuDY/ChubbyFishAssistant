@@ -193,6 +193,14 @@ pub struct ApiPool {
     /// 冷却/禁用标记的 app.log 观测上下文：(data_dir, 池标签)。
     /// do_start 装配三池（trae/buddy/qoder）时注入；None（测试/未启动）不落日志
     log_ctx: Mutex<Option<(std::path::PathBuf, String)>>,
+    /// 暂停选号的 uid 集合（账号级运维态）。
+    ///
+    /// 与 `disabled` 的区别：disabled 是终态（session/授权判死，需人工解冻），
+    /// paused 是临时态——账号完全健康，只是**退出选号流量**（含全冷却兜底、
+    /// 专一/粘性锁定），签到/保活/额度刷新照常；恢复即刻回池，不清冷却域。
+    ///
+    /// 独立于 `entries` 存放：池重建（sync_*）会清空条目，挂条目上会被冲掉
+    pub paused: Mutex<HashSet<String>>,
 }
 
 /// 安全获取 Mutex 锁：若锁被毒化（panic 导致），仍恢复内部数据继续运行
@@ -210,7 +218,39 @@ impl ApiPool {
             concurrency_limit: std::sync::atomic::AtomicU32::new(1),
             reserve_credits: std::sync::atomic::AtomicU64::new(0.0f64.to_bits()),
             log_ctx: Mutex::new(None),
+            paused: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// 设置/清除账号的「暂停选号」。
+    ///
+    /// 只影响选号（[selectable] 闸口），不触碰冷却域、不写 error_count、
+    /// 不阻止签到/保活/额度刷新——与 disabled 的终态语义刻意分开。
+    /// 返回是否发生了变化（供调用方决定是否落盘/记日志）。
+    pub fn set_paused(&self, uid: &str, paused: bool) -> bool {
+        let mut set = safe_lock(&self.paused);
+        let changed = if paused {
+            set.insert(uid.to_string())
+        } else {
+            set.remove(uid)
+        };
+        changed
+    }
+
+    /// 批量覆盖暂停集合（启动时从持久化恢复；与池条目重建无关）
+    pub fn replace_paused(&self, uids: &HashSet<String>) {
+        let mut set = safe_lock(&self.paused);
+        *set = uids.clone();
+    }
+
+    /// 当前暂停集合快照（供持久化与状态展示）
+    pub fn paused_snapshot(&self) -> HashSet<String> {
+        safe_lock(&self.paused).clone()
+    }
+
+    /// 该账号是否处于暂停选号态
+    pub fn is_paused(&self, uid: &str) -> bool {
+        safe_lock(&self.paused).contains(uid)
     }
 
     /// 装配冷却/禁用标记的日志上下文：池标签 + 数据目录（do_start 启动时调用）；
@@ -615,11 +655,15 @@ impl ApiPool {
 
     /// 指定 uid 取号（T2.4 会话粘性）：账号 healthy 时返回其凭证，否则 None
     pub fn pick_by_uid(&self, uid: &str) -> Option<PickedAccount> {
+        let paused = self.paused_snapshot();
         let entries = safe_lock(&self.entries);
         let now = now_ts();
         let tried = HashSet::new();
         let reserve = self.reserve_credits();
-        entries.get(uid).filter(|e| selectable(e, &tried, now, reserve)).map(|e| PickedAccount {
+        entries
+            .get(uid)
+            .filter(|e| selectable(e, &tried, now, reserve, &paused))
+            .map(|e| PickedAccount {
             uid: e.uid.clone(),
             jwt: e.jwt.clone(),
             device_id: e.device_id.clone(),
@@ -670,13 +714,14 @@ impl ApiPool {
                 }
             }
         }
+        let paused = self.paused_snapshot();
         let mut entries = safe_lock(&self.entries);
         let strategy = *safe_lock(&self.strategy);
         let now = now_ts();
         let reserve = self.reserve_credits();
         let all_cands: Vec<&PoolEntry> = entries
             .values()
-            .filter(|e| selectable(e, tried, now, reserve))
+            .filter(|e| selectable(e, tried, now, reserve, &paused))
             .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
             .collect();
         // F-77 busy 过滤 + 全 busy 降级
@@ -781,13 +826,15 @@ impl ApiPool {
         }
         // 粘性账号 busy：判定其他健康候选（同 allowed 约束；首轮无 tried）是否存在空闲
         let reserve = self.reserve_credits();
+        // 暂停号不计入「其他可用候选」：否则会让位给一个不可选的号
+        let paused = self.paused_snapshot();
         let (has_other, has_idle) = {
             let entries = safe_lock(&self.entries);
             let now = now_ts();
             let tried = HashSet::new();
             entries
                 .values()
-                .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now, reserve))
+                .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now, reserve, &paused))
                 .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
                 .fold((false, false), |(any, idle), e| {
                     (any || true, idle || inflight_of(e, &inflight) < limit)
@@ -812,7 +859,7 @@ impl ApiPool {
         let tried = HashSet::new();
         let idle: Vec<&PoolEntry> = entries
             .values()
-            .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now, reserve))
+            .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now, reserve, &paused))
             .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
             .filter(|e| inflight_of(e, &inflight) < limit)
             .collect();
@@ -980,6 +1027,7 @@ impl ApiPool {
 
     /// 返回池状态列表
     pub fn status_list(&self) -> Vec<PoolStatus> {
+        let paused = self.paused_snapshot();
         let entries = safe_lock(&self.entries);
         let now = now_ts();
         let inflight = self.inflight_snapshot();
@@ -995,8 +1043,14 @@ impl ApiPool {
                 cooldown_reason: if e.reason.is_empty() { None } else { Some(e.reason.clone()) },
                 hard_credit: e.hard_until > 0 && now < e.hard_until,
                 disabled: e.disabled,
+                paused: paused.contains(&e.uid),
                 err_count: e.err_count,
-                state: e.state_str(now).to_string(),
+                // 暂停态覆盖显示（暂停与冷却/禁用正交：账号健康但不参与选号）
+                state: if paused.contains(&e.uid) {
+                    "Paused".to_string()
+                } else {
+                    e.state_str(now).to_string()
+                },
                 inflight: inflight.get(&e.uid).copied().unwrap_or(0),
                 refresh_invalid: e.refresh_invalid,
             })
@@ -1013,11 +1067,14 @@ impl ApiPool {
     /// 统一调度选池健康预检用（§4.1 ④）；不含 Key 级白名单/专一约束——
     /// 那由各执行路径取号时自理，预检仅覆盖"池整体耗尽"场景
     pub fn has_selectable(&self) -> bool {
+        let paused = self.paused_snapshot();
         let entries = safe_lock(&self.entries);
         let now = now_ts();
         let tried = HashSet::new();
         let reserve = self.reserve_credits();
-        entries.values().any(|e| selectable(e, &tried, now, reserve))
+        entries
+            .values()
+            .any(|e| selectable(e, &tried, now, reserve, &paused))
     }
 
     /// 同 [has_selectable]，附加 Key 级 uid 白名单过滤（issue #25 资源池绑定）：
@@ -1033,6 +1090,7 @@ impl ApiPool {
     /// `allowed` 语义同 has_selectable_in（None = 不限）；供 NoHealthy 错误
     /// 消息携带「池健康数 / 白名单命中数」，帮助用户自查 Key 约束配置
     pub fn selectable_stats_in(&self, allowed: Option<&HashSet<String>>) -> (usize, usize) {
+        let paused = self.paused_snapshot();
         let entries = safe_lock(&self.entries);
         let now = now_ts();
         let tried = HashSet::new();
@@ -1040,7 +1098,7 @@ impl ApiPool {
         let mut total = 0usize;
         let mut in_allowed = 0usize;
         for e in entries.values() {
-            if selectable(e, &tried, now, reserve) {
+            if selectable(e, &tried, now, reserve, &paused) {
                 total += 1;
                 if allowed.map_or(true, |a| a.contains(&e.uid)) {
                     in_allowed += 1;
@@ -1187,8 +1245,19 @@ pub struct DoubaoAccountSync {
 
 /// 候选过滤：healthy + 未 tried + 积分未过期 + 非零积分 + 非 hard_credit 冷却
 /// `reserve`：账号保留剩余积分阈值（issue #91，≥ 0；0 = 仅过滤零积分）
-fn selectable(e: &PoolEntry, tried: &HashSet<String>, now: i64, reserve: f64) -> bool {
+fn selectable(
+    e: &PoolEntry,
+    tried: &HashSet<String>,
+    now: i64,
+    reserve: f64,
+    paused: &HashSet<String>,
+) -> bool {
     if tried.contains(&e.uid) || !e.healthy(now) {
+        return false;
+    }
+    // 暂停选号：退出一切选号路径（含全冷却兜底、专一/粘性锁定）。
+    // 账号本身仍健康，签到/保活/额度刷新照常
+    if paused.contains(&e.uid) {
         return false;
     }
     // 跳过积分已过期的（expire_time=0 视为无过期时间，不跳过）
@@ -1500,6 +1569,59 @@ mod tests {
         let expired = build_pool(&[("uid_a", 100.0, 1_000)]);
         let ok_a: HashSet<String> = ["uid_a".to_string()].into_iter().collect();
         assert!(!expired.has_selectable_in(Some(&ok_a)));
+    }
+
+    /// 暂停选号：账号健康但退出选号（含专一/指定取号），可随时恢复
+    #[test]
+    fn paused_account_exits_selection_and_resumes() {
+        let pool = build_pool(&[
+            ("uid_a", 100.0, 4_000_001_000),
+            ("uid_b", 100.0, 4_000_001_000),
+        ]);
+        assert!(pool.has_selectable());
+        assert!(pool.set_paused("uid_a", true));
+        // 被暂停的账号不再被任何路径选中
+        assert!(pool.pick_by_uid("uid_a").is_none(), "暂停号不得被指定取号");
+        for _ in 0..20 {
+            let p = pool
+                .pick_excluding_constrained(&HashSet::new(), None, None)
+                .expect("仍有健康账号");
+            assert_eq!(p.uid, "uid_b", "暂停号不得参与调度");
+        }
+        // 全部暂停 → 池无可选（选号侧视为耗尽，但不影响签到/保活）
+        pool.set_paused("uid_b", true);
+        assert!(!pool.has_selectable());
+        assert_eq!(pool.selectable_stats_in(None), (0, 0));
+        // 恢复即刻回池，无需清冷却/重登
+        pool.set_paused("uid_a", false);
+        assert!(pool.has_selectable());
+        assert!(pool.pick_by_uid("uid_a").is_some());
+        // 重复设置幂等
+        assert!(!pool.set_paused("uid_a", false));
+    }
+
+    /// 池重建（sync）不得冲掉暂停态：暂停集合独立于条目存放
+    #[test]
+    fn paused_survives_pool_resync() {
+        let pool = build_pool(&[("uid_a", 100.0, 4_000_001_000)]);
+        pool.set_paused("uid_a", true);
+        let accounts = vec![acct("A", "uid_a")];
+        let enabled = vec!["uid_a".to_string()];
+        let mut credits = HashMap::new();
+        credits.insert("uid_a".to_string(), 100.0);
+        pool.sync_from_accounts(
+            &accounts,
+            &enabled,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &credits,
+            Some(now_ts()),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(pool.is_paused("uid_a"), "重建后暂停态必须保留");
+        assert!(!pool.has_selectable());
     }
 
     #[test]

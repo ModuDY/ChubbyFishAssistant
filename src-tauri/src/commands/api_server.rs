@@ -34,6 +34,90 @@ fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
 /// 无并发窗口，不取锁
 pub(crate) static POOL_CFG_LOCK: Mutex<()> = Mutex::new(());
 
+// ── 账号级「暂停选号」持久化（P3）─────────────────────────────────────────
+//
+// 键：kv `api_paused_uids`，形如 {"trae":["uid_a"],"wb":["wb-x"]}。
+// 与 disabled（终态）分开存：暂停是运维临时态，跨重启保留但随时可恢复。
+const PAUSED_KV: &str = "api_paused_uids";
+
+fn paused_map(state: &AppState) -> serde_json::Map<String, serde_json::Value> {
+    let store = crate::store::db(&state.data_dir);
+    let v: serde_json::Value = store.kv_get(PAUSED_KV);
+    v.as_object().cloned().unwrap_or_default()
+}
+
+/// 读取某池的暂停 uid 集合（启动装配池后回灌，避免重启丢暂停态）
+pub(crate) fn paused_set(state: &AppState, pool: &str) -> std::collections::HashSet<String> {
+    paused_map(state)
+        .get(pool)
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|u| u.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_paused(
+    state: &AppState,
+    pool: &str,
+    uid: &str,
+    paused: bool,
+) -> Result<(), String> {
+    let mut map = paused_map(state);
+    let mut arr: Vec<String> = map
+        .get(pool)
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|u| u.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    arr.retain(|u| u != uid);
+    if paused {
+        arr.push(uid.to_string());
+    }
+    arr.sort();
+    arr.dedup();
+    map.insert(pool.to_string(), serde_json::json!(arr));
+    let store = crate::store::db(&state.data_dir);
+    store
+        .kv_set(PAUSED_KV, &serde_json::Value::Object(map))
+        .map_err(|e| format!("保存暂停状态失败: {e}"))
+}
+
+/// 账号级「暂停选号」开关：只影响选号，签到/保活/额度刷新照常。
+/// `pool`: trae | wb | qoder | doubao
+#[tauri::command]
+pub fn api_pool_pause(
+    state: State<'_, AppState>,
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+    pool: String,
+    uid: String,
+    paused: bool,
+) -> Result<bool, String> {
+    if uid.trim().is_empty() {
+        return Err("uid 不能为空".into());
+    }
+    if !matches!(pool.as_str(), "trae" | "wb" | "qoder" | "doubao") {
+        return Err(format!("未知账号池: {pool}"));
+    }
+    // 热应用（服务未启动时仅落库，下次启动装配时生效）
+    if let Some(rt) = safe_lock(&runtime).as_ref() {
+        let target = match pool.as_str() {
+            "trae" => &rt.shared.pool,
+            "wb" => &rt.shared.wb_pool,
+            "qoder" => &rt.shared.qoder_pool,
+            _ => &rt.shared.doubao_pool,
+        };
+        target.set_paused(&uid, paused);
+    }
+    save_paused(&state, &pool, &uid, paused)?;
+    Ok(paused)
+}
+
 // ==================== 启停命令 ====================
 
 /// 启动 API 服务核心逻辑（页面命令 / 托盘菜单共用）。
@@ -296,6 +380,13 @@ pub async fn do_start(
             ),
         );
     }
+
+    // 暂停选号回灌（P3）：该状态独立于池条目存放，重启/池重建后必须从持久化
+    // 恢复，否则用户暂停过的账号会静默重新参与选号
+    pool.replace_paused(&paused_set(state, "trae"));
+    wb_pool.replace_paused(&paused_set(state, "wb"));
+    qoder_pool.replace_paused(&paused_set(state, "qoder"));
+    doubao_pool.replace_paused(&paused_set(state, "doubao"));
 
     let shared = Arc::new(ApiSharedState {
         pool,

@@ -783,6 +783,12 @@ export const api = {
       invoke<Record<string, Record<string, number>>>('api_keys_org_preview', { keys }),
     /** WB 池实时状态（F-77⑤：含 per-account inflight 在途计数） */
     wbPoolStatus: () => invoke<PoolStatus[]>('wb_pool_status'),
+    /**
+     * 账号级「暂停选号」开关（P3）：只影响选号，签到/保活/额度刷新照常。
+     * pool: trae | wb | qoder | doubao
+     */
+    poolPause: (pool: 'trae' | 'wb' | 'qoder' | 'doubao', uid: string, paused: boolean) =>
+      invoke<boolean>('api_pool_pause', { pool, uid, paused }),
     /** Qoder 池实时状态（Qoder「资源调度」页：含 per-account inflight 在途计数） */
     qoderPoolStatus: () => invoke<PoolStatus[]>('qoder_pool_status'),
     /** 手动同步 Qoder 模型目录（复用每日调度任务入口；返回采纳模型数） */

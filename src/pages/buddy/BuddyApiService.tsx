@@ -585,6 +585,27 @@ export default function BuddyApiService() {
                       <span className="shrink-0 text-right tabular-nums text-xs text-slate-500">
                         {a.credits_balance != null ? `${a.credits_balance.toFixed(2)} 积分` : '余额未知'}
                       </span>
+                      {/* 暂停选号：只退出选号（含兜底/专一），签到/保活照常，随时恢复 */}
+                      <button
+                        className="shrink-0 text-xs text-slate-500 underline-offset-2 hover:underline dark:text-zinc-400"
+                        title={
+                          poolItem?.paused
+                            ? '恢复后立即重新参与选号（不清冷却、无需重登）'
+                            : '暂停后不再承接对话流量，签到与保活照常执行'
+                        }
+                        onClick={() => {
+                          void (async () => {
+                            try {
+                              await api.apiServer.poolPause('wb', a.id, !poolItem?.paused);
+                              await refresh();
+                            } catch {
+                              /* 保留旧状态，下次轮询自愈 */
+                            }
+                          })();
+                        }}
+                      >
+                        {poolItem?.paused ? '恢复选号' : '暂停选号'}
+                      </button>
                     </div>
                   );
                 })}

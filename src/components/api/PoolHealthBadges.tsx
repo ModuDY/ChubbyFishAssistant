@@ -47,10 +47,17 @@ export function PoolHealthBadges({
   const creditsExpired =
     s.credits_expire_at != null && s.credits_expire_at > 0 && s.credits_expire_at < nowSec;
   const selectable =
-    !s.disabled && !s.cooling && !s.hard_credit && !creditsExhausted && !creditsExpired;
+    !s.disabled &&
+    !s.paused &&
+    !s.cooling &&
+    !s.hard_credit &&
+    !creditsExhausted &&
+    !creditsExpired;
   return (
     <>
       {s.disabled && !tokenInvalid && <Badge tone="red">已禁用</Badge>}
+      {/* 暂停选号：账号健康但退出选号流量（签到/保活照常），与「已禁用」区分 */}
+      {s.paused && !s.disabled && <Badge tone="slate">已暂停选号</Badge>}
       {s.hard_credit && <Badge tone="red">积分耗尽·次日04:00恢复</Badge>}
       {s.cooling && (
         <Badge tone="amber">冷却中·{cooldownReasonLabel(s.cooldown_reason)}</Badge>

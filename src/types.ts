@@ -679,6 +679,10 @@ export interface PoolStatus {
   /** 积分耗尽硬冷却中（次日 04:00 自动恢复探测；cooling 仅覆盖软冷却，旧后端未返回时为 undefined） */
   hard_credit?: boolean;
   disabled: boolean;
+  /** 暂停选号（账号级运维态：退出选号，签到/保活照常；旧后端未返回时 undefined） */
+  paused?: boolean;
+  /** 账号五态机（Available/QuotaProtection/RateLimited/Forbidden/Paused） */
+  state?: string;
   err_count: number;
   /** 账号实时在途并发数（F-77⑤ 可观测；旧后端未返回时为 undefined） */
   inflight?: number;

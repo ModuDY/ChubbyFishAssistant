@@ -684,6 +684,32 @@ export default function ApiService() {
                           running={running}
                           tokenInvalid={a.refresh_token_invalid}
                         />
+                        {/* 暂停选号：只退出选号，签到/保活照常。行外层是 label（点按会切勾选），
+                            故显式阻止默认行为与冒泡 */}
+                        <button
+                          className="shrink-0 text-xs text-slate-500 underline-offset-2 hover:underline dark:text-zinc-400"
+                          title={
+                            poolItem?.paused
+                              ? '恢复后立即重新参与选号（不清冷却、无需重登）'
+                              : '暂停后不再承接对话流量，签到与保活照常执行'
+                          }
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            const uid = a.user_id;
+                            if (!uid) return;
+                            void (async () => {
+                              try {
+                                await api.apiServer.poolPause('trae', uid, !poolItem?.paused);
+                                setPoolStatus(await api.apiServer.poolStatus());
+                              } catch {
+                                /* 保留旧状态，下次轮询自愈 */
+                              }
+                            })();
+                          }}
+                        >
+                          {poolItem?.paused ? '恢复选号' : '暂停选号'}
+                        </button>
                       </div>
                     </label>
                   );

@@ -251,6 +251,7 @@ fn main() {
             commands::api_server::api_unified_models,
             commands::api_server::dispatch_policy_get,
             commands::api_server::dispatch_policy_set,
+    commands::api_server::api_pool_pause,
             commands::api_server::model_whitelist_get,
             commands::api_server::model_whitelist_set,
             commands::api_server::gateway_settings_get,
