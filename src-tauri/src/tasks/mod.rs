@@ -33,6 +33,7 @@ pub mod ui_click;
 pub mod wb_checkin;
 pub mod wb_common;
 pub mod wb_credits;
+pub mod wb_report;
 
 use crate::state::AppState;
 

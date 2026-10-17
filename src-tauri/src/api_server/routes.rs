@@ -1493,12 +1493,15 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                         // ①上游提前收尾（done/finish_reason）②上游 EOF 断流被补成正常结束。
                         // 每请求单行，与既有请求行同量级，无需开 Debug 也可回溯
                         state.logger.log_debug_line(format!(
-                            "[STREAM] key={} model={} out={} th={} tool={} done={} fin={} eof={} sent={} {}ms",
+                            "[STREAM] key={} model={} out={} th={} tool={} tcf={} tcum={} tcbad={} done={} fin={} eof={} sent={} {}ms",
                             if key_name.is_empty() { "-" } else { &key_name },
                             model,
                             diag.outputs,
                             diag.thoughts,
                             diag.tools,
+                            diag.tool_frames,
+                            diag.tool_cumulative,
+                            diag.tool_args_bad,
                             diag.done_frames,
                             if diag.finish_reason.is_empty() { "-" } else { &diag.finish_reason },
                             if diag.completed { 0 } else { 1 },

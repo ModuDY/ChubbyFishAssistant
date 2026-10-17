@@ -158,6 +158,9 @@ fn parse_solo_line(event: &str, data: &str) -> Option<SoloEvent> {
 /// 由调用方决定重试（如 4001 改 function）或透传给客户端。
 /// 行源：wb_upstream::lines_with_first_byte_timeout 包装（首字 10s 超时 →
 /// 故障转移）产出的可中断行源
+/// 三参兼容入口：生产路径用 `stream_convert_lines_ex`（带 model 与诊断），
+/// 本入口保留给测试与不关心诊断的调用方
+#[allow(dead_code)]
 pub fn stream_convert_lines(
     lines: InterruptibleLines,
     sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
@@ -184,6 +187,13 @@ pub struct StreamDiag {
     pub finish_reason: String,
     /// 上游是否显式发过完成帧（false = 靠 EOF 收尾）
     pub completed: bool,
+    /// 工具调用参数分片数（含同 index 的增量片）
+    pub tool_frames: usize,
+    /// 检测到「累积式参数」的分片数：>0 说明上游每片重复下发全量参数，
+    /// 原样透传会让客户端重复拼接（表现为工具调用无法闭合）
+    pub tool_cumulative: usize,
+    /// 合并后参数不是合法 JSON 的调用数（>0 = 参数被截断，客户端会解析失败）
+    pub tool_args_bad: usize,
 }
 
 /// 流式转换 + 诊断（调用方需要判断上游收尾形态时使用）
@@ -213,6 +223,10 @@ fn stream_convert_src(
     // 时 has_content 为真而本标记为假——下游 AI SDK 系客户端只认正文/tool_calls，
     // 静默收尾会被判为「模型返回数据异常，未输出最终回答」，故按空完成处置
     let mut has_visible = false;
+    // 本流是否出现过工具调用：收尾原因据此归一（见 finish_with_tools）
+    let mut tool_seen = false;
+    // 工具调用参数按 index 累积，用于诊断上游是增量片还是累积片
+    let mut tool_acc: std::collections::BTreeMap<i64, String> = std::collections::BTreeMap::new();
     let mut error_info: Option<(i64, String)> = None;
     // 收尾形态诊断（见 StreamDiag）
     let mut diag = StreamDiag::default();
@@ -296,6 +310,28 @@ fn stream_convert_src(
                                     c
                                 })
                                 .collect();
+                            // 参数形态诊断：区分「增量片」与「累积片」。累积片若
+                            // 原样透传，客户端会把同一段参数重复拼接，导致调用无法
+                            // 闭合（客户端报 before completing this tool call）
+                            for call in &converted {
+                                let idx = call.get("index").and_then(|i| i.as_i64()).unwrap_or(0);
+                                let args = call
+                                    .pointer("/function/arguments")
+                                    .and_then(|a| a.as_str())
+                                    .unwrap_or("");
+                                if args.is_empty() {
+                                    continue;
+                                }
+                                diag.tool_frames += 1;
+                                let e = tool_acc.entry(idx).or_default();
+                                if !e.is_empty() && args.starts_with(e.as_str()) && args.len() > e.len()
+                                {
+                                    diag.tool_cumulative += 1;
+                                    *e = args.to_string();
+                                } else {
+                                    e.push_str(args);
+                                }
+                            }
                             if !converted.is_empty() {
                                 delta.insert("tool_calls".into(), json!(converted));
                             }
@@ -306,6 +342,9 @@ fn stream_convert_src(
                         // 可交付输出：仅正文/工具调用计入（思考链不构成交付物）
                         if delta.contains_key("content") || delta.contains_key("tool_calls") {
                             has_visible = true;
+                        }
+                        if delta.contains_key("tool_calls") {
+                            tool_seen = true;
                         }
                         let data = write_chunk(Value::Object(delta), "", &pending_usage);
                         // 客户端断连检测：发送失败即退出读循环，释放上游与账号并发槽
@@ -370,7 +409,12 @@ fn stream_convert_src(
                         sent_any = true;
                         break;
                     }
-                    let data = write_chunk(json!({}), &ev.finish_reason, &pending_usage);
+                    // 收尾原因归一：有工具调用时必须为 tool_calls。上游实测在带
+                    // 工具调用时仍回 stop，客户端据此提前结束本轮并丢弃未闭合的
+                    // 调用（报 "before completing this tool call"）
+                    let finish =
+                        crate::api_server::finish_with_tools(&ev.finish_reason, tool_seen);
+                    let data = write_chunk(json!({}), &finish, &pending_usage);
                     if sender.blocking_send(Ok(bytes::Bytes::from(data))).is_err() {
                         break;
                     }
@@ -431,16 +475,18 @@ fn stream_convert_src(
             // 上游未发完成帧即断流：补齐带 finish_reason 的收尾 chunk 再 [DONE]。
             // 严格客户端（AI SDK 等）只认「finish_reason 帧 + [DONE]」的组合，
             // 裸 [DONE] 会让它们把已收正文当作残缺消息（表现为「输出几句就停」）
-            let finish = if diag.finish_reason.is_empty() {
-                "stop".to_string()
-            } else {
-                diag.finish_reason.clone()
-            };
+            let finish = crate::api_server::finish_with_tools(&diag.finish_reason, tool_seen);
             let data = write_chunk(json!({}), &finish, &pending_usage);
             let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
             let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
         }
     }
+
+    // 参数完整性诊断：合并后仍不是合法 JSON → 被截断，客户端解析会失败
+    diag.tool_args_bad = tool_acc
+        .values()
+        .filter(|a| !a.trim().is_empty() && serde_json::from_str::<Value>(a).is_err())
+        .count();
 
     (
         error_info.map(|(code, msg)| (code, msg)),
@@ -721,7 +767,12 @@ pub fn aggregate<R: Read + Send>(
         "choices": [{
             "index": 0,
             "message": message,
-            "finish_reason": c.finish_reason,
+            // 有工具调用时必须为 tool_calls（上游实测回 stop，客户端据此提前
+            // 结束本轮并丢弃未闭合的调用）
+            "finish_reason": crate::api_server::finish_with_tools(
+                &c.finish_reason,
+                message.get("tool_calls").is_some(),
+            ),
         }],
     });
     if let Some(u) = c.usage {
@@ -1575,6 +1626,66 @@ mod tests {
         let joined = collect_events(rx).join("\n");
         assert!(joined.contains("\"finish_reason\":\"stop\""), "必须补 finish_reason 帧");
         assert!(joined.ends_with("data: [DONE]"));
+    }
+
+    /// 上游带工具调用却回 stop：出站必须归一为 tool_calls。否则客户端认为本轮
+    /// 已正常结束，丢弃未闭合的工具调用（"before completing this tool call"）
+    #[test]
+    fn tool_calls_with_upstream_stop_normalized() {
+        let input = "event: output\ndata: {\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let (err, sent_any, _, _d) = stream_convert_lines_ex(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "c1",
+            "m",
+        );
+        assert!(err.is_none());
+        assert!(sent_any);
+        let joined = collect_events(rx).join("\n");
+        assert!(
+            joined.contains("\"finish_reason\":\"tool_calls\""),
+            "有工具调用时收尾必须是 tool_calls"
+        );
+        assert!(
+            !joined.contains("\"finish_reason\":\"stop\""),
+            "不得把 stop 透传给客户端"
+        );
+    }
+
+    /// 截断语义不被掩盖：上游 length + 工具调用 → 仍为 length
+    #[test]
+    fn tool_calls_with_length_keeps_length() {
+        let input = "event: output\ndata: {\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"length\"}\n\n";
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let _ = stream_convert_lines_ex(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "c1",
+            "m",
+        );
+        let joined = collect_events(rx).join("\n");
+        assert!(
+            joined.contains("\"finish_reason\":\"length\""),
+            "length 必须原样保留"
+        );
+    }
+
+    /// 对照组：无工具调用的正常回复仍为 stop
+    #[test]
+    fn done_without_tools_keeps_stop() {
+        let input = "event: output\ndata: {\"response\":\"hi\"}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let _ = stream_convert_lines_ex(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "c1",
+            "m",
+        );
+        let joined = collect_events(rx).join("\n");
+        assert!(joined.contains("\"finish_reason\":\"stop\""));
     }
 
     #[test]

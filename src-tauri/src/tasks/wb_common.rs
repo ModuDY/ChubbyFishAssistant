@@ -499,6 +499,28 @@ pub fn region_billing_base(domain: &str) -> &'static str {
 pub const WEB_BASE_CN: &str = "https://www.workbuddy.cn";
 pub const WEB_BASE_GLOBAL: &str = "https://www.workbuddy.ai";
 
+/// Web 端域名（CN `www.workbuddy.cn` / Global `www.workbuddy.ai`）
+pub fn region_web_base(domain: &str) -> &'static str {
+    if is_global_region(domain) {
+        WEB_BASE_GLOBAL
+    } else {
+        WEB_BASE_CN
+    }
+}
+
+/// 对话域基址（`/v2/report` 桌面事件族与 `/v2/chat/completions` 同域）：
+/// CN `copilot.tencent.com` / Global `www.workbuddy.ai`
+pub const CHAT_BASE_CN: &str = "https://copilot.tencent.com";
+pub const CHAT_BASE_GLOBAL: &str = "https://www.workbuddy.ai";
+
+pub fn region_chat_base(domain: &str) -> &'static str {
+    if is_global_region(domain) {
+        CHAT_BASE_GLOBAL
+    } else {
+        CHAT_BASE_CN
+    }
+}
+
 /// 在既有账号头上补齐 Web 端标记（领奖用）：`x-client-platform: web` 与成长中心
 /// Origin/Referer（浏览器实请求形状，上游按此判定来源端）。
 /// 独立成函数是为了让调用方能把「刷新后的新凭证头」再套一层，避免拿旧 token 领奖。

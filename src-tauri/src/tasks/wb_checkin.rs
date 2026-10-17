@@ -17,6 +17,7 @@ use crate::state::AppState;
 
 use super::http_agent;
 use super::wb_common::{self, Creds};
+use super::wb_report;
 
 /// 盲盒抽取循环上限（防接口异常时死循环；正常 balance 会归零）
 const LOTTERY_MAX_DRAWS: usize = 20;
@@ -72,6 +73,9 @@ struct Urls {
     streak_redeem: String,
     /// 对话活跃上报（点亮连登 + 解锁领养等成长任务）
     report: String,
+    /// 领养协议 / 领取第一只 Buddy（first_buddy 任务）
+    buddy_agreement: String,
+    buddy_first: String,
 }
 
 fn urls_for(base: &'static str) -> Urls {
@@ -94,6 +98,8 @@ fn urls_for(base: &'static str) -> Urls {
         streak: format!("{g}/streak"),
         streak_redeem: format!("{g}/redeem"),
         report: format!("{b}/v2/report"),
+        buddy_agreement: format!("{g}/buddy/agreement"),
+        buddy_first: format!("{g}/buddy/first"),
     }
 }
 
@@ -876,6 +882,211 @@ fn claim_task(
     Ok((credit, energy))
 }
 
+/// 拉取成长任务列表（宽松解析 `data.tasks/list/records`，返回 owned 数组）
+fn fetch_tasks(
+    agent: &ureq::Agent,
+    headers: &[(String, String)],
+    urls: &Urls,
+) -> Result<Vec<Value>, (u16, String)> {
+    let (status, body, raw) = wb_common::get_json(agent, &urls.tasks, headers);
+    if status == 401 {
+        return Err((401, "登录态失效（401）".into()));
+    }
+    if status != 200 || !body.as_ref().is_some_and(|b| b.is_object()) {
+        let head: String = raw.chars().take(60).collect();
+        let msg = if status != 0 {
+            format!("tasks 不可用（HTTP {status}）")
+        } else {
+            format!("tasks 不可达: {head}")
+        };
+        return Err((status, msg));
+    }
+    let b = body.as_ref().unwrap();
+    Ok(fs_utils::dig(b, &["tasks", "list", "records"])
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// 取任务码（task_code / taskCode / code）
+fn task_code_of(t: &Value) -> &str {
+    t.get("task_code")
+        .filter(|v| !v.is_null())
+        .or_else(|| t.get("taskCode").filter(|v| !v.is_null()))
+        .or_else(|| t.get("code").filter(|v| !v.is_null()))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+}
+
+/// P2 第一批：纯事件型任务的判据补齐。
+///
+/// 只处理「未领取且进度未达标」的任务，按任务类型构造对应客户端指纹的事件链：
+/// - 桌面包（RichMeow / Buddy_App / automation / template / playbook / canvas）
+/// - Web 包（Library_read）
+/// - 对话包（chat_5 / first_buddy 前置）
+///
+/// 上报 200 不等于计分：真正是否到账由随后重新拉进度 + 领奖决定
+/// （调用方在本函数返回后 sleep 一段时间再走 `growth_tasks`）。
+fn sync_task_reports(
+    agent: &ureq::Agent,
+    headers: &[(String, String)],
+    creds: &Creds,
+    urls: &Urls,
+    tasks: &[Value],
+) -> (String, String) {
+    let mut ok_codes: Vec<&str> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+    for t in tasks {
+        let code = task_code_of(t);
+        if code.is_empty() {
+            continue;
+        }
+        let accept_status = t
+            .get("accept_status")
+            .filter(|v| !v.is_null())
+            .or_else(|| fs_utils::dig(t, &["acceptStatus", "status"]))
+            .map(value_display)
+            .unwrap_or_default();
+        let claimed = ["claimed", "已领取"].contains(&accept_status.as_str());
+        let (cur, tgt) = task_progress(t);
+        let met = tgt > 0.0 && cur >= tgt;
+        if claimed || met {
+            continue;
+        }
+        let ms = chrono::Local::now().timestamp_millis();
+        let desktop = |evs| wb_report::report_desktop(agent, creds, evs).map(|_| ());
+        let res: Result<(), String> = match code {
+            // 对话活跃上报补足差额（每条独立会话 id）
+            "chat_5" => {
+                let need = if tgt > 0.0 { ((tgt - cur).max(0.0)).round() as usize } else { 5 };
+                let mut first_err: Option<String> = None;
+                for i in 0..need {
+                    let conv = format!("aiwork-chat5-{ms}-{i}");
+                    let (k, m) = report_chat_event(
+                        agent, headers, urls, &creds.uid, &conv,
+                        "deepseek-v4-flash", "DeepSeek V4 Flash",
+                    );
+                    if k == "auth" {
+                        return ("auth".into(), m);
+                    }
+                    if k == "fail" {
+                        first_err.get_or_insert(m);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+                match first_err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                }
+            }
+            // 领养：活跃上报解锁 → 同意协议 → 领取
+            "first_buddy" => {
+                let conv = format!("aiwork-adopt-{ms}");
+                let (k, m) = report_chat_event(
+                    agent, headers, urls, &creds.uid, &conv,
+                    "deepseek-v4-flash", "DeepSeek V4 Flash",
+                );
+                if k == "auth" {
+                    return ("auth".into(), m);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                let (st1, _b1, _r1) =
+                    wb_common::post_json_raw(agent, &urls.buddy_agreement, headers, &json!({}));
+                if st1 == 401 {
+                    return ("auth".into(), "登录态失效（401）".into());
+                }
+                let (st2, _b2, raw2) =
+                    wb_common::post_json_raw(agent, &urls.buddy_first, headers, &json!({}));
+                if st2 == 401 {
+                    return ("auth".into(), "登录态失效（401）".into());
+                }
+                if (200..=201).contains(&st2) {
+                    Ok(())
+                } else {
+                    Err(format!("领取 Buddy HTTP {st2} {}", raw2.chars().take(60).collect::<String>()))
+                }
+            }
+            // 桌面端完整对话链
+            "RichMeow_Chat" => desktop(wb_report::chat_sequence(
+                &format!("aiwork-rm-{ms}"),
+                &format!("aiwork-rm-req-{ms}"),
+                &format!("req-{ms}-user"),
+                "fast-model",
+                "fast-model",
+            )),
+            // 进入 Buddy 应用五连事件（同覆盖 Buddy_App_QQ）
+            "Buddy_App" | "Buddy_App_QQ" => {
+                desktop(wb_report::buddy_app_sequence("cb_y5Dy46tPQGGWtueMxXbe", "企鹅教师助手"))
+            }
+            "automation_1" => desktop(vec![wb_report::automation_create_event("aiwork 自动化")]),
+            // Web 页面行为：资料库介绍点击
+            "Library_read" => wb_report::report_web_event(
+                agent,
+                creds,
+                "web_element_click",
+                "https://www.workbuddy.cn/space/d/o0KWYeynteVv06UnAZqIFm",
+                "library_doc_intro_click",
+                "WorkBuddy资料库介绍",
+            )
+            .map(|_| ()),
+            // 模板使用 ×5（不同模板 id）
+            "template_5" => {
+                let need = if tgt > 0.0 { ((tgt - cur).max(0.0)).round() as usize } else { 5 };
+                let mut first_err: Option<String> = None;
+                for i in 0..need.max(1) {
+                    let evs = wb_report::template_use_sequence(
+                        &format!("aiwork-tpl-{ms}-{i}"),
+                        &format!("aiwork-tpl-req-{ms}-{i}"),
+                        &format!("tpl-{i}"),
+                        &format!("模板 {i}"),
+                    );
+                    if let Err(e) = desktop(evs) {
+                        first_err.get_or_insert(e);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+                match first_err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                }
+            }
+            "playbook_prompt" => desktop(wb_report::playbook_prompt_sequence(
+                &format!("aiwork-pb-{ms}"),
+                &format!("aiwork-pb-req-{ms}"),
+                "pb-aiwork",
+                "灵感案例",
+            )),
+            "create_canvas" => desktop(wb_report::canvas_sequence(
+                &format!("aiwork-cv-{ms}"),
+                &format!("aiwork-cv-req-{ms}"),
+            )),
+            // 其余任务需要真实对话/专家链路，留待下一批
+            _ => continue,
+        };
+        match res {
+            Ok(()) => ok_codes.push(code),
+            Err(e) => failed.push(format!("{code}: {e}")),
+        }
+    }
+    if ok_codes.is_empty() && failed.is_empty() {
+        return ("skip".into(), "判据事件无需补齐".into());
+    }
+    let mut msg = String::new();
+    if !ok_codes.is_empty() {
+        msg.push_str(&format!("已上报 {} 个任务判据（{}）", ok_codes.len(), ok_codes.join("/")));
+    }
+    if !failed.is_empty() {
+        if !msg.is_empty() {
+            msg.push_str("；");
+        }
+        msg.push_str(&format!("失败 {}：{}", failed.len(), failed.join("；")));
+    }
+    let kind = if ok_codes.is_empty() { "fail" } else { "ok" };
+    (kind.into(), msg)
+}
+
 /// 成长任务：拉列表 → 未接受则 accept → 进度达标且未领取则 **Web 域 claim 领奖**。
 /// accept 只是「接任务」，奖励必须另走 claim 才会到账（此前只 accept 不 claim，
 /// 奖励从未落袋）。
@@ -886,30 +1097,17 @@ fn growth_tasks(
 ) -> (String, String) {
     // 领奖走 Web 域：在（可能刚刷新过的）账号头上补 Web 端标记
     let web_headers = wb_common::web_flavor(headers, urls.web_base());
-    let (status, body, raw) = wb_common::get_json(agent, &urls.tasks, headers);
-    if status == 401 {
-        return ("auth".into(), "登录态失效（401）".into());
-    }
-    if status != 200 || !body.as_ref().is_some_and(|b| b.is_object()) {
-        let head: String = raw.chars().take(60).collect();
-        let msg = if status != 0 {
-            format!("tasks 不可用（HTTP {status}）")
-        } else {
-            format!("tasks 不可达: {head}")
-        };
-        return ("fail".into(), msg);
-    }
-    let b = body.as_ref().unwrap();
-    let tasks: Vec<&Value> = fs_utils::dig(b, &["tasks", "list", "records"])
-        .and_then(Value::as_array)
-        .map(|a| a.iter().collect())
-        .unwrap_or_default();
+    let tasks = match fetch_tasks(agent, headers, urls) {
+        Ok(t) => t,
+        Err((401, msg)) => return ("auth".into(), msg),
+        Err((_, msg)) => return ("fail".into(), msg),
+    };
     let mut accepted = 0usize;
     let mut claimed = 0usize;
     let mut skipped = 0usize;
     let mut credit_total = 0.0;
     let mut energy_total = 0.0;
-    for t in tasks {
+    for t in &tasks {
         let Some(obj) = t.as_object() else { continue };
         if !py_truthy(obj.get("has_reward")) && fs_utils::dig(t, &["hasReward"]).is_none() {
             continue;
@@ -1050,11 +1248,24 @@ fn growth_report(
     urls: &Urls,
     uid: &str,
 ) -> (String, String) {
+    let now = chrono::Utc::now().timestamp_millis();
+    report_chat_event(agent, headers, urls, uid, &format!("aiwork-{now}"), "deepseek-v4-flash", "DeepSeek V4 Flash")
+}
+
+/// 单条对话活跃事件上报（可指定会话 id 与模型，供 chat_5 / 模型体验类任务复用）
+fn report_chat_event(
+    agent: &ureq::Agent,
+    headers: &[(String, String)],
+    urls: &Urls,
+    uid: &str,
+    conv: &str,
+    model_id: &str,
+    model_name: &str,
+) -> (String, String) {
     if uid.trim().is_empty() {
         return ("skip".into(), "缺少 uid，跳过活跃上报".into());
     }
     let now = chrono::Utc::now().timestamp_millis();
-    let conv = format!("aiwork-{now}");
     let event = json!({
         "eventCode": "chat_request_send",
         "timestamp": now,
@@ -1063,8 +1274,8 @@ fn growth_report(
         "conversationId": conv,
         "requestId": conv,
         "inputLength": 12,
-        "requestModelId": "deepseek-v4-flash",
-        "requestModelName": "DeepSeek V4 Flash",
+        "requestModelId": model_id,
+        "requestModelName": model_name,
         "isPlan": false,
         "isAutoExecuteTerminal": false,
         "isAutoModify": false,
@@ -1163,6 +1374,17 @@ fn process_account_growth(state: &AppState, agent: &ureq::Agent, acct: &Value, f
         result.insert("report".into(), json!(if k1 == "fail" { "fail" } else { m1.as_str() }));
         let (k2, m2) = with_retry(state, agent, &aid, &creds, |h| growth_redeem(agent, h, &urls));
         result.insert("redeem".into(), json!(if k2 == "fail" { "fail" } else { m2.as_str() }));
+        // 判据事件补齐：先拉任务列表，按任务类型构造对应指纹的事件链上报；
+        // 上报与计分异步，等待片刻再交给下面的 accept/claim 步骤
+        let (k3, m3) = with_retry(state, agent, &aid, &creds, |h| {
+            match fetch_tasks(agent, h, &urls) {
+                Ok(tasks) => sync_task_reports(agent, h, &creds, &urls, &tasks),
+                Err((401, msg)) => ("auth".into(), msg),
+                Err((_, msg)) => ("fail".into(), msg),
+            }
+        });
+        result.insert("actions".into(), json!(if k3 == "fail" { "fail" } else { m3.as_str() }));
+        std::thread::sleep(std::time::Duration::from_millis(1500));
         let (kind, msg) = with_retry(state, agent, &aid, &creds, |h| growth_tasks(agent, h, &urls));
         result.insert("tasks".into(), json!(if kind == "fail" { "fail" } else { msg.as_str() }));
     }
@@ -1172,11 +1394,11 @@ fn process_account_growth(state: &AppState, agent: &ureq::Agent, acct: &Value, f
         result.insert(k.to_string(), json!(v));
     }
 
-    let enabled = ["travel", "lottery", "report", "redeem", "tasks"]
+    let enabled = ["travel", "lottery", "report", "redeem", "actions", "tasks"]
         .iter()
         .filter(|k| result.contains_key(**k))
         .count();
-    let fails = ["travel", "lottery", "report", "redeem", "tasks"]
+    let fails = ["travel", "lottery", "report", "redeem", "actions", "tasks"]
         .iter()
         .filter(|k| result.get(**k).and_then(Value::as_str) == Some("fail"))
         .count();

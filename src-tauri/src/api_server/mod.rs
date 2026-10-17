@@ -713,6 +713,23 @@ pub fn tool_args_truncated(raw: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(trimmed).is_err()
 }
 
+/// 收尾原因归一（OpenAI 流式/聚合共用）：本流出现过工具调用时，
+/// `finish_reason` 必须是 `tool_calls`。
+///
+/// 实测上游（Trae SOLO 与 WB）在有工具调用时仍回 `stop`；原样透传会让客户端
+/// 认为本轮已正常结束，从而丢弃尚未闭合的工具调用，报
+/// 「response ended with finish reason "stop" before completing this tool call」。
+/// 截断语义（`length`）与其它原因原样保留，避免掩盖真实的 max_tokens 中止。
+pub fn finish_with_tools(upstream: &str, has_tools: bool) -> String {
+    if has_tools && (upstream.is_empty() || upstream == "stop") {
+        return "tool_calls".to_string();
+    }
+    if upstream.is_empty() {
+        return "stop".to_string();
+    }
+    upstream.to_string()
+}
+
 /// 聚合响应是否零内容（OpenAI chat / legacy text / Anthropic message 三形态）：
 /// 无正文 + 无工具调用即视为空完成（换号重试）。
 /// 注意：思考链（`reasoning_content` / Anthropic `thinking` 块）**不计入**交付物

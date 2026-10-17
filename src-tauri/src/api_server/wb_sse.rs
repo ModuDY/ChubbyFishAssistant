@@ -250,6 +250,8 @@ pub fn stream_forward_ex(
     // 时 has_content 为真而本标记为假——下游 AI SDK 系客户端只认正文/tool_calls，
     // 静默收尾会被判为「模型返回数据异常，未输出最终回答」，故按空完成处置
     let mut has_visible = false;
+    // 本流是否出现过工具调用：OpenAI 出站帧的 finish_reason 据此归一
+    let mut tool_seen = false;
     let mut usage: Option<Value> = None;
     let mut error_info: Option<(i64, String)> = None;
 
@@ -597,6 +599,9 @@ pub fn stream_forward_ex(
                 if frame_text || frame_tools {
                     has_visible = true;
                 }
+                if frame_tools {
+                    tool_seen = true;
+                }
                 if proto == crate::api_server::routes::Protocol::Anthropic {
                     anthropic_start(tx, &mut message_started, chat_id, model);
                     // T5.3/F-62：思考链增量 → thinking block（先于文本块）
@@ -729,10 +734,19 @@ pub fn stream_forward_ex(
                             if !(frame_empty && finish.is_empty() && !frame_has_usage) {
                                 // OpenAI 流式规范：finish_reason / usage 缺省时写 null，
                                 // 不省略键（严格客户端按 schema 校验帧结构）
+                                // 收尾原因归一：有工具调用时必须为 tool_calls（上游实测
+                                // 回 stop，客户端会据此提前结束并丢弃未闭合的调用）
+                                let finish_val = if finish.is_empty() {
+                                    Value::Null
+                                } else if tool_seen {
+                                    json!(crate::api_server::finish_with_tools(&finish, true))
+                                } else {
+                                    json!(finish)
+                                };
                                 let choice = json!({
                                     "index": 0,
                                     "delta": delta,
-                                    "finish_reason": if finish.is_empty() { Value::Null } else { json!(finish) },
+                                    "finish_reason": finish_val,
                                 });
                                 let mut chunk = json!({
                                     "id": if id.is_empty() { chat_id.to_string() } else { id },
@@ -988,7 +1002,7 @@ pub fn aggregate<L: Iterator<Item = String>>(
         "object": "chat.completion",
         "created": now_ts(),
         "model": "",
-        "choices": [{ "index": 0, "message": message, "finish_reason": if finish.is_empty() { "stop" } else { &finish } }],
+        "choices": [{ "index": 0, "message": message, "finish_reason": crate::api_server::finish_with_tools(&finish, message.get("tool_calls").is_some()) }],
     });
     if let Some(u) = usage {
         resp["usage"] = u;
