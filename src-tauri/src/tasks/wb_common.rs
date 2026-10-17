@@ -57,6 +57,14 @@ pub struct Creds {
     pub nickname: String,
     #[serde(default)]
     pub edition: String,
+    /// 企业标识（auth 文件 `account.enterpriseId`；个人号为空）。
+    /// 非空即企业号 —— 企业号无个人成长体系，签到/成长任务等须整体跳过
+    #[serde(default)]
+    pub enterprise_id: String,
+    /// 客户端 account 段的企业标志（不同版本命名不一，任一为真即企业号）：
+    /// `isCurrentOneIdEnterprise` / `isCurrentOneIdPersonal`(取反) / `accountType`
+    #[serde(default)]
+    pub enterprise_flag: bool,
 }
 
 /// 字符串字段提取：兼容 WorkBuddy 5.8.2+ 静态加密包装
@@ -107,7 +115,51 @@ pub fn creds_of(source: &Value) -> Creds {
         domain: s_of(fs_utils::dig(source, &["domain"])),
         nickname: s_of(fs_utils::dig(account, &["nickname", "name", "displayName"])),
         edition: s_of(fs_utils::dig(account, &["editionType", "edition_type", "edition"])),
+        enterprise_id: s_of(fs_utils::dig(
+            account,
+            &["enterpriseId", "enterprise_id", "entId"],
+        )),
+        enterprise_flag: enterprise_flag_of(account),
     }
+}
+
+/// 客户端 account 段的企业标志识别（各版本字段命名不一，逐项判定）：
+/// - `isCurrentOneIdEnterprise == true` → 企业
+/// - `accountType` 含 enterprise/corp/company → 企业
+///
+/// **不能**用「`isCurrentOneIdPersonal == false` → 企业」：实测个人账号的
+/// auth 文件里 enterprise 与 personal 两个标志**同时为 false**（均未置位），
+/// 按此判据会把所有个人号误判成企业号、整体跳过签到与成长任务。
+///
+/// 这些字段来自客户端本地文件（非凭据），只作「是否企业号」判定，不外传。
+fn enterprise_flag_of(account: &Value) -> bool {
+    let truthy = |keys: &[&str]| -> bool {
+        fs_utils::dig(account, keys).is_some_and(|v| match v {
+            Value::Bool(b) => *b,
+            Value::String(s) => !matches!(
+                s.to_ascii_lowercase().as_str(),
+                "" | "false" | "0" | "no"
+            ),
+            Value::Number(n) => n.as_i64().unwrap_or(0) != 0,
+            _ => false,
+        })
+    };
+    if truthy(&["isCurrentOneIdEnterprise", "isEnterprise"]) {
+        return true;
+    }
+    fs_utils::dig(account, &["accountType", "account_type"])
+        .map(|v| s_of(Some(v)).to_ascii_lowercase())
+        .is_some_and(|t| t.contains("enterprise") || t.contains("corp") || t.contains("company"))
+}
+
+/// 是否企业号：auth 文件带非空 `enterpriseId`，或客户端 account 段带企业标志。
+///
+/// 企业号**没有个人成长体系**：签到、成长任务、连登兑换、旅行、抽奖在上游一律
+/// 被拒（400 code 10001「企业账号不支持该操作」/ 403「growth system is only
+/// available for personal users」）。调用方应在发起这类请求前整体跳过，
+/// 而不是每天空发一轮注定失败的请求；额度改走企业专用接口。
+pub fn is_enterprise_account(creds: &Creds) -> bool {
+    !creds.enterprise_id.trim().is_empty() || creds.enterprise_flag
 }
 
 fn read_auth_file(state: &AppState) -> Creds {
@@ -851,6 +903,53 @@ pub fn refresh_token_once_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ==================== 企业号判定 ====================
+
+    #[test]
+    fn enterprise_detected_from_enterprise_id() {
+        // auth 文件带非空 enterpriseId → 企业号（参考实现的同一判据）
+        let raw = serde_json::json!({
+            "auth": {"accessToken": "at", "domain": "www.workbuddy.cn"},
+            "account": {"uid": "u1", "enterpriseId": "ent-1", "nickname": "企业号"}
+        });
+        let c = creds_of(&raw);
+        assert_eq!(c.enterprise_id, "ent-1");
+        assert!(is_enterprise_account(&c));
+    }
+
+    #[test]
+    fn personal_account_not_enterprise() {
+        // 个人号：无 enterpriseId，且 isCurrentOneIdEnterprise=false
+        let raw = serde_json::json!({
+            "auth": {"accessToken": "at"},
+            "account": {
+                "uid": "u1", "isCurrentOneIdEnterprise": false,
+                "isCurrentOneIdPersonal": false, "accountType": ""
+            }
+        });
+        let c = creds_of(&raw);
+        assert!(c.enterprise_id.is_empty());
+        // personal 与 enterprise 同为 false 时不得判成企业（缺省噪声）
+        assert!(!is_enterprise_account(&c));
+    }
+
+    #[test]
+    fn enterprise_detected_from_client_flag() {
+        // 客户端标志形态（无 enterpriseId 时兜底）：isCurrentOneIdEnterprise=true
+        let raw = serde_json::json!({
+            "auth": {"accessToken": "at"},
+            "account": {"uid": "u2", "isCurrentOneIdEnterprise": true}
+        });
+        assert!(is_enterprise_account(&creds_of(&raw)));
+
+        // accountType 含 enterprise
+        let raw2 = serde_json::json!({
+            "auth": {"accessToken": "at"},
+            "account": {"uid": "u3", "accountType": "Enterprise"}
+        });
+        assert!(is_enterprise_account(&creds_of(&raw2)));
+    }
 
     // ==================== 客户端指纹伪装（issue #48） ====================
 

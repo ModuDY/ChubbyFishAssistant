@@ -92,6 +92,14 @@ pub struct WorkBuddyAccount {
     /// None = 无到期信息或全部包长期有效，键值随每次回写覆盖（不留 stale）
     #[serde(default)]
     pub credits_expire_at: Option<i64>,
+    /// 企业号标记：企业账号**没有个人成长体系**——签到、成长任务、连登、旅行、
+    /// 抽奖在上游一律被拒（400 code 10001「企业账号不支持该操作」/
+    /// 403「growth system is only available for personal users」），必须整体跳过，
+    /// 否则每日对注定失败的端点空发请求。额度改走 get-enterprise-user-usage。
+    /// 判据见 `wb_common::is_enterprise_account`（auth 文件 enterpriseId 或
+    /// 客户端 account 段的企业标志），识别后落库避免每次重探
+    #[serde(default)]
+    pub is_enterprise: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]

@@ -401,6 +401,44 @@ fn fetch_round(
     (enriched, balance, saw_auth, false)
 }
 
+/// 企业号额度查询：`POST /v2/billing/meter/get-enterprise-user-usage`。
+///
+/// 上游口径（与个人资源包完全不同）：
+/// - `credit`   = **本周期已用**（个人侧 CapacityRemain 是「剩余」，语义相反）
+/// - `limitNum` = **分配给本账号的额度**
+/// - 剩余 = limitNum - credit；limitNum < 0 表示不限量
+///
+/// 企业**池**总额度是另一回事（成员账号无权查询，池端点恒 403），此处只反映
+/// 该账号被分配的额度。查询失败返回 None，由调用方按「未知」展示。
+fn fetch_enterprise_balance(
+    agent: &ureq::Agent,
+    headers: &[(String, String)],
+    domain: &str,
+) -> Option<f64> {
+    let base = wb_common::region_billing_base(domain);
+    let url = format!("{base}/v2/billing/meter/get-enterprise-user-usage");
+    let (status, body) = wb_common::post_json(agent, &url, headers, &json!({}));
+    if status != 200 {
+        return None;
+    }
+    let b = body.filter(|b| b.is_object())?;
+    enterprise_remaining(&b)
+}
+
+/// 企业额度口径换算（纯函数，便于单测）：
+/// `limitNum` 是分配额度、`credit` 是本周期**已用**，剩余 = limit - used。
+/// 兼容 snake_case（limit_num/used_num）；`limitNum < 0` 表示不限量，原样返回。
+fn enterprise_remaining(b: &Value) -> Option<f64> {
+    let limit = num_of(fs_utils::dig(b, &["limitNum", "limit_num"]))
+        .or_else(|| num_of(fs_utils::dig(b, &["LimitNum"])))?;
+    // 不限量：池内无对应状态位，直接按 limit 展示（下方饱和到 0 以上即可）
+    if limit < 0.0 {
+        return Some(limit);
+    }
+    let used = num_of(fs_utils::dig(b, &["credit", "used_num", "usedNum"])).unwrap_or(0.0);
+    Some((limit - used).max(0.0))
+}
+
 /// 一次取数：summary（余额+包）→ paid/free 带 PackageCodes 回查到期 →
 /// 全 401 刷新一次仅重试失败分支 → 旧接口回退。
 /// 主域名整体网络不可达时切备用域名重试一轮（§2.2 域名双探测，仅一次、不循环）。
@@ -412,6 +450,14 @@ fn fetch_credits_once(
     creds: &wb_common::Creds,
 ) -> (Vec<Value>, Option<f64>, &'static str, Option<wb_common::Creds>) {
     let headers = wb_common::build_auth_headers(creds, true);
+    // 企业号额度不在「个人资源包」体系内：get-user-resource* 对企业号恒返回空
+    // Accounts（额度其实是有的，只是口径不同），必须走企业专用接口
+    if wb_common::is_enterprise_account(creds) {
+        // 企业口径：credit 是「本周期已用」、limitNum 是「分配给本账号的额度」，
+        // 剩余 = limitNum - credit（与个人 CapacityRemain 的「剩余」语义相反）
+        let bal = fetch_enterprise_balance(agent, &headers, &creds.domain);
+        return (vec![], bal, "enterprise", None);
+    }
     let (summary_url, paid_url, free_url, old_url) = billing_urls(&creds.domain);
     let (mut pkgs, mut balance, mut saw_auth, net_down) =
         fetch_round(agent, &headers, (&summary_url, &paid_url, &free_url));
@@ -728,6 +774,31 @@ mod wb_credits_tests {
         // 布尔/空串拒绝
         assert_eq!(to_ts(Some(&json!(true))), None);
         assert_eq!(to_ts(Some(&json!(""))), None);
+    }
+
+    #[test]
+    fn enterprise_remaining_is_limit_minus_used() {
+        // 上游口径：credit 是「已用」而非「剩余」，剩余 = limitNum - credit
+        let b = json!({"credit": 812.45, "limitNum": 2000,
+                       "cycleEndTime": "2026-10-26 23:59:59"});
+        assert_eq!(enterprise_remaining(&b), Some(2000.0 - 812.45));
+        // snake_case 兼容
+        assert_eq!(
+            enterprise_remaining(&json!({"used_num": 100, "limit_num": 500})),
+            Some(400.0)
+        );
+        // 超额：饱和到 0，不出现负余额
+        assert_eq!(
+            enterprise_remaining(&json!({"credit": 600, "limitNum": 500})),
+            Some(0.0)
+        );
+        // 不限量（limitNum < 0）原样返回
+        assert_eq!(
+            enterprise_remaining(&json!({"credit": 1, "limitNum": -1})),
+            Some(-1.0)
+        );
+        // 缺 limitNum → 无法判定
+        assert_eq!(enterprise_remaining(&json!({"credit": 5})), None);
     }
 
     #[test]

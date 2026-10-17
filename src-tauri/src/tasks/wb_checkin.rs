@@ -430,6 +430,32 @@ fn fetch_wb_credits_balance(state: &AppState, aid: &str) -> Option<f64> {
 
 // ── 账号池回写 / 结果存储 ──────────────────────────────────────────────────
 
+/// 回写账号池的企业号标记（识别出来即落库，避免每轮重探）。
+/// 只在该标记发生变化时写盘，识别失败（网络/POST 不可达）不误标
+fn sync_pool_enterprise(state: &AppState, aid: &str, is_enterprise: bool) {
+    let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pool: Value = crate::store::docs::wb_pool_load(&crate::store::db(&state.data_dir));
+    let mut changed = false;
+    if let Some(accounts) = pool.get_mut("accounts").and_then(Value::as_array_mut) {
+        for a in accounts.iter_mut() {
+            if a.get("id").and_then(Value::as_str) != Some(aid) {
+                continue;
+            }
+            if a.get("is_enterprise").and_then(Value::as_bool) == Some(is_enterprise) {
+                break;
+            }
+            if let Some(obj) = a.as_object_mut() {
+                obj.insert("is_enterprise".into(), json!(is_enterprise));
+                changed = true;
+            }
+            break;
+        }
+    }
+    if changed {
+        let _ = crate::store::docs::wb_pool_save(&crate::store::db(&state.data_dir), &pool);
+    }
+}
+
 /// 刷新成功后回写账号池 token 过期时间（调度/到期日历数据源）
 fn sync_pool_expiry(state: &AppState, aid: &str, creds: &Creds) {
     // SQLite 化（P3）：wb_accounts 表
@@ -475,6 +501,12 @@ fn append_results(state: &AppState, events: &[Value]) {
         .filter(|r| r.get("date").and_then(Value::as_str).unwrap_or("") >= cutoff.as_str())
         .collect();
     for ev in events {
+        // skip = 按设计不适用（企业号无个人签到体系）：不落签到记录。
+        // 日历/趋势把非 success/already 一律计入 fail，落库会让企业号
+        // 每天在签到日历上留一个红色「失败」
+        if ev.get("status").and_then(Value::as_str) == Some("skip") {
+            continue;
+        }
         let mut rec = json!({
             "date": today,
             "time": fs_utils::now_ts(),
@@ -512,6 +544,15 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
     }
     if refreshed {
         sync_pool_expiry(state, &aid, &creds);
+    }
+    // 企业号无个人成长体系：签到在上游返回 400 code 10001「企业账号不支持该操作」，
+    // 整体跳过（不空发请求）。额度查询另走企业接口，不受影响
+    if wb_common::is_enterprise_account(&creds) {
+        sync_pool_enterprise(state, &aid, true);
+        return json!({
+            "user_id": aid, "name": base_ev["name"], "status": "skip",
+            "message": "企业号无个人签到体系，已跳过"
+        });
     }
     let base = wb_common::region_billing_base(&creds.domain);
     let urls = urls_for(base);
@@ -667,7 +708,9 @@ pub fn run_checkin_round(state: &AppState, opts: &CheckinOpts, emit: &mut dyn Fn
 
     let ok = events.iter().filter(|e| e["status"] == "success").count();
     let already = events.iter().filter(|e| e["status"] == "already").count();
-    let failed = events.len() - ok - already;
+    // skip 是「按设计不适用」（企业号无个人签到体系）而非失败，不计入 failed
+    let skipped = events.iter().filter(|e| e["status"] == "skip").count();
+    let failed = events.len() - ok - already - skipped;
     let done = json!({"type": "done", "ok": ok, "already": already, "failed": failed});
     emit(&done);
     append_results(state, &events);
@@ -1353,6 +1396,15 @@ fn process_account_growth(state: &AppState, agent: &ureq::Agent, acct: &Value, f
     let (creds, _refreshed, note) = wb_common::ensure_fresh(state, agent, acct, 24);
     if creds.access_token.is_empty() {
         return json!({ "type": "growth", "user_id": aid, "name": base_ev["name"], "status": "fail", "message": format!("无可用凭证（{note}）") });
+    }
+    // 企业号无个人成长体系：growth 系列端点一律 403「growth system is only
+    // available for personal users」，整体跳过而非逐项空发失败请求
+    if wb_common::is_enterprise_account(&creds) {
+        sync_pool_enterprise(state, &aid, true);
+        return json!({
+            "type": "growth", "user_id": aid, "name": base_ev["name"], "status": "ok",
+            "tasks": "企业号无个人成长体系，已跳过"
+        });
     }
     let urls = urls_for(wb_common::region_billing_base(&creds.domain));
 

@@ -1092,6 +1092,7 @@ mod tests {
             nickname: "测试昵称".into(),
             edition: "pro".into(),
             domain: "example.com".into(),
+            ..Default::default()
         }
     }
 

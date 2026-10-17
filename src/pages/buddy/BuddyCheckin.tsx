@@ -19,7 +19,8 @@ interface WbAccountLine {
   index: number;
   user_id: string;
   name: string;
-  status: 'success' | 'already' | 'fail';
+  /** skip = 按设计不适用（企业号无个人签到体系），不算失败 */
+  status: 'success' | 'already' | 'fail' | 'skip';
   message?: string;
   reward?: number;
 }
@@ -34,6 +35,12 @@ interface WbGrowthLine {
   travel?: string;
   lottery?: string;
   tasks?: string;
+  /** 每日对话活跃上报（点亮连登） */
+  report?: string;
+  /** 连登档位兑换 */
+  redeem?: string;
+  /** 判据事件补齐（P2 事件链） */
+  actions?: string;
   energy?: number;
   streak?: number;
 }
@@ -44,6 +51,15 @@ type ParsedEvent =
   | { type: 'exit' }
   | WbAccountLine
   | WbGrowthLine;
+
+/**
+ * 成长明细项渲染：值为失败占位（"fail"）时整项隐藏——后端在各环节失败时
+ * 以 "fail" 填充，直接展示会变成「活跃：fail」这类无信息量的文本
+ */
+function detail(label: string, value?: string) {
+  if (!value || value === 'fail') return null;
+  return <span>{label}：{value}</span>;
+}
 
 /** 能量/连签标量归一：接口可能返回 {current:..} 等嵌套对象（修复「连签 [object Object] 天」展示） */
 function scalarNum(v: unknown, depth = 0): number | null {
@@ -73,6 +89,7 @@ const statusText: Record<string, string> = {
   success: '成功',
   already: '已签',
   fail: '失败',
+  skip: '跳过',
 };
 
 /** 登录态徽标：needs_relogin 优先，其次按 access_token 剩余时长分色（对齐 Trae MiniJwtBadge 形态） */
@@ -272,7 +289,7 @@ export default function BuddyCheckin() {
     return recs.find((r) => r.reward != null)?.reward ?? null; // recs 新→旧序，find 即最新
   };
   // 今日签到状态（无实时行时按记录推导：任一成功/已签 → 已签；否则最近一条失败）
-  const checkinStatusOf = (uid: string): 'success' | 'already' | 'fail' | null => {
+  const checkinStatusOf = (uid: string): 'success' | 'already' | 'fail' | 'skip' | null => {
     const live = liveById.get(uid);
     if (live) return live.status;
     const recs = checkinMap.get(uid) ?? [];
@@ -363,9 +380,12 @@ export default function BuddyCheckin() {
                   )}
                 </div>
                 <div className="mt-1 flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-slate-400">
-                  {g.travel && <span>旅行：{g.travel}</span>}
-                  {g.lottery && <span>盲盒：{g.lottery}</span>}
-                  {g.tasks && <span>任务：{g.tasks}</span>}
+                  {detail('旅行', g.travel)}
+                  {detail('盲盒', g.lottery)}
+                  {detail('活跃', g.report)}
+                  {detail('连登', g.redeem)}
+                  {detail('判据', g.actions)}
+                  {detail('任务', g.tasks)}
                   {g.status === 'fail' && g.message && <span className="text-red-500">{g.message}</span>}
                 </div>
               </div>
@@ -501,6 +521,8 @@ export default function BuddyCheckin() {
                   ? 'text-emerald-600 dark:text-emerald-300'
                   : l.status === 'already'
                   ? 'text-sky-600 dark:text-sky-300'
+                  : l.status === 'skip'
+                  ? 'text-slate-500 dark:text-zinc-400'
                   : 'text-rose-600 dark:text-rose-300';
               const Icon = l.status === 'fail' ? XCircle : CheckCircle2;
               return (
