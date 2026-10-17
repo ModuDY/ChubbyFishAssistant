@@ -5,6 +5,7 @@ pub mod config_cache;
 pub mod custom_models;
 pub mod custom_route;
 pub mod dispatch;
+pub mod discovery;
 pub mod doubao_payload;
 pub mod doubao_route;
 pub mod doubao_sse;

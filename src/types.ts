@@ -1631,3 +1631,7 @@ export interface QoderCreditsSnapshot {
   earned?: number | null;
   accounts: { user_id: string; total: number | null }[];
 }
+export interface StorageHealth {
+  mode: 'persistent' | 'recovered' | 'memory' | 'unavailable';
+  message: string | null;
+}

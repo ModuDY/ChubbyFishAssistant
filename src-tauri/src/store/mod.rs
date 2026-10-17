@@ -19,8 +19,23 @@ use std::sync::{Arc, Mutex, OnceLock};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageMode {
+    Persistent,
+    Recovered,
+    Memory,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct StorageHealth {
+    pub mode: StorageMode,
+    pub message: Option<String>,
+}
+
 pub struct Store {
     conn: Mutex<rusqlite::Connection>,
+    health: StorageHealth,
     /// 数据根目录（供 docs 层写 app_log 等辅助用途；db_path 上两级）
     data_dir: PathBuf,
 }
@@ -48,24 +63,31 @@ pub fn db(data_dir: &Path) -> Arc<Store> {
 impl Store {
     fn open(path: &Path, data_dir: &Path) -> Arc<Store> {
         match Self::try_open(path, data_dir) {
-            Ok(s) => s,
-            Err(e) => {
-                // 库损坏/不可用自愈：隔离现场后重建空库再试一次。个人应用数据可由
-                // data/backup/ 与各上游重新拉取兜底；隔离件保留待人工诊断，绝不静默删除。
-                eprintln!("[store] SQLite 打开失败 {}: {e}，隔离损坏库并重建", path.display());
-                quarantine_corrupt_db(path, &e);
-                if let Ok(s) = Self::try_open(path, data_dir) {
-                    return s;
+            Ok(s) => Arc::new(s),
+            Err(mut e) => {
+                if database_is_corrupt(path) {
+                    match quarantine_corrupt_db(path, &e) {
+                        Ok(()) => {
+                            if let Ok(mut s) = Self::try_open(path, data_dir) {
+                                s.health = StorageHealth {
+                                    mode: StorageMode::Recovered,
+                                    message: Some("原数据库损坏，已保留为 data/ 下的 *.corrupt-* 文件并创建新库；请从备份恢复原数据。".into()),
+                                };
+                                return Arc::new(s);
+                            }
+                        }
+                        Err(reason) => e = format!("{e}；隔离失败：{reason}"),
+                    }
                 }
                 // 审查 P2 兜底：重建仍失败不再 panic 击穿启动/调用线程——降级内存库
                 // 续命，本会话读写不落盘（退出即失），应用可启动、其余子系统可排查；
                 // 内存库也不可用时才 panic（真无路可走）。registry 仍以原路径为键，
                 // 同会话后续 db() 命中同一内存库，视图一致
-                eprintln!("[store] SQLite 重建仍失败 {}，降级内存库运行（本会话数据不落盘）", path.display());
+                eprintln!("[store] SQLite 不可用 {}: {e}，降级内存库运行（本会话数据不落盘）", path.display());
                 crate::fs_utils::app_log(
                     data_dir,
                     &format!(
-                        "[store] SQLite 重建仍失败 {}，已降级内存库运行（本会话数据不落盘，请排查 data/ 隔离件）",
+                        "[store] SQLite 不可用 {}: {e}，已降级内存库运行（本会话数据不落盘，请检查磁盘或目录权限）",
                         path.display()
                     ),
                 );
@@ -76,12 +98,19 @@ impl Store {
                         Ok(c)
                     })
                     .unwrap_or_else(|e2| panic!("SQLite 内存库兜底亦失败 {}: {e2}", path.display()));
-                Arc::new(Store { conn: Mutex::new(conn), data_dir: data_dir.to_path_buf() })
+                Arc::new(Store {
+                    conn: Mutex::new(conn),
+                    data_dir: data_dir.to_path_buf(),
+                    health: StorageHealth {
+                        mode: StorageMode::Memory,
+                        message: Some(format!("数据库不可用，当前更改仅保存在内存中，退出后将丢失。请修复磁盘空间或目录权限，导出重要数据后重启应用。原因：{e}")),
+                    },
+                })
             }
         }
     }
 
-    fn try_open(path: &Path, data_dir: &Path) -> Result<Arc<Store>, String> {
+    fn try_open(path: &Path, data_dir: &Path) -> Result<Store, String> {
         let conn = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
         conn.pragma_update(None, "journal_mode", "WAL").ok();
         conn.pragma_update(None, "synchronous", "NORMAL").ok();
@@ -91,7 +120,15 @@ impl Store {
         // 健康探针：损坏库可能 open 成功但任何查询失败（页损坏等），在此暴露
         conn.query_row("SELECT count(*) FROM kv", [], |r| r.get::<_, i64>(0))
             .map_err(|e| format!("库健康探针失败: {e}"))?;
-        Ok(Arc::new(Store { conn: Mutex::new(conn), data_dir: data_dir.to_path_buf() }))
+        Ok(Store {
+            conn: Mutex::new(conn),
+            data_dir: data_dir.to_path_buf(),
+            health: StorageHealth { mode: StorageMode::Persistent, message: None },
+        })
+    }
+
+    pub fn health(&self) -> StorageHealth {
+        self.health.clone()
     }
 
     /// 在连接上执行（串行化访问的统一出口）
@@ -232,9 +269,14 @@ impl Store {
     }
 }
 
-/// 损坏库隔离：主库/-wal/-shm 改名 `<原名>.corrupt-<时间戳>`（保留现场，不删除），
-/// 随后重建空库。隔离原因尽量落应用日志（库路径上两级 = data_dir）。
-fn quarantine_corrupt_db(path: &Path, reason: &str) {
+fn database_is_corrupt(path: &Path) -> bool {
+    let probe = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .and_then(|conn| conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)));
+    matches!(probe, Err(rusqlite::Error::SqliteFailure(error, _))
+        if matches!(error.code, rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase))
+}
+
+fn quarantine_corrupt_db(path: &Path, reason: &str) -> Result<(), String> {
     let stamp = chrono::Local::now().format("%Y%m%d%H%M%S");
     for suffix in ["", "-wal", "-shm"] {
         let mut name = path.as_os_str().to_os_string();
@@ -243,7 +285,7 @@ fn quarantine_corrupt_db(path: &Path, reason: &str) {
         if src.exists() {
             let mut dst = src.as_os_str().to_os_string();
             dst.push(format!(".corrupt-{stamp}"));
-            let _ = std::fs::rename(&src, PathBuf::from(dst));
+            std::fs::rename(&src, PathBuf::from(dst)).map_err(|e| e.to_string())?;
         }
     }
     if let Some(root) = path.parent().and_then(Path::parent) {
@@ -252,6 +294,7 @@ fn quarantine_corrupt_db(path: &Path, reason: &str) {
             &format!("SQLite 库损坏已隔离重建: {reason}（原库保留为 *.corrupt-* 文件，可人工抢救）"),
         );
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -270,6 +313,7 @@ mod tests {
     fn kv_roundtrip_and_default_fallback() {
         let dir = tmp_dir("kv");
         let s = db(&dir);
+        assert_eq!(s.health().mode, StorageMode::Persistent);
         #[derive(serde::Serialize, serde::Deserialize, Default, PartialEq, Debug)]
         struct V {
             a: i32,
@@ -328,6 +372,8 @@ mod tests {
         std::fs::write(&db_path, b"definitely not a sqlite database").unwrap();
 
         let s = db(&dir); // 应自愈而非 panic
+        assert_eq!(s.health().mode, StorageMode::Recovered);
+        assert!(s.health().message.is_some());
         s.kv_set("k", &json!({"v": 1})).unwrap();
         assert_eq!(s.kv_get_raw("k").is_some(), true);
 
@@ -337,6 +383,46 @@ mod tests {
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().contains(".corrupt-"));
         assert!(quarantined, "损坏库应被隔离保留");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unavailable_path_uses_visible_memory_fallback_without_quarantine() {
+        let dir = tmp_dir("unavailable");
+        let db_path = dir.join("data").join("aiwork.sqlite");
+        std::fs::create_dir_all(&db_path).unwrap();
+        std::fs::write(db_path.join("keep.txt"), b"preserve original path").unwrap();
+
+        let s = db(&dir);
+        assert_eq!(s.health().mode, StorageMode::Memory);
+        assert!(s.health().message.unwrap().contains("退出后将丢失"));
+        s.kv_set("temporary", &json!(true)).unwrap();
+        assert_eq!(s.kv_get::<bool>("temporary"), true);
+        assert!(db_path.join("keep.txt").exists());
+        assert!(!std::fs::read_dir(db_path.parent().unwrap()).unwrap()
+            .any(|entry| entry.unwrap().file_name().to_string_lossy().contains(".corrupt-")));
+        assert!(Arc::ptr_eq(&s, &db(&dir)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn schema_error_preserves_existing_database_and_reports_memory_mode() {
+        let dir = tmp_dir("schema_error");
+        let path = dir.join("data").join("aiwork.sqlite");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE VIEW kv AS SELECT * FROM missing_source;").unwrap();
+        drop(conn);
+
+        let store = db(&dir);
+        assert_eq!(store.health().mode, StorageMode::Memory);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let object_type: String = conn.query_row(
+            "SELECT type FROM sqlite_master WHERE name = 'kv'", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(object_type, "view");
+        assert!(!database_is_corrupt(&path));
+        drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

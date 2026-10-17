@@ -199,6 +199,7 @@ fn main() {
             commands::misc::logs_query,
             commands::misc::logs_clear,
             commands::misc::startup_notice_take,
+            commands::misc::storage_health,
             commands::misc::traework_migration_guide,
             commands::misc::traework_migration_guide_dismiss,
             commands::misc::settings_get,

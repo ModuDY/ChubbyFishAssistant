@@ -35,6 +35,12 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Frontend tests
+        run: npm test
+
       - name: Build Tauri app (NSIS + MSI)
         run: npm run tauri build -- --bundles nsis,msi
 
@@ -43,7 +49,7 @@ jobs:
       # 存在；任一用例失败则阻断产物上传
       - name: Run Rust tests
         working-directory: src-tauri
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       # portable zip：零依赖（Windows 自带 tar.exe），从 release 产物打包
       - name: Package portable zip

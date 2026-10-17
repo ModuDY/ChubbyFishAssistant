@@ -18,17 +18,20 @@ npm run tauri build        # 打包 MSI + NSIS 到 src-tauri/target/release/bund
 node scripts/rename_release.mjs     # 产物统一输出到 release/，中文命名 AI Work 助手_<版本>_x64*
 ```
 
-测试：
+测试（CI Checks 在 main / feat/** / codex/** 推送、目标 main 的 PR 与手动触发时执行）：
 
 ```powershell
-cargo test                                    # Rust 单测（需先装工具链；切换器/签到/网关全覆盖）
+npm run typecheck                             # TypeScript 类型检查
+npm test                                      # Vitest，含启动重试与监听注册回滚回归
+npm run build                                 # 生成 frontendDist，Rust generate_context! 需要
+cargo test --manifest-path src-tauri/Cargo.toml --workspace --locked
 ```
 
 ## 3. 技术栈
 
 | 层 | 技术 |
 |---|---|
-| 外壳 | Tauri 2.x (Rust 1.75+ MSVC) |
+| 外壳 | Tauri 2.x (Rust 1.85+ MSVC，以 Cargo.toml 为准) |
 | 前端 | React 18 + TypeScript 5 + Vite 5 + Tailwind 3 + Zustand 4 + Recharts 2 + lucide-react |
 | 后端 | Rust (serde / chrono / axum / ureq / tauri-plugin-{shell,dialog,notification,single-instance}) |
 | 辅助 | Node.js 18+（scripts/*.mjs 发布工具链，零 npm 依赖）；PowerShell 运行时依赖已移除（switcher 模块进程内直调） |
@@ -43,7 +46,7 @@ ai-work-assistant/
 ├── docs/                         # user-manual / tech-framework / product-design / backlog（唯一待办；原五份分析文档 2026-09-13 归并删除，原文在 git 历史）
 ├── src/                          # 前端
 │   ├── App.tsx                   # 外壳（TitleBar + Sidebar + TopBar + 页面切换 + Toaster）
-│   ├── store.ts                  # Zustand 单一真相（init / 刷新 / checkin/switch/saveLogin 事件归约）
+│   ├── store.ts + store/          # Zustand 单一状态源；startup slice 管理初始化/重试/存储健康，其余业务逐步拆分
 │   ├── types.ts                  # 与 Rust DTO 对齐（snake_case）
 │   ├── lib/                      # tauri.ts(invoke 封装+事件订阅) / themes.ts(主题) / delay.ts(withMinDelay) / cn.ts / about.ts / useIsDark.ts
 │   ├── components/               # TitleBar/Sidebar/TopBar/Toaster/PageHeader/SetupGuide/ui + SystemDialog(系统设置+系统日志弹框)/GeneralSettingsPanel/AboutDialog
@@ -69,6 +72,7 @@ ai-work-assistant/
 │       │   ├── mod.rs            # 常量 + 路由注册
 │       │   ├── server.rs         # axum 服务器启停
 │       │   ├── routes.rs         # OpenAI /v1/chat/completions + Anthropic /v1/messages + Codex /v1/responses（SSE 流式 + 非流式，三协议输出）
+│       │   ├── discovery.rs      # 只读 health/healthz/status/models；routes 保持旧导出兼容
 │       │   ├── pool.rs           # 账号池调度（积分感知 + 冷却状态机 + 账号轮换，app 无关）
 │       │   ├── payload.rs        # OpenAI/Anthropic 请求 → llm_utils_chat 改写（anthropic_to_openai 先转内部格式）
 │       │   ├── sse.rs            # SSE 协议转换（SOLO → OpenAI chunk / Anthropic 事件流）
@@ -98,6 +102,7 @@ ai-work-assistant/
 
 | 模块 | 命令 | 说明 |
 |---|---|---|
+| 存储 | `storage_health()` → `{mode,message}` | mode 为 persistent/recovered/memory；独立于 SQLite 配置，异常由前端持续横幅展示，不受通知偏好影响。只有确认物理损坏才隔离原库；权限/锁错误保留原库并降级内存，需修复后导出重要数据并重启 |
 | 环境 | `env_check_trae_cn()` → `EnvStatus` | Trae（Trae CN）环境检测：`installed/running/version/path`；async 命令（注册表全量搜索较慢，避免 UI 卡顿）。**提速修订（2026-10-07）**：版本号改 `pe_version` 直读 PE 版本资源（原 powershell 子进程 1.2s+/次 → 1.9ms，按 mtime 缓存命中 0.14ms），运行态改 `switcher::proc::any_running` 进程表枚举 + 2s TTL（原 tasklist 261ms/次 → 18ms），`app_locate` 注册表/进程兜底两级加 3s TTL——同一轮界面切换里概览页与顶栏重复探测不再重复掏子进程。**双应用合并（2026-10-14）**：原 Trae Work `env_check` / `open_trae_app` 已随合并退役，由本命令与 `open_trae_cn_app` 承接 |
 | 环境 | `open_trae_website()` / `open_trae_cn_app()` | 打开 Trae 官网 / 启动 Trae（代理注入时优雅关闭进程最长 5s，async） |
 | 证书 | `cert_status` / `cert_install` | 安装走 UAC `certutil -addstore -f Root` |

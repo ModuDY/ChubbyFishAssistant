@@ -3,6 +3,7 @@ import TitleBar from './components/TitleBar';
 import Sidebar from './components/Sidebar';
 import TopBar from './components/TopBar';
 import Toaster from './components/Toaster';
+import StorageHealthBanner from './components/StorageHealthBanner';
 import { useAppStore } from './store';
 import { resolveTheme } from './lib/themes';
 import Dashboard from './pages/Dashboard';
@@ -88,6 +89,7 @@ export default function App() {
   const setView = useAppStore((s) => s.setView);
   const init = useAppStore((s) => s.init);
   const ready = useAppStore((s) => s.ready);
+  const initError = useAppStore((s) => s.initError);
   const settings = useAppStore((s) => s.settings);
 
   useEffect(() => {
@@ -113,8 +115,17 @@ export default function App() {
     return (
       <div className="flex h-full items-center justify-center bg-slate-100 dark:bg-zinc-950">
         <div className="flex flex-col items-center gap-3">
-          <div className="h-8 w-8 animate-spin rounded-full border-3 border-zinc-400 border-t-transparent" />
-          <span className="text-sm text-slate-500">正在加载…</span>
+          {initError ? (
+            <>
+              <p role="alert" className="max-w-lg break-words px-4 text-sm text-red-600">初始化失败：{initError}</p>
+              <button className="btn-primary" onClick={() => void init().catch(() => {})}>重试</button>
+            </>
+          ) : (
+            <>
+              <div className="h-8 w-8 animate-spin rounded-full border-3 border-zinc-400 border-t-transparent" />
+              <span className="text-sm text-slate-500">正在加载…</span>
+            </>
+          )}
         </div>
       </div>
     );
@@ -123,6 +134,7 @@ export default function App() {
   return (
     <div className="flex h-full flex-col bg-slate-100 text-slate-800 dark:bg-zinc-950 dark:text-zinc-100">
       <TitleBar />
+      <StorageHealthBanner />
       <div className="flex min-h-0 flex-1">
         <Sidebar view={view} onNav={setView} />
         <main className="relative flex min-w-0 flex-1 flex-col">

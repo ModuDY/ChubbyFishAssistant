@@ -57,7 +57,7 @@ Switcher      tasks 外的独立域：switcher/（原 PS 切换桥——profile 
               proc 三级关闭 / machine 6 层重置 / copy+icube+chromium+authfile+electron_root 快照管线）
 Store         store/（SQLite 存储层——全量状态库 aiwork.sqlite：kv 键值文档表 / 行文档实体表 / 列化流水表；
               WAL + busy_timeout，首启迁移器把旧 JSON 导 backup/，v3.4.5 起替代 data 目录 JSON 读写；
-              schema.rs SCHEMA_VERSION=3，qoder 四表随 F-80 M1 加入 ROW_TABLES）
+              schema.rs SCHEMA_VERSION=4，qoder 四表随 F-80 M1 加入 ROW_TABLES）
 ```
 
 关键机制：
@@ -69,6 +69,11 @@ Store         store/（SQLite 存储层——全量状态库 aiwork.sqlite：kv 
 - **动态叶子证书 AKI**：MITM 叶子证书必须带 Authority Key Identifier（OpenSSL 3.2+/Python 3.13 客户端强制）；只补叶子、不改 CA 本体。工具自身出站请求一律 `ProxyHandler({})` 绕系统代理直连。
 
 ### 2.1 前端实现要点
+
+- 初始化与监听生命周期独立在 `src/store/startup.ts`，并发启动共享 Promise；失败等待本轮读取全部结束、清理监听、展示重试入口。`setupListeners` 注册中途失败会回滚已注册监听。
+- `storage_health` 返回独立于数据库配置的存储健康状态；前端持续横幅展示重建/内存降级，内存模式应在修复磁盘或权限后导出重要数据并重启，不原位切换连接以免丢失本会话更改。
+- 网关只读接口移入 `api_server/discovery.rs`，`routes` 保持导出兼容；推理路由与协议适配留待后续按业务边界继续拆分。
+- CI `checks.yml` 对 main / feat/** / codex/** 推送、目标 main 的 PR 和手动触发执行类型检查、Vitest、前端构建、Rust 测试；Rust 测试在前端构建之后，确保 `generate_context!` 的资源存在。
 
 - 启动加载态：`App.tsx` 等待 store `init()` 完成才挂载主界面，避免空状态闪烁。
 - 设置页显式保存：本地表单 + dirty 标记，保存才落盘；`saveSettings` 失败自动回滚。
@@ -84,7 +89,7 @@ Store         store/（SQLite 存储层——全量状态库 aiwork.sqlite：kv 
 
 统一存于 `%APPDATA%\AIWorkAssistant\`（旧 TraeWorkAssistant 目录由 `state.rs::migrate_legacy_dirs` 启动自动复制迁移）：
 
-> **v3.4.5 起 data 目录 JSON 全量迁入 `data/aiwork.sqlite`**（WAL；kv 键值文档表 + 行文档实体表 + 列化流水表三形态，`store/schema.rs` 为权威定义，`SCHEMA_VERSION=3`；首启迁移器导旧 JSON 入 `backup/`，`user_version` 幂等闸门）。下表 JSON 文件名为**逻辑名**（kv 键 = 文件名去 .json），运行期不产生 JSON 读写。
+> **v3.4.5 起 data 目录 JSON 全量迁入 `data/aiwork.sqlite`**（WAL；kv 键值文档表 + 行文档实体表 + 列化流水表三形态，`store/schema.rs` 为权威定义，`SCHEMA_VERSION=4`；首启迁移器导旧 JSON 入 `backup/`，`user_version` 幂等闸门）。下表 JSON 文件名为**逻辑名**（kv 键 = 文件名去 .json），运行期不产生 JSON 读写。
 
 | 逻辑名（库中位置） | 说明 |
 |---|---|

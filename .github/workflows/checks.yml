@@ -1,0 +1,46 @@
+name: Checks
+
+on:
+  push:
+    branches: [main, 'feat/**', 'codex/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Frontend and Rust tests
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-checks-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+      - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Frontend tests
+        run: npm test
+      # generate_context! 需要 frontendDist；先构建前端再运行 Rust 测试。
+      - name: Frontend build
+        run: npm run build
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test --workspace --locked

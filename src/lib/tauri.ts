@@ -44,6 +44,7 @@ import type {
   ProxyLogListResult,
   ProxyStatus,
   Settings,
+  StorageHealth,
   TagView,
   UpdateCheckResult,
   UpdateDownloaded,
@@ -275,6 +276,7 @@ export const api = {
       invoke<CheckinTrendPoint[]>('checkin_trends', { days: days ?? null }),
   },
   misc: {
+    storageHealth: () => invoke<StorageHealth>('storage_health'),
     deviceReset: (userId: string) => invoke('device_reset', { userId }),
     // 为全部 Trae 账号一键重派设备号（解决多账号同设备签到 9095）
     deviceReassignAll: () => invoke<{ total: number; changed: number }>('device_reassign_all'),
@@ -1001,87 +1003,94 @@ export async function setupListeners(
   handlers: ListenerHandlers,
 ): Promise<UnlistenFn[]> {
   const unsubs: UnlistenFn[] = [];
-  if (handlers.onProxyLog) {
-    unsubs.push(
-      await listen<string>('proxy-log', (e) => handlers.onProxyLog!(e.payload)),
-    );
+  try {
+    if (handlers.onProxyLog) {
+      unsubs.push(
+        await listen<string>('proxy-log', (e) => handlers.onProxyLog!(e.payload)),
+      );
+    }
+    if (handlers.onAccountCaptured) {
+      unsubs.push(
+        await listen<string>('account-captured', (e) =>
+          handlers.onAccountCaptured!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onCheckinProgress) {
+      unsubs.push(
+        await listen<CheckinProgressEvent>('checkin-progress', (e) =>
+          handlers.onCheckinProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onSwitchProgress) {
+      unsubs.push(
+        await listen<string>('switch-progress', (e) =>
+          handlers.onSwitchProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onSwitchDone) {
+      unsubs.push(
+        await listen<SwitchDoneEvent>('switch-done', (e) =>
+          handlers.onSwitchDone!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onSaveLoginProgress) {
+      unsubs.push(
+        await listen<string>('save-login-progress', (e) =>
+          handlers.onSaveLoginProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onSaveLoginDone) {
+      unsubs.push(
+        await listen<SaveLoginDoneEvent>('save-login-done', (e) =>
+          handlers.onSaveLoginDone!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onDeviceResetProgress) {
+      unsubs.push(
+        await listen<string>('device-reset-progress', (e) =>
+          handlers.onDeviceResetProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onDeviceResetDone) {
+      unsubs.push(
+        await listen<DeviceResetDoneEvent>('device-reset-done', (e) =>
+          handlers.onDeviceResetDone!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onProfileProgress) {
+      unsubs.push(
+        await listen<string>('profile-progress', (e) =>
+          handlers.onProfileProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onProfileDone) {
+      unsubs.push(
+        await listen<ProfileDoneEvent>('profile-done', (e) =>
+          handlers.onProfileDone!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onQoderCheckinProgress) {
+      unsubs.push(
+        await listen<string>('qoder-checkin-progress', (e) =>
+          handlers.onQoderCheckinProgress!(e.payload),
+        ),
+      );
+    }
+    return unsubs;
+  } catch (error) {
+    for (const unlisten of unsubs.reverse()) {
+      try { unlisten(); } catch {}
+    }
+    throw error;
   }
-  if (handlers.onAccountCaptured) {
-    unsubs.push(
-      await listen<string>('account-captured', (e) =>
-        handlers.onAccountCaptured!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onCheckinProgress) {
-    unsubs.push(
-      await listen<CheckinProgressEvent>('checkin-progress', (e) =>
-        handlers.onCheckinProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onSwitchProgress) {
-    unsubs.push(
-      await listen<string>('switch-progress', (e) =>
-        handlers.onSwitchProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onSwitchDone) {
-    unsubs.push(
-      await listen<SwitchDoneEvent>('switch-done', (e) =>
-        handlers.onSwitchDone!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onSaveLoginProgress) {
-    unsubs.push(
-      await listen<string>('save-login-progress', (e) =>
-        handlers.onSaveLoginProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onSaveLoginDone) {
-    unsubs.push(
-      await listen<SaveLoginDoneEvent>('save-login-done', (e) =>
-        handlers.onSaveLoginDone!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onDeviceResetProgress) {
-    unsubs.push(
-      await listen<string>('device-reset-progress', (e) =>
-        handlers.onDeviceResetProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onDeviceResetDone) {
-    unsubs.push(
-      await listen<DeviceResetDoneEvent>('device-reset-done', (e) =>
-        handlers.onDeviceResetDone!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onProfileProgress) {
-    unsubs.push(
-      await listen<string>('profile-progress', (e) =>
-        handlers.onProfileProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onProfileDone) {
-    unsubs.push(
-      await listen<ProfileDoneEvent>('profile-done', (e) =>
-        handlers.onProfileDone!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onQoderCheckinProgress) {
-    unsubs.push(
-      await listen<string>('qoder-checkin-progress', (e) =>
-        handlers.onQoderCheckinProgress!(e.payload),
-      ),
-    );
-  }
-  return unsubs;
 }
