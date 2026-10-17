@@ -771,6 +771,7 @@ export default function BuddyAccounts() {
       <PageHeader
         title="Buddy · 账号管理"
         desc="多账号入池 · 切换登录 · 凭证续期"
+        stackActions
         leftExtra={
           <button
             onClick={() => setHelpOpen(true)}

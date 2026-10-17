@@ -383,6 +383,7 @@ export default function Accounts() {
       <PageHeader
         title="Trae · 账号管理"
         desc="多账号入池 · 切换登录 · JWT 续期"
+        stackActions
         leftExtra={
           <button
             onClick={() => setHelpOpen(true)}

@@ -771,6 +771,7 @@ export default function QoderAccounts() {
       <PageHeader
         title="Qoder · 账号管理"
         desc="全家桶账号池 · PAT / OAuth / IDE 存储三通道 · 快照切换 · CLI 状态桥"
+        stackActions
         leftExtra={
           <button
             onClick={() => setHelpOpen(true)}
