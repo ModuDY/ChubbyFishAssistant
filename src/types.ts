@@ -780,6 +780,29 @@ export interface UsageKeyTokenView {
   completion_tokens: number;
 }
 
+/** 单个 API Key 下的模型明细（按请求数降序） */
+export interface UsageKeyModelView {
+  model: string;
+  requests: number;
+  ok: number;
+  errors: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+}
+
+/** 按 API Key 聚合视图：请求 / 成功失败 / token + 模型明细 */
+export interface UsageKeyUsageView {
+  /** Key 条目 id（"anonymous" = 未启用鉴权时的匿名流量） */
+  name: string;
+  requests: number;
+  ok: number;
+  errors: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  /** 旧版本数据未记录模型维度时为空数组 */
+  models: UsageKeyModelView[];
+}
+
 /** 单日用量统计（api_usage_stats 返回，按日期升序） */
 export interface UsageDayView {
   date: string;
@@ -806,6 +829,8 @@ export interface UsageDayView {
   accounts: UsageCounterView[];
   keys: UsageCounterView[];
   key_tokens: UsageKeyTokenView[];
+  /** 按 API Key 的完整视图（请求 + token + 模型明细；旧数据可能缺省） */
+  key_usage?: UsageKeyUsageView[];
   /** 按模型的延迟分位（F-76①，按请求数降序） */
   model_latency?: UsageModelLatencyView[];
 }

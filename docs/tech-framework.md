@@ -104,7 +104,7 @@ Store         store/（SQLite 存储层——全量状态库 aiwork.sqlite：kv 
 | `checkin_results`（表） | 签到最终态按日落库（T8，保留 90 天） |
 | `account_cooldowns`（表） | 签到错误冷却状态 |
 | `api_pool`（kv） | 四池配置：账号池 enabled_uids + `strategy`(expire_first/credit_first/random/weighted/p2c) + `group_ids` + **每池独立开关** `trae_enabled` / `wb_enabled` / `qoder_enabled` 及各池同构参数（详见 §5.5） |
-| `api_keys`（表）/ `api_usage`（表）/ `api_models`（kv） | 多 API Key+每日配额 / 用量按日统计（`(bucket, day)` 复合主键，Qoder 桶 `UsageBucket::Qoder`）/ 模型目录 |
+| `api_keys`（表）/ `api_usage`（表）/ `api_models`（kv） | 多 API Key+每日配额 / 用量按日统计（`(bucket, day)` 复合主键，Qoder 桶 `UsageBucket::Qoder`；单日行含 models / accounts / keys / key_tokens / **key_models（Key×模型交叉）** / latency 维度）/ 模型目录 |
 | `data/profiles*/`、`doubao_chats/`、`exports/`、`certs/` | 快照槽（current_account.txt + <uid> 槽位 + .bak 单代回滚）/ 对话备份 / 导出产物 / 自签 CA——保留文件形态不入库 |
 | `doubao_accounts`（表）/ `doubao_captured_credentials`（kv）/ `doubao_health_events`（表） | 豆包账号池 / 抓包凭证回写 / 运维健康史 |
 | `qoder_accounts`（表） | Qoder 账号池（行文档，pk 例外采用 seq 自增保序）：`QoderAccount`{ id(`qd-<hex12>`) / uid / plan(free·pro·pro+·teams) / `credential_source`(pat·ide_store·qoderwork_store·mitm·cli) / `needs_relogin` / `device_profile` } |

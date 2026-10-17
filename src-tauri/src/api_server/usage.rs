@@ -51,6 +51,37 @@ impl Counter {
     }
 }
 
+/// API Key × 模型 交叉计数（用量页「按 Key 统计」下钻：同一个 Key 各自用了哪些模型、
+/// 分别多少请求与 token）。键空间 = Key 数 × 模型数，两者均有界（模型名经
+/// `bucket_key` 截断、Key 来自 api_keys 条目），不会随请求数放大。
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+pub struct KeyModelStat {
+    #[serde(default)]
+    pub requests: u64,
+    #[serde(default)]
+    pub ok: u64,
+    #[serde(default)]
+    pub errors: u64,
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+}
+
+impl KeyModelStat {
+    /// 记一次请求（成功/失败 + token 用量）
+    fn add(&mut self, ok: bool, prompt_tokens: u64, completion_tokens: u64) {
+        self.requests += 1;
+        if ok {
+            self.ok += 1;
+        } else {
+            self.errors += 1;
+        }
+        self.prompt_tokens = self.prompt_tokens.saturating_add(prompt_tokens);
+        self.completion_tokens = self.completion_tokens.saturating_add(completion_tokens);
+    }
+}
+
 /// 延迟样本（F-76 TTFT 分维统计）：滚动保留最近 N 条总耗时与首字耗时样本，
 /// 供用量页计算 P50/P95/最大值——均值会被少数超长请求拉偏，分位数才能区分
 /// 「普遍慢」与「少数超大请求慢」。样本仅存数值（8 字节/条），量级可忽略
@@ -137,6 +168,10 @@ pub struct DayStats {
     /// 按 API Key 统计 token 用量：(prompt, completion)
     #[serde(default)]
     pub key_tokens: HashMap<String, (u64, u64)>,
+    /// 按 API Key × 模型 的交叉统计（Key → 模型 → 计数；旧数据无该字段视为空，
+    /// 前端按「Key 有请求但无模型明细」降级展示）
+    #[serde(default)]
+    pub key_models: HashMap<String, HashMap<String, KeyModelStat>>,
     /// 天级延迟样本（F-76：P50/P95/最大值 + TTFT）
     #[serde(default)]
     pub latency: LatencyAgg,
@@ -187,6 +222,14 @@ impl DayStats {
         self.models.entry(model_key.clone()).or_default().add(ok);
         self.accounts.entry(uid.to_string()).or_default().add(ok);
         self.keys.entry(key_id.to_string()).or_default().add(ok);
+        // Key × 模型 交叉记账（用量页「按 API Key 统计」→ 模型下钻数据源；
+        // 与上方 keys/key_tokens 同源同步写入，保证「各 Key 用了哪些模型、多少请求与 token」）
+        self.key_models
+            .entry(key_id.to_string())
+            .or_default()
+            .entry(model_key.clone())
+            .or_default()
+            .add(ok, prompt_tokens, completion_tokens);
         // 延迟样本（F-76）：总耗时全量采样，TTFT 仅在有值时采样
         self.latency.push_total(duration_ms, SAMPLE_CAP_DAY);
         let m = self.model_latency.entry(model_key).or_default();
@@ -528,6 +571,32 @@ pub struct KeyTokenView {
     pub completion_tokens: u64,
 }
 
+/// 单个 Key 下的模型明细视图（用量页按 Key 下钻：模型 / 请求 / 成功失败 / token）
+#[derive(Serialize, Clone)]
+pub struct KeyModelView {
+    pub model: String,
+    pub requests: u64,
+    pub ok: u64,
+    pub errors: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+}
+
+/// 按 API Key 聚合视图：请求 / 成功失败 / token + 模型明细。
+/// 与 `keys` + `key_tokens` 口径一致（同一批记账写入），但把「Key 用了哪些模型」
+/// 一并下发给前端，避免前端再做交叉拼接。
+#[derive(Serialize, Clone)]
+pub struct KeyUsageView {
+    pub name: String,
+    pub requests: u64,
+    pub ok: u64,
+    pub errors: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    /// 按请求数降序（旧版本数据无模型明细时为空数组）
+    pub models: Vec<KeyModelView>,
+}
+
 /// 按模型的延迟分位视图（F-76：P50/P95/最大值 + TTFT 分桶）
 #[derive(Serialize, Clone)]
 pub struct ModelLatencyView {
@@ -590,6 +659,8 @@ pub struct UsageDayView {
     pub keys: Vec<CounterView>,
     /// 按 Key 的 token 用量（与 keys 对应）
     pub key_tokens: Vec<KeyTokenView>,
+    /// 按 API Key 的完整视图（请求 + token + 模型明细，按请求数降序）
+    pub key_usage: Vec<KeyUsageView>,
     /// 按模型的延迟分位（F-76，按请求数降序）
     pub model_latency: Vec<ModelLatencyView>,
 }
@@ -639,6 +710,55 @@ impl UsageDayView {
             .map(|(k, agg)| ModelLatencyView::from_agg(k, agg))
             .collect();
         model_latency.sort_by(|a, b| b.samples.cmp(&a.samples).then(a.model.cmp(&b.model)));
+        // 按 Key 聚合视图：键集取 keys / key_tokens / key_models 的并集——
+        // 历史数据可能只有计数或只有 token（早期版本记账缺口），并集保证不丢行
+        let mut key_ids: std::collections::BTreeSet<&String> = std::collections::BTreeSet::new();
+        key_ids.extend(d.keys.keys());
+        key_ids.extend(d.key_tokens.keys());
+        key_ids.extend(d.key_models.keys());
+        let mut key_usage: Vec<KeyUsageView> = key_ids
+            .into_iter()
+            .map(|k| {
+                let counter = d.keys.get(k);
+                let (prompt_tokens, completion_tokens) =
+                    d.key_tokens.get(k).copied().unwrap_or((0, 0));
+                let mut models: Vec<KeyModelView> = d
+                    .key_models
+                    .get(k)
+                    .map(|m| {
+                        m.iter()
+                            .map(|(model, s)| KeyModelView {
+                                model: model.clone(),
+                                requests: s.requests,
+                                ok: s.ok,
+                                errors: s.errors,
+                                prompt_tokens: s.prompt_tokens,
+                                completion_tokens: s.completion_tokens,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                models.sort_by(|a, b| b.requests.cmp(&a.requests).then(a.model.cmp(&b.model)));
+                KeyUsageView {
+                    name: k.clone(),
+                    requests: counter.map(|c| c.requests).unwrap_or(0),
+                    ok: counter.map(|c| c.ok).unwrap_or(0),
+                    errors: counter.map(|c| c.errors).unwrap_or(0),
+                    prompt_tokens,
+                    completion_tokens,
+                    models,
+                }
+            })
+            .collect();
+        key_usage.sort_by(|a, b| {
+            b.requests
+                .cmp(&a.requests)
+                .then(
+                    (b.prompt_tokens + b.completion_tokens)
+                        .cmp(&(a.prompt_tokens + a.completion_tokens)),
+                )
+                .then(a.name.cmp(&b.name))
+        });
         Self {
             date: date.to_string(),
             total_requests: d.total.requests,
@@ -669,6 +789,7 @@ impl UsageDayView {
             accounts,
             keys,
             key_tokens,
+            key_usage,
             model_latency,
         }
     }
@@ -733,9 +854,60 @@ mod tests {
         // 按 Key 的 token 用量记账（m1/u1/master 两请求：10+0 prompt、20+0 completion）
         assert_eq!(d.key_tokens.get("master"), Some(&(10, 20)));
         assert_eq!(d.key_tokens.get("k2"), Some(&(5, 8)));
+        // Key × 模型 交叉记账：master 两次 m1（一成一败），k2 一次 m2
+        let master_m1 = d.key_models.get("master").unwrap().get("m1").unwrap();
+        assert_eq!((master_m1.requests, master_m1.ok, master_m1.errors), (2, 1, 1));
+        assert_eq!((master_m1.prompt_tokens, master_m1.completion_tokens), (10, 20));
+        let k2_m2 = d.key_models.get("k2").unwrap().get("m2").unwrap();
+        assert_eq!((k2_m2.requests, k2_m2.ok, k2_m2.errors), (1, 1, 0));
+        assert_eq!((k2_m2.prompt_tokens, k2_m2.completion_tokens), (5, 8));
         // 平均耗时 = (100+300+50)/3 = 150
         let view = UsageDayView::from_day(&today, d);
         assert_eq!(view.avg_duration_ms, 150);
+    }
+
+    /// 按 Key 的视图：请求/成功失败/token 与模型明细一次下发，
+    /// 且历史数据（无 key_models）仍能通过 keys/key_tokens 并集成行
+    #[test]
+    fn key_usage_view_aggregates_models_per_key() {
+        let mut f = UsageFile::default();
+        f.record(false, "m1", "u1", "k-a", true, false, 10, 3, 4);
+        f.record(false, "m1", "u1", "k-a", false, false, 10, 0, 0);
+        f.record(false, "m2", "u1", "k-a", true, false, 10, 5, 6);
+        f.record(false, "m2", "u2", "k-b", true, false, 10, 7, 8);
+        let today = today_key();
+        let d = f.days.get(&today).expect("当日统计应存在");
+        let v = UsageDayView::from_day(&today, d);
+        let ka = v
+            .key_usage
+            .iter()
+            .find(|k| k.name == "k-a")
+            .expect("k-a 应在按 Key 视图");
+        assert_eq!(ka.requests, 3);
+        assert_eq!((ka.ok, ka.errors), (2, 1));
+        assert_eq!((ka.prompt_tokens, ka.completion_tokens), (8, 10));
+        // 模型明细按请求数降序：m1(2 次) 在 m2(1 次) 前
+        assert_eq!(ka.models.len(), 2);
+        assert_eq!(ka.models[0].model, "m1");
+        assert_eq!((ka.models[0].requests, ka.models[0].ok, ka.models[0].errors), (2, 1, 1));
+        assert_eq!((ka.models[0].prompt_tokens, ka.models[0].completion_tokens), (3, 4));
+        assert_eq!(ka.models[1].model, "m2");
+        // 顶层排序：请求数多的 Key 在前
+        assert_eq!(v.key_usage[0].name, "k-a");
+        // 历史数据兼容：只有计数/token、无 key_models 的 Key 也成行（模型明细为空）
+        let mut legacy = DayStats::default();
+        let mut counter = Counter::default();
+        counter.add(true);
+        legacy.keys.insert("legacy".into(), counter);
+        legacy.key_tokens.insert("legacy".into(), (1, 2));
+        let legacy_view = UsageDayView::from_day(&today, &legacy);
+        let row = legacy_view
+            .key_usage
+            .iter()
+            .find(|k| k.name == "legacy")
+            .expect("历史 Key 应成行");
+        assert_eq!((row.requests, row.prompt_tokens, row.completion_tokens), (1, 1, 2));
+        assert!(row.models.is_empty(), "旧数据无模型明细时为空数组");
     }
 
     #[test]

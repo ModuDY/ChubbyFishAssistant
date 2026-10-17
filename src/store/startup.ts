@@ -27,7 +27,8 @@ export const createStartupSlice: StateCreator<AppState, [], [], StartupSlice> = 
         // 提取脚本 [fatal] 行的原文（如「目标账号 xxx 无快照，请先登录该账号并点击保存当前登录态」）
         // raw 兜底空串：后端偶发缺 payload 时避免 TypeError 把 switchingTo 永久锁死
         const raw = e.raw ?? '';
-        const reason = e.success ? null : (raw.match(/\[fatal\]\s*(.+)$/)?.[1]?.trim() ?? null);
+        // 取 fatal 行的首个非空行（raw 可能追加后续多行文本，不能只认行尾）
+        const reason = e.success ? null : (raw.match(/\[fatal\]\s*([^\n]+)/)?.[1]?.trim() ?? null);
         // verify 超时（authfile 布局）：切换动作完成但登录身份未确认 → warn 而非 success，
         // 避免「切换成功」toast 掩盖客户端未登录的事实（switcher.log 实测 4/4 超时）
         const warnUnconfirmed = e.success && /未确认登录身份/.test(raw);
@@ -59,7 +60,7 @@ export const createStartupSlice: StateCreator<AppState, [], [], StartupSlice> = 
         set((s) => ({ saveLoginProgress: [...s.saveLoginProgress.slice(-49), line] })),
       onSaveLoginDone: (e: SaveLoginDoneEvent) => {
         // 同上：raw 缺失时兜底空串，避免 savingLogin 被锁死
-        const reason = e.success ? null : ((e.raw ?? '').match(/\[fatal\]\s*(.+)$/)?.[1]?.trim() ?? null);
+        const reason = e.success ? null : ((e.raw ?? '').match(/\[fatal\]\s*([^\n]+)/)?.[1]?.trim() ?? null);
         set((s) => ({
           savingLogin: null,
           saveLoginProgress: [

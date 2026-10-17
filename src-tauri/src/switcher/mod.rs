@@ -907,10 +907,21 @@ fn switch_flow(
                     "目标账号 {uid} 无快照，凭证副本中也没有该账号的有效登录凭证，无法自动合成。\
                      请先在客户端手动登录账号 {uid}，再点「保存当前登录态」建立首个快照"
                 ),
-                _ => format!("目标账号 {uid} 无快照，请先登录该账号并点击「保存当前登录态」"),
+                _ if sess.prof.profiles_dir.exists() => {
+                    format!("目标账号 {uid} 无快照，请先登录该账号并点击「保存当前登录态」")
+                }
+                // 整个快照目录都不存在 = 本机从未保存过任何该应用登录态，需要先建首个快照
+                _ => format!(
+                    "目标账号 {uid} 无快照，本机还没有任何 {} 登录态快照。\
+                     请先打开客户端登录该账号，回到账号页点该行的「保存当前登录态」建立首个快照，\
+                     之后再点「切换」",
+                    sess.prof.app_name
+                ),
             };
-            sink.step("fatal", StepStatus::Error, &msg);
-            return Err(fatal_line(&msg));
+            // 与其余错误点一致：流内 fatal 行带「失败: 」，Err 载荷带 [fatal] 前缀
+            // （前端 toast 按 /\[fatal\]\s*(.+)$/ 提取完整原因）
+            sink.step("fatal", StepStatus::Error, &format!("失败: {msg}"));
+            return Err(fatal_line(&format!("[fatal] {msg}")));
         };
         sess.bootstrap_uid = Some(bootstrap_uid);
         sess.bootstrap_done = true;
