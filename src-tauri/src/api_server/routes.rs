@@ -1469,28 +1469,42 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             Box::new(lines) as Box<dyn Iterator<Item = String> + Send>,
                         );
                         // 连接成功 → 开始流式转换，mid-stream error 只冷却不轮换
-                        let (error_info, sent_any, up_usage) = match proto {
+                        let (error_info, sent_any, up_usage, diag) = match proto {
                             Protocol::OpenAi => {
-                                let (e, s, u) = sse::stream_convert_lines(lines, tx.clone(), &chat_id);
-                                (e, s, u)
+                                sse::stream_convert_lines_ex(lines, tx.clone(), &chat_id, &model)
                             }
                             Protocol::OpenAiText => {
                                 let (e, s, u) =
                                     sse::stream_convert_text_lines(lines, tx.clone(), &chat_id, &model);
-                                (e, s, u)
+                                (e, s, u, sse::StreamDiag::default())
                             }
                             Protocol::Anthropic => {
                                 let (e, s, u) =
                                     sse::stream_convert_anthropic_lines(lines, tx.clone(), &chat_id, &model);
-                                (e, s, u)
+                                (e, s, u, sse::StreamDiag::default())
                             }
                             // Responses 仅走 WB 上游；solo 管线兜底按 OpenAI 透传
                             Protocol::Responses => {
-                                let (e, s, u) = sse::stream_convert_lines(lines, tx.clone(), &chat_id);
-                                (e, s, u)
+                                sse::stream_convert_lines_ex(lines, tx.clone(), &chat_id, &model)
                             }
                         };
                         let duration_ms = start_ts.elapsed().as_millis() as u64;
+                        // 收尾形态诊断：客户端「输出几句就停」时用它区分
+                        // ①上游提前收尾（done/finish_reason）②上游 EOF 断流被补成正常结束。
+                        // 每请求单行，与既有请求行同量级，无需开 Debug 也可回溯
+                        state.logger.log_debug_line(format!(
+                            "[STREAM] key={} model={} out={} th={} tool={} done={} fin={} eof={} sent={} {}ms",
+                            if key_name.is_empty() { "-" } else { &key_name },
+                            model,
+                            diag.outputs,
+                            diag.thoughts,
+                            diag.tools,
+                            diag.done_frames,
+                            if diag.finish_reason.is_empty() { "-" } else { &diag.finish_reason },
+                            if diag.completed { 0 } else { 1 },
+                            if sent_any { 1 } else { 0 },
+                            duration_ms,
+                        ));
                         // TTFB：首行到达耗时（未读到首行 → None，不输出该字段）
                         let ttfb_ms = {
                             let us = ttfb_us.load(std::sync::atomic::Ordering::Relaxed);
@@ -1839,6 +1853,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
         .header("connection", "keep-alive")
+        // 显式禁用中间层缓冲：nginx/各类反代默认会缓冲 SSE，导致流被切碎或延迟
+        .header("x-accel-buffering", "no")
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| {
             Response::builder()

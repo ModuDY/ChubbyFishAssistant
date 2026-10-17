@@ -493,6 +493,24 @@ pub fn region_billing_base(domain: &str) -> &'static str {
     }
 }
 
+/// Web 端（成长中心页面）域名：**领奖必须走这里**。
+/// CN 是 `www.workbuddy.cn`（不是拿 token 的 `www.codebuddy.cn`，后者领奖返回
+/// 400 "task not completed"）；Global 沿用 `www.workbuddy.ai`。
+pub const WEB_BASE_CN: &str = "https://www.workbuddy.cn";
+pub const WEB_BASE_GLOBAL: &str = "https://www.workbuddy.ai";
+
+/// 在既有账号头上补齐 Web 端标记（领奖用）：`x-client-platform: web` 与成长中心
+/// Origin/Referer（浏览器实请求形状，上游按此判定来源端）。
+/// 独立成函数是为了让调用方能把「刷新后的新凭证头」再套一层，避免拿旧 token 领奖。
+pub fn web_flavor(base: &[(String, String)], web_base: &str) -> Vec<(String, String)> {
+    let mut h = base.to_vec();
+    h.push(("Accept".to_string(), "application/json, text/plain, */*".to_string()));
+    h.push(("Origin".to_string(), web_base.to_string()));
+    h.push(("Referer".to_string(), format!("{web_base}/profile/growth-center")));
+    h.push(("X-Client-Platform".to_string(), "web".to_string()));
+    h
+}
+
 /// 域名双探测（§2.2 接口稳定性）：主域名在前、备用域名在后。
 pub fn billing_bases(domain: &str) -> [&'static str; 2] {
     let main = region_billing_base(domain);

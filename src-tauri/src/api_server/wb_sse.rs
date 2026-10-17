@@ -727,16 +727,20 @@ pub fn stream_forward_ex(
                             let frame_empty =
                                 delta.as_object().map_or(true, |o| o.is_empty());
                             if !(frame_empty && finish.is_empty() && !frame_has_usage) {
-                                let mut choice = json!({"index":0,"delta":delta});
-                                if !finish.is_empty() {
-                                    choice["finish_reason"] = json!(finish);
-                                }
+                                // OpenAI 流式规范：finish_reason / usage 缺省时写 null，
+                                // 不省略键（严格客户端按 schema 校验帧结构）
+                                let choice = json!({
+                                    "index": 0,
+                                    "delta": delta,
+                                    "finish_reason": if finish.is_empty() { Value::Null } else { json!(finish) },
+                                });
                                 let mut chunk = json!({
                                     "id": if id.is_empty() { chat_id.to_string() } else { id },
                                     "object": "chat.completion.chunk",
                                     "created": now_ts(),
                                     "model": model,
                                     "choices": [choice],
+                                    "usage": Value::Null,
                                 });
                                 if let Some(x) = &usage {
                                     // usage 归一化投影（同 solo 管线 sse.rs 口径）：
@@ -897,11 +901,16 @@ pub fn aggregate<L: Iterator<Item = String>>(
     let mut usage: Option<Value> = None;
     // index → (id, name, args)
     let mut tools: BTreeMap<i64, (String, String, String)> = BTreeMap::new();
+    // 上游是否显式发过完成事件（false = EOF 断流 → 参数可能残缺）
+    let mut completed = false;
 
     loop {
         match parser.next_event() {
             None => break,
-            Some(WbEvent::Done) => break,
+            Some(WbEvent::Done) => {
+                completed = true;
+                break;
+            }
             Some(WbEvent::Error { code, msg }) => return (None, Some((code, msg))),
             Some(WbEvent::Chunk { delta, finish: f, usage: u, .. }) => {
                 if let Some(x) = u {
@@ -955,8 +964,12 @@ pub fn aggregate<L: Iterator<Item = String>>(
         message["reasoning_content"] = json!(reasoning);
     }
     if !tools.is_empty() {
+        // 截断处置（finish_reason=length / 上游断流）：丢弃参数残缺的调用，
+        // 半截 JSON 交给客户端会解析失败并卡死会话；完整参数零改动
+        let truncated = finish == "length" || !completed;
         let calls: Vec<Value> = tools
             .values()
+            .filter(|(_, _, args)| !(truncated && super::tool_args_truncated(args)))
             .enumerate()
             .map(|(i, (id, name, args))| {
                 json!({
@@ -966,7 +979,9 @@ pub fn aggregate<L: Iterator<Item = String>>(
                 })
             })
             .collect();
-        message["tool_calls"] = json!(calls);
+        if !calls.is_empty() {
+            message["tool_calls"] = json!(calls);
+        }
     }
     let mut resp = json!({
         "id": chat_id,
@@ -1361,6 +1376,43 @@ mod tests {
         assert_eq!(msg["tool_calls"][0]["function"]["name"], json!("get"));
         assert_eq!(r["usage"]["prompt_tokens"], json!(10));
         assert_eq!(r["choices"][0]["finish_reason"], json!("tool_calls"));
+    }
+
+    /// 断流（无 [DONE]）时参数残缺的 tool_call 必须丢弃，不把半截 JSON 交给客户端
+    #[test]
+    fn aggregate_drops_truncated_tool_calls_on_eof() {
+        let (resp, err) = aggregate(
+            lines(&[
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"get\",\"arguments\":\"{\\\"a\\\"\"}}]}}]}",
+                "",
+            ]),
+            "chat-1",
+        );
+        assert!(err.is_none());
+        let r = resp.unwrap();
+        assert!(
+            r.pointer("/choices/0/message/tool_calls").is_none(),
+            "断流残缺调用必须丢弃"
+        );
+    }
+
+    /// finish_reason=length（max_tokens 中止）同样按截断处置；完整参数不受影响
+    #[test]
+    fn aggregate_drops_truncated_tool_calls_on_length() {
+        let (resp, err) = aggregate(
+            lines(&[
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"get\",\"arguments\":\"{\\\"a\\\"\"}}]}}]}",
+                "",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}",
+                "",
+                "data: [DONE]",
+                "",
+            ]),
+            "chat-1",
+        );
+        assert!(err.is_none());
+        let r = resp.unwrap();
+        assert!(r.pointer("/choices/0/message/tool_calls").is_none());
     }
 
     #[test]

@@ -163,14 +163,45 @@ pub fn stream_convert_lines(
     sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     chat_id: &str,
 ) -> (Option<(i64, String)>, bool, Option<Value>) {
-    stream_convert_src(lines, sender, chat_id)
+    let (e, s, u, _d) = stream_convert_src(lines, sender, chat_id, "");
+    (e, s, u)
+}
+
+/// 流式转换诊断产物：回答「上游到底是正常收尾还是中途断流」——
+/// 客户端出现「输出几句就停」时，先用它区分「上游提前 done / finish_reason=length」
+/// 与「上游 EOF 断流被网关补成正常结束」
+#[derive(Debug, Default, Clone)]
+pub struct StreamDiag {
+    /// output 事件数（正文增量）
+    pub outputs: usize,
+    /// thought 事件数（思考链增量）
+    pub thoughts: usize,
+    /// 携带 tool_calls 的事件数
+    pub tools: usize,
+    /// 完成帧事件数（done / turn_completion）
+    pub done_frames: usize,
+    /// 上游最后携带的 finish_reason（空 = 上游未给）
+    pub finish_reason: String,
+    /// 上游是否显式发过完成帧（false = 靠 EOF 收尾）
+    pub completed: bool,
+}
+
+/// 流式转换 + 诊断（调用方需要判断上游收尾形态时使用）
+pub fn stream_convert_lines_ex(
+    lines: InterruptibleLines,
+    sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    chat_id: &str,
+    model: &str,
+) -> (Option<(i64, String)>, bool, Option<Value>, StreamDiag) {
+    stream_convert_src(lines, sender, chat_id, model)
 }
 
 fn stream_convert_src(
     mut src: LineSrc,
     sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     chat_id: &str,
-) -> (Option<(i64, String)>, bool, Option<Value>) {
+    model: &str,
+) -> (Option<(i64, String)>, bool, Option<Value>, StreamDiag) {
     let mut st = SseState::new();
     let mut pending_usage: Option<Value> = None;
     let mut saw_done = false;
@@ -183,29 +214,30 @@ fn stream_convert_src(
     // 静默收尾会被判为「模型返回数据异常，未输出最终回答」，故按空完成处置
     let mut has_visible = false;
     let mut error_info: Option<(i64, String)> = None;
+    // 收尾形态诊断（见 StreamDiag）
+    let mut diag = StreamDiag::default();
 
+    // 按 OpenAI 流式规范重建帧（白名单）：中间帧也必须显式携带
+    // `finish_reason: null` 与 `usage: null`——缺键而非 null 会让严格客户端
+    // （AI SDK 系）在解析器层判定帧不合法，表现为「输出几句就停」
     let write_chunk = |delta: Value, finish: &str, pending_usage: &Option<Value>| -> String {
-        let mut choices = vec![json!({
-            "index": 0,
-            "delta": delta,
-        })];
-        if !finish.is_empty() {
-            if let Some(c) = choices.get_mut(0).and_then(|c| c.as_object_mut()) {
-                c.insert("finish_reason".into(), json!(finish));
-            }
-        }
-        let mut chunk = json!({
+        let finish_val = if finish.is_empty() {
+            Value::Null
+        } else {
+            json!(finish)
+        };
+        let chunk = json!({
             "id": chat_id,
             "object": "chat.completion.chunk",
             "created": now_ts(),
-            "model": "",
-            "choices": choices,
+            "model": if model.is_empty() { "" } else { model },
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_val,
+            }],
+            "usage": pending_usage.clone().unwrap_or(Value::Null),
         });
-        if pending_usage.is_some() {
-            if let Some(c) = chunk.as_object_mut() {
-                c.insert("usage".into(), pending_usage.clone().unwrap());
-            }
-        }
         format!("data: {}\n\n", chunk)
     };
 
@@ -225,6 +257,12 @@ fn stream_convert_src(
         if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
             match ev.event.as_str() {
                 "output" | "thought" => {
+                    // 诊断计数：正文/思考链事件分别计，工具调用事件单独计
+                    if ev.event == "thought" {
+                        diag.thoughts += 1;
+                    } else {
+                        diag.outputs += 1;
+                    }
                     let mut delta = Map::new();
                     if !ev.response.is_empty() {
                         delta.insert("content".into(), json!(ev.response));
@@ -234,6 +272,9 @@ fn stream_convert_src(
                     }
                     if let Some(tc) = &ev.tool_calls {
                         if let Some(arr) = tc.as_array() {
+                            if !arr.is_empty() {
+                                diag.tools += 1;
+                            }
                             let converted: Vec<Value> = arr
                                 .iter()
                                 .map(|call| {
@@ -292,6 +333,11 @@ fn stream_convert_src(
                     // 首个完成帧已发则忽略后续，防同一 SSE 流拼接第二份收尾帧
                     if saw_done {
                         continue;
+                    }
+                    diag.done_frames += 1;
+                    diag.completed = true;
+                    if !ev.finish_reason.is_empty() {
+                        diag.finish_reason = ev.finish_reason.clone();
                     }
                     if !has_content {
                         // 空完成（影子风控/上游异常）：不发收尾帧，以哨兵错误上抛
@@ -382,6 +428,16 @@ fn stream_convert_src(
             ))));
             let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
         } else {
+            // 上游未发完成帧即断流：补齐带 finish_reason 的收尾 chunk 再 [DONE]。
+            // 严格客户端（AI SDK 等）只认「finish_reason 帧 + [DONE]」的组合，
+            // 裸 [DONE] 会让它们把已收正文当作残缺消息（表现为「输出几句就停」）
+            let finish = if diag.finish_reason.is_empty() {
+                "stop".to_string()
+            } else {
+                diag.finish_reason.clone()
+            };
+            let data = write_chunk(json!({}), &finish, &pending_usage);
+            let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
             let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
         }
     }
@@ -390,6 +446,7 @@ fn stream_convert_src(
         error_info.map(|(code, msg)| (code, msg)),
         sent_any,
         pending_usage,
+        diag,
     )
 }
 
@@ -417,21 +474,17 @@ fn stream_convert_text_src(
     let mut has_content = false; // 空完成检测（issue #57）
     let mut error_info: Option<(i64, String)> = None;
 
+    // 同 OpenAI chat 口径：finish_reason / usage 缺省时显式写 null（不省略键）
     let write_chunk = |text: &str, finish: &str, usage: &Option<Value>| -> String {
-        let mut choice = json!({ "text": text, "index": 0 });
-        if !finish.is_empty() {
-            choice["finish_reason"] = json!(finish);
-        }
-        let mut chunk = json!({
+        let finish_val = if finish.is_empty() { Value::Null } else { json!(finish) };
+        let chunk = json!({
             "id": completion_id,
             "object": "text_completion",
             "created": now_ts(),
             "model": model,
-            "choices": [choice],
+            "choices": [{ "text": text, "index": 0, "finish_reason": finish_val }],
+            "usage": usage.clone().unwrap_or(Value::Null),
         });
-        if let Some(u) = usage {
-            chunk["usage"] = u.clone();
-        }
         format!("data: {}\n\n", chunk)
     };
 
@@ -531,16 +584,20 @@ fn stream_convert_text_src(
     (error_info, sent_any, pending_usage)
 }
 
-/// 纯文本收集器：output/thought 文本 + usage + error（无 tool_calls 场景）
+/// 纯文本收集器：output/thought 文本 + 工具调用 + usage + error
 struct PlainCollect {
     content: String,
     reasoning: String,
     finish_reason: String,
     usage: Option<Value>,
     error_info: Option<(i64, String)>,
+    /// 工具调用：index → (id, name, args)，与流式路径同口径按 index 合并
+    tools: std::collections::BTreeMap<i64, (String, String, String)>,
+    /// 上游是否显式发过完成帧（false = EOF 断流 → 参数可能残缺）
+    completed: bool,
 }
 
-/// 读取完整 SOLO SSE，收集文本/结束原因/用量/错误
+/// 读取完整 SOLO SSE，收集文本/工具调用/结束原因/用量/错误
 fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
     let br = BufReader::new(reader);
     let mut st = SseState::new();
@@ -550,6 +607,8 @@ fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
         finish_reason: "stop".to_string(),
         usage: None,
         error_info: None,
+        tools: std::collections::BTreeMap::new(),
+        completed: false,
     };
     for line in br.lines() {
         let line = match line {
@@ -561,11 +620,45 @@ fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
                 "output" | "thought" => {
                     out.content.push_str(&ev.response);
                     out.reasoning.push_str(&ev.reasoning);
+                    // 工具调用按 index 合并（非流式响应此前完全丢失 tool_calls）
+                    if let Some(arr) = ev.tool_calls.as_ref().and_then(|t| t.as_array()) {
+                        for tc in arr {
+                            let idx = tc
+                                .get("index")
+                                .and_then(|i| i.as_i64())
+                                .unwrap_or(out.tools.len() as i64);
+                            let e = out.tools.entry(idx).or_default();
+                            if let Some(i) = tc.get("id").and_then(|i| i.as_str()) {
+                                if !i.is_empty() {
+                                    e.0 = i.to_string();
+                                }
+                            }
+                            if let Some(n) =
+                                tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str())
+                            {
+                                if !n.is_empty() {
+                                    e.1 = n.to_string();
+                                }
+                            }
+                            if let Some(a) = tc.get("function").and_then(|f| f.get("arguments")) {
+                                match a {
+                                    Value::String(s) => e.2.push_str(s),
+                                    v if !v.is_null() => {
+                                        if let Ok(s) = serde_json::to_string(v) {
+                                            e.2.push_str(&s);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
                 }
                 "token_usage" => {
                     out.usage = Some(normalize_openai_usage(&ev.usage.unwrap_or(json!({}))));
                 }
                 "done" | "turn_completion" => {
+                    out.completed = true;
                     if !ev.finish_reason.is_empty() {
                         out.finish_reason = ev.finish_reason;
                     }
@@ -596,6 +689,28 @@ pub fn aggregate<R: Read + Send>(
     });
     if !c.reasoning.is_empty() {
         message["reasoning_content"] = json!(c.reasoning);
+    }
+    if !c.tools.is_empty() {
+        // 截断处置：finish_reason=length（max_tokens 中止）或上游未发完成帧即断流时，
+        // 累计到的 arguments 可能只是半截 JSON。这类调用直接丢弃（不补成 {} 伪造合法
+        // 外观），否则客户端解析非法 JSON 会卡死会话；完整参数零改动
+        let truncated = c.finish_reason == "length" || !c.completed;
+        let calls: Vec<Value> = c
+            .tools
+            .values()
+            .filter(|(_, _, args)| !(truncated && super::tool_args_truncated(args)))
+            .enumerate()
+            .map(|(i, (id, name, args))| {
+                json!({
+                    "id": if id.is_empty() { format!("call_{}_{}", chat_id, i) } else { id.clone() },
+                    "type": "function",
+                    "function": { "name": name, "arguments": args },
+                })
+            })
+            .collect();
+        if !calls.is_empty() {
+            message["tool_calls"] = json!(calls);
+        }
     }
 
     let mut resp = json!({
@@ -1380,6 +1495,86 @@ mod tests {
         assert!(joined.contains("想一想"), "思考增量照常转发");
         assert!(joined.contains("empty completion"), "必须下发明确错误帧");
         assert!(joined.ends_with("data: [DONE]"), "错误帧后仍需 [DONE] 收尾");
+    }
+
+    /// 中间帧必须显式携带 finish_reason: null / usage: null，并使用真实 model
+    /// （缺键而非 null 会让严格客户端按 schema 判定帧不合法）
+    #[test]
+    fn intermediate_chunk_carries_null_finish_and_usage() {
+        let input = "event: output\ndata: {\"response\":\"hi\"}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let _ = stream_convert_lines_ex(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "c1",
+            "deepseek-v4.1-flash",
+        );
+        let joined = collect_events(rx).join("\n");
+        assert!(joined.contains("\"finish_reason\":null"), "中间帧须带 finish_reason:null");
+        assert!(joined.contains("\"usage\":null"), "无 usage 时须显式 null");
+        assert!(joined.contains("\"model\":\"deepseek-v4.1-flash\""), "须回填真实模型名");
+    }
+
+    /// 非流式聚合必须带回 tool_calls（此前该路径完全丢失工具调用）
+    #[test]
+    fn aggregate_keeps_complete_tool_calls() {
+        let input = "event: output\ndata: {\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"a\\\"\"}}]}\n\n\
+                     event: output\ndata: {\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":1}\"}}]}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"tool_calls\"}\n\n";
+        let (resp, err) = aggregate(std::io::Cursor::new(input), "c1");
+        assert!(err.is_none());
+        let resp = resp.expect("聚合应有响应");
+        let calls = resp
+            .pointer("/choices/0/message/tool_calls")
+            .and_then(|v| v.as_array())
+            .expect("必须带回 tool_calls");
+        assert_eq!(calls[0]["function"]["arguments"], json!("{\"a\":1}"));
+        assert_eq!(resp.pointer("/choices/0/finish_reason"), Some(&json!("tool_calls")));
+    }
+
+    /// finish_reason=length 时丢弃参数残缺的调用（半截 JSON 会让客户端卡死）
+    #[test]
+    fn aggregate_drops_truncated_tool_calls_on_length() {
+        let input = "event: output\ndata: {\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"a\\\"\"}}]}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"length\"}\n\n";
+        let (resp, err) = aggregate(std::io::Cursor::new(input), "c1");
+        assert!(err.is_none());
+        let resp = resp.expect("聚合应有响应");
+        assert!(
+            resp.pointer("/choices/0/message/tool_calls").is_none(),
+            "残缺调用必须丢弃"
+        );
+    }
+
+    /// 上游未发完成帧即断流（EOF）：同样按截断处理，丢弃残缺参数
+    #[test]
+    fn aggregate_drops_truncated_tool_calls_on_eof() {
+        let input = "event: output\ndata: {\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"a\\\"\"}}]}\n\n";
+        let (resp, err) = aggregate(std::io::Cursor::new(input), "c1");
+        assert!(err.is_none());
+        let resp = resp.expect("聚合应有响应");
+        assert!(
+            resp.pointer("/choices/0/message/tool_calls").is_none(),
+            "断流残缺调用必须丢弃"
+        );
+    }
+
+    #[test]
+    fn eof_with_output_emits_finish_reason_before_done() {
+        // 上游未发完成帧即断流：必须补齐带 finish_reason 的收尾 chunk，
+        // 裸 [DONE] 会让严格客户端（AI SDK 系）把正文当作残缺消息丢弃
+        let input = "event: output\ndata: {\"response\":\"hi\"}\n\n";
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let (error_info, sent_any, _) = stream_convert_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "c1",
+        );
+        assert!(error_info.is_none());
+        assert!(sent_any);
+        let joined = collect_events(rx).join("\n");
+        assert!(joined.contains("\"finish_reason\":\"stop\""), "必须补 finish_reason 帧");
+        assert!(joined.ends_with("data: [DONE]"));
     }
 
     #[test]

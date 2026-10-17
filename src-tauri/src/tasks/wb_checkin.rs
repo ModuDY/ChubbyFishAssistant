@@ -68,6 +68,10 @@ struct Urls {
     tasks_accept: String,
     energy: String,
     streak: String,
+    /// 连登档位兑换（POST {tier, client_token}；未解锁返回 403）
+    streak_redeem: String,
+    /// 对话活跃上报（点亮连登 + 解锁领养等成长任务）
+    report: String,
 }
 
 fn urls_for(base: &'static str) -> Urls {
@@ -88,6 +92,8 @@ fn urls_for(base: &'static str) -> Urls {
         tasks_accept: format!("{g}/tasks/accept"),
         energy: format!("{g}/energy"),
         streak: format!("{g}/streak"),
+        streak_redeem: format!("{g}/redeem"),
+        report: format!("{b}/v2/report"),
     }
 }
 
@@ -97,6 +103,15 @@ impl Urls {
         let bases = wb_common::billing_bases("");
         let alt = if bases[0] == self.base { bases[1] } else { bases[0] };
         urls_for(alt)
+    }
+
+    /// Web 端基址（领奖专用，与 billing 基址不同域）
+    fn web_base(&self) -> &'static str {
+        if self.base == wb_common::BILLING_BASE_GLOBAL {
+            wb_common::WEB_BASE_GLOBAL
+        } else {
+            wb_common::WEB_BASE_CN
+        }
     }
 }
 
@@ -812,8 +827,65 @@ fn growth_lottery(agent: &ureq::Agent, headers: &[(String, String)], urls: &Urls
     ("ok".into(), format!("抽取 {draws} 次（奖励 {joined}）"))
 }
 
-/// 任务领奖：tasks → 过滤 has_reward && 未领取 → accept {task_code}（可开关）
-fn growth_tasks(agent: &ureq::Agent, headers: &[(String, String)], urls: &Urls) -> (String, String) {
+/// 任务码路径段编码（任务码形如 `first_buddy` / `Model_chat_GLM5.2`）
+fn encode_path_seg(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// 任务进度 (current, target)：`progress{current,target}` 优先，回退平铺字段
+fn task_progress(t: &Value) -> (f64, f64) {
+    let flat = |k: &str| t.get(k).filter(|v| !v.is_null()).and_then(scalar_of);
+    if let Some(p) = t.get("progress").filter(|p| p.is_object()) {
+        let c = p.get("current").filter(|v| !v.is_null()).and_then(scalar_of);
+        let g = p.get("target").filter(|v| !v.is_null()).and_then(scalar_of);
+        if c.is_some() || g.is_some() {
+            return (c.or_else(|| flat("current")).unwrap_or(0.0), g.or_else(|| flat("target")).unwrap_or(0.0));
+        }
+    }
+    (flat("current").unwrap_or(0.0), flat("target").unwrap_or(0.0))
+}
+
+/// 单任务领奖（**Web 域**）：`POST {web}/activity/growth/tasks/{code}/claim`，无 body。
+/// 返回 Ok((credit, energy))；`already_claimed` 视为成功但零到账。Err 携带 HTTP 状态。
+fn claim_task(
+    agent: &ureq::Agent,
+    web_headers: &[(String, String)],
+    urls: &Urls,
+    code: &str,
+) -> Result<(f64, f64), u16> {
+    let url = format!(
+        "{}/activity/growth/tasks/{}/claim",
+        urls.web_base(),
+        encode_path_seg(code)
+    );
+    let (st, body, _raw) = wb_common::post_json_raw(agent, &url, web_headers, &json!({}));
+    if !(200..=201).contains(&st) {
+        return Err(st);
+    }
+    let b = body.unwrap_or_else(|| json!({}));
+    let credit = fs_utils::dig(&b, &["credit"]).and_then(scalar_of).unwrap_or(0.0);
+    let energy = fs_utils::dig(&b, &["energy"]).and_then(scalar_of).unwrap_or(0.0);
+    Ok((credit, energy))
+}
+
+/// 成长任务：拉列表 → 未接受则 accept → 进度达标且未领取则 **Web 域 claim 领奖**。
+/// accept 只是「接任务」，奖励必须另走 claim 才会到账（此前只 accept 不 claim，
+/// 奖励从未落袋）。
+fn growth_tasks(
+    agent: &ureq::Agent,
+    headers: &[(String, String)],
+    urls: &Urls,
+) -> (String, String) {
+    // 领奖走 Web 域：在（可能刚刷新过的）账号头上补 Web 端标记
+    let web_headers = wb_common::web_flavor(headers, urls.web_base());
     let (status, body, raw) = wb_common::get_json(agent, &urls.tasks, headers);
     if status == 401 {
         return ("auth".into(), "登录态失效（401）".into());
@@ -832,22 +904,14 @@ fn growth_tasks(agent: &ureq::Agent, headers: &[(String, String)], urls: &Urls) 
         .and_then(Value::as_array)
         .map(|a| a.iter().collect())
         .unwrap_or_default();
+    let mut accepted = 0usize;
     let mut claimed = 0usize;
     let mut skipped = 0usize;
+    let mut credit_total = 0.0;
+    let mut energy_total = 0.0;
     for t in tasks {
         let Some(obj) = t.as_object() else { continue };
         if !py_truthy(obj.get("has_reward")) && fs_utils::dig(t, &["hasReward"]).is_none() {
-            continue;
-        }
-        // accept_status：顶层缺省时 dig 兜底；空值归一 ""（对齐 python `or ""` + str()）
-        let accept_status = obj
-            .get("accept_status")
-            .filter(|v| !v.is_null())
-            .or_else(|| fs_utils::dig(t, &["acceptStatus", "status"]))
-            .map(value_display)
-            .unwrap_or_default();
-        if ["1", "2", "claimed", "accepted", "已领取", "true", "True"].contains(&accept_status.as_str()) {
-            skipped += 1;
             continue;
         }
         let code = obj
@@ -855,23 +919,189 @@ fn growth_tasks(agent: &ureq::Agent, headers: &[(String, String)], urls: &Urls) 
             .filter(|v| !v.is_null())
             .or_else(|| obj.get("taskCode").filter(|v| !v.is_null()))
             .or_else(|| obj.get("code").filter(|v| !v.is_null()))
-            .cloned();
-        let accept_body = match &code {
-            Some(c) => json!({"task_code": c}),
-            None => json!({}),
-        };
-        let (st, _bb, _r) = wb_common::post_json_raw(agent, &urls.tasks_accept, headers, &accept_body);
+            .and_then(|v| v.as_str().map(str::to_string));
+        // accept_status：顶层缺省时 dig 兜底；空值归一 ""（对齐 python `or ""` + str()）
+        let accept_status = obj
+            .get("accept_status")
+            .filter(|v| !v.is_null())
+            .or_else(|| fs_utils::dig(t, &["acceptStatus", "status"]))
+            .map(value_display)
+            .unwrap_or_default();
+        let already_claimed = ["claimed", "已领取"].contains(&accept_status.as_str());
+        let accepted_already =
+            ["1", "2", "accepted", "true", "True"].contains(&accept_status.as_str());
+
+        // 1) 未接受 → accept（幂等）
+        if !already_claimed && !accepted_already {
+            let accept_body = match &code {
+                Some(c) => json!({"task_code": c}),
+                None => json!({}),
+            };
+            let (st, _bb, _r) =
+                wb_common::post_json_raw(agent, &urls.tasks_accept, headers, &accept_body);
+            if st == 401 {
+                return ("auth".into(), format!("登录态失效（401，已领 {claimed} 项）"));
+            }
+            if (200..=201).contains(&st) {
+                accepted += 1;
+            }
+        }
+
+        // 2) 进度达标且未领取 → Web 域 claim
+        let (cur, tgt) = task_progress(t);
+        let done = tgt > 0.0 && cur >= tgt;
+        if already_claimed || !done {
+            skipped += 1;
+            continue;
+        }
+        let Some(code) = code else { continue };
+        match claim_task(agent, &web_headers, urls, &code) {
+            Ok((c, e)) => {
+                claimed += 1;
+                credit_total += c;
+                energy_total += e;
+            }
+            Err(401) => {
+                return ("auth".into(), format!("登录态失效（401，已领 {claimed} 项）"));
+            }
+            Err(_) => continue, // 单项失败不影响其余任务
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if accepted > 0 {
+        parts.push(format!("接受 {accepted} 项"));
+    }
+    if claimed > 0 {
+        parts.push(format!(
+            "领取 {claimed} 项（+{:.0} 积分/+{:.0} 能量）",
+            credit_total, energy_total
+        ));
+    }
+    if parts.is_empty() {
+        return ("skip".into(), format!("暂无可领取奖励（已领/未达标 {skipped} 项）"));
+    }
+    ("ok".into(), parts.join("，"))
+}
+
+/// 连登档位兑换：读 streak 的 `redemption_status` → 对「未锁定且未兑换」的档位
+/// 逐个 POST redeem。未解锁返回 403「连续登录天数不足」属预期，静默跳过。
+fn growth_redeem(agent: &ureq::Agent, headers: &[(String, String)], urls: &Urls) -> (String, String) {
+    let (st, body, raw) = wb_common::get_json(agent, &urls.streak, headers);
+    if st == 401 {
+        return ("auth".into(), "登录态失效（401）".into());
+    }
+    if st != 200 || !body.as_ref().is_some_and(|b| b.is_object()) {
+        let head: String = raw.chars().take(60).collect();
+        return (
+            "fail".into(),
+            if st != 0 { format!("streak 不可用（HTTP {st}）") } else { format!("streak 不可达: {head}") },
+        );
+    }
+    let b = body.as_ref().unwrap();
+    // 档位清单：tiers[].tier 优先；缺省回退固定三档
+    let mut tiers: Vec<String> = fs_utils::dig(b, &["tiers"])
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| t.get("tier").and_then(|v| v.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if tiers.is_empty() {
+        tiers = vec!["7d".into(), "14d".into(), "28d".into()];
+    }
+    let mut done = 0usize;
+    let mut skipped = 0usize;
+    for tier in &tiers {
+        // 状态键：tier_7d_status / tier_14d_status / tier_28d_status
+        let key = format!("tier_{}_status", tier.replace('-', "_"));
+        let status = fs_utils::dig(b, &[key.as_str()])
+            .map(value_display)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        // locked / claimed 明确不可兑换；其余（含空值）尝试一次，403 属预期
+        if status == "locked" || status == "claimed" {
+            skipped += 1;
+            continue;
+        }
+        let payload = json!({"tier": tier, "client_token": uuid::Uuid::new_v4().to_string()});
+        let (st, _rb, _rr) = wb_common::post_json_raw(agent, &urls.streak_redeem, headers, &payload);
         if st == 401 {
-            return ("auth".into(), format!("登录态失效（401，已领 {claimed} 项）"));
+            return ("auth".into(), format!("登录态失效（401，已兑换 {done} 档）"));
         }
         if (200..=201).contains(&st) {
-            claimed += 1;
+            done += 1;
+        } else {
+            skipped += 1; // 403 未满天数 / 已兑换：预期内
         }
     }
-    if claimed == 0 {
-        return ("skip".into(), format!("无可领奖励（已领 {skipped} 项）"));
+    if done == 0 {
+        return ("skip".into(), format!("连登档位暂不可兑换（跳过 {skipped} 档）"));
     }
-    ("ok".into(), format!("领取 {claimed} 项任务奖励"))
+    ("ok".into(), format!("兑换连登档位 {done} 个"))
+}
+
+/// 对话活跃上报（`POST /v2/report`，事件码 chat_request_send）：
+/// 一条即点亮当日连登，并解锁「领养 Buddy」等成长任务前置。每号每天 1 次。
+/// `userId` 必填——缺失时上游 200 但静默丢弃。
+fn growth_report(
+    agent: &ureq::Agent,
+    headers: &[(String, String)],
+    urls: &Urls,
+    uid: &str,
+) -> (String, String) {
+    if uid.trim().is_empty() {
+        return ("skip".into(), "缺少 uid，跳过活跃上报".into());
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let conv = format!("aiwork-{now}");
+    let event = json!({
+        "eventCode": "chat_request_send",
+        "timestamp": now,
+        "reportDelay": 0,
+        "mode": "craft",
+        "conversationId": conv,
+        "requestId": conv,
+        "inputLength": 12,
+        "requestModelId": "deepseek-v4-flash",
+        "requestModelName": "DeepSeek V4 Flash",
+        "isPlan": false,
+        "isAutoExecuteTerminal": false,
+        "isAutoModify": false,
+        "codebaseEnable": false,
+        "maxToken": 0,
+        "maxSteps": 0,
+        "temperature": 0,
+        "maxRetries": 0,
+        "mentionContexts": [],
+        "knowledgeId": [],
+        "knowledgeName": [],
+        "codebaseId": "",
+        "mentionContextCount": 0,
+        "command": "",
+        "expertId": "",
+        "recommendId": "",
+        "skillId": "",
+        "skillCount": 0,
+        "totalCount": 0,
+        "fileUri": "",
+        "presentAt": now,
+        "traceId": "",
+        "rootRequestId": conv,
+        "parentConversationId": conv,
+        "agentName": "default",
+        "agentType": "conversation",
+        "userId": uid,
+    });
+    let (st, _b, raw) = wb_common::post_json_raw(agent, &urls.report, headers, &json!([event]));
+    if st == 401 {
+        return ("auth".into(), "登录态失效（401）".into());
+    }
+    if (200..=201).contains(&st) {
+        return ("ok".into(), "已上报对话活跃".into());
+    }
+    let head: String = raw.chars().take(60).collect();
+    ("fail".into(), format!("活跃上报失败（HTTP {st}）{head}"))
 }
 
 /// 能量与连签天数（页面附注展示；对象响应归一为标量，防 [object Object]）
@@ -925,6 +1155,14 @@ fn process_account_growth(state: &AppState, agent: &ureq::Agent, acct: &Value, f
         result.insert("lottery".into(), json!(if kind == "fail" { "fail" } else { msg.as_str() }));
     }
     if flags.tasks {
+        // 成长任务链路：活跃上报（点亮连登）→ 连登档位兑换 → 任务接受/领奖。
+        // 三步同属成长中心维护，随 growth_tasks 开关联动，避免再增一组设置项
+        let (k1, m1) = with_retry(state, agent, &aid, &creds, |h| {
+            growth_report(agent, h, &urls, &creds.uid)
+        });
+        result.insert("report".into(), json!(if k1 == "fail" { "fail" } else { m1.as_str() }));
+        let (k2, m2) = with_retry(state, agent, &aid, &creds, |h| growth_redeem(agent, h, &urls));
+        result.insert("redeem".into(), json!(if k2 == "fail" { "fail" } else { m2.as_str() }));
         let (kind, msg) = with_retry(state, agent, &aid, &creds, |h| growth_tasks(agent, h, &urls));
         result.insert("tasks".into(), json!(if kind == "fail" { "fail" } else { msg.as_str() }));
     }
@@ -934,11 +1172,11 @@ fn process_account_growth(state: &AppState, agent: &ureq::Agent, acct: &Value, f
         result.insert(k.to_string(), json!(v));
     }
 
-    let enabled = ["travel", "lottery", "tasks"]
+    let enabled = ["travel", "lottery", "report", "redeem", "tasks"]
         .iter()
         .filter(|k| result.contains_key(**k))
         .count();
-    let fails = ["travel", "lottery", "tasks"]
+    let fails = ["travel", "lottery", "report", "redeem", "tasks"]
         .iter()
         .filter(|k| result.get(**k).and_then(Value::as_str) == Some("fail"))
         .count();
@@ -1049,6 +1287,34 @@ mod wb_checkin_tests {
         let alt = u.alt();
         assert_eq!(alt.base, wb_common::BILLING_BASE_GLOBAL);
         assert_ne!(alt.checkin_do, u.checkin_do);
+    }
+
+    /// 领奖走 Web 域：urls.web_base() 与 billing 基址不同域（CN=workbuddy.cn）
+    #[test]
+    fn claim_uses_web_domain_not_billing_domain() {
+        let u = urls_for(wb_common::BILLING_BASE_CN);
+        assert_eq!(u.web_base(), wb_common::WEB_BASE_CN);
+        assert_eq!(wb_common::WEB_BASE_CN, "https://www.workbuddy.cn");
+        assert!(u.streak_redeem.ends_with("/v2/activity/growth/redeem"));
+        assert!(u.report.ends_with("/v2/report"));
+    }
+
+    /// 任务进度：progress 对象优先于平铺字段，字符串数字同样解析
+    #[test]
+    fn task_progress_prefers_progress_object() {
+        let obj = json!({"progress": {"current": 3, "target": 5}, "current": 0, "target": 0});
+        assert_eq!(task_progress(&obj), (3.0, 5.0));
+        let flat = json!({"current": "2", "target": "4"});
+        assert_eq!(task_progress(&flat), (2.0, 4.0));
+        let none = json!({});
+        assert_eq!(task_progress(&none), (0.0, 0.0));
+    }
+
+    /// 任务码路径段编码：合法字符原样，非法字符百分号转义
+    #[test]
+    fn encode_path_seg_escapes_unsafe_chars() {
+        assert_eq!(encode_path_seg("Model_chat_GLM5.2"), "Model_chat_GLM5.2");
+        assert_eq!(encode_path_seg("a/b c"), "a%2Fb%20c");
     }
 
     #[test]

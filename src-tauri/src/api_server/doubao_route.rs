@@ -283,6 +283,8 @@ pub fn doubao_stream_chat(
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
         .header("connection", "keep-alive")
+        // 显式禁用中间层缓冲（nginx 默认缓冲 SSE 会切碎流）
+        .header("x-accel-buffering", "no")
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| internal_error_response())
 }

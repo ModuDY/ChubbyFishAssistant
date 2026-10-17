@@ -698,6 +698,21 @@ pub fn is_empty_completion(code: i64, msg: &str) -> bool {
     code == EMPTY_COMPLETION_CODE || msg.starts_with("empty completion:")
 }
 
+/// 工具调用参数字符串是否因分片丢失而残缺（区别于「该工具本就无参数」）：
+/// - 空串 / 纯空白 → false（合法无参工具）；
+/// - 非空但 JSON 解析失败 → true（截断）；
+/// - 能解析（含 null / 标量 / 数组等任何合法 JSON）→ false。
+///
+/// 只在「finish_reason == length」或「上游未发完成帧即断流」时用于过滤：
+/// 半截 JSON 交给客户端会解析失败并卡死会话，宁可丢这一次调用。
+pub fn tool_args_truncated(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed).is_err()
+}
+
 /// 聚合响应是否零内容（OpenAI chat / legacy text / Anthropic message 三形态）：
 /// 无正文 + 无工具调用即视为空完成（换号重试）。
 /// 注意：思考链（`reasoning_content` / Anthropic `thinking` 块）**不计入**交付物
