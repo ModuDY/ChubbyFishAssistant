@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod backup;
 mod checkin_results;
 mod device_proxy;
 mod events;
@@ -141,6 +142,8 @@ fn main() {
         .manage(Mutex::new(Option::<commands::api_server::ApiServerRuntime>::None))
         .manage(commands::checkin::CheckinGuard(tokio::sync::Mutex::new(())))
         .invoke_handler(tauri::generate_handler![
+            commands::backup::backup_unlock,
+            commands::backup::backup_action,
             commands::env::app_locate,
             commands::env::open_doubao_app,
             commands::env::open_trae_website,
@@ -681,6 +684,7 @@ fn main() {
             // 应用内定时调度器（Rust 原生方案，补充 Windows schtasks）：
             // 每日签到/巡检/续期到点补跑 + 积分余额每日快照（新增任务，补齐近 7 日消耗时序）
             tasks::scheduler::start(app.handle().clone());
+            backup::start(app.handle().clone());
 
             Ok(())
         })

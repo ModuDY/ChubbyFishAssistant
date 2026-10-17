@@ -1,5 +1,7 @@
 # 技术架构设计 — AI Work 助手 v3.7.0
 
+> 新增账号备份模块 `src-tauri/src/backup/`：独立后台调度、严格 SQLite/Stronghold 读取、Argon2id + AES-256-GCM、TLS SMTP、恢复事务与保险库补偿。协议与故障语义见 [加密账号备份](account-backup.md)。
+
 > 本文是技术侧唯一总纲：技术选型、架构分层、数据模型、进程契约、API 协议参考、开发运维与排错。
 > 产品侧（需求/交互/界面）见 [product-design.md](product-design.md)；未排期优化项见 [backlog.md](backlog.md)（WorkBuddy 接入蓝本协议事实已归并至本文附录 B）。
 > **完整 Tauri 命令契约表以根目录 `AGENT.md` §5 为权威**，本文只保留契约概览与协议细节，避免双维护漂移。

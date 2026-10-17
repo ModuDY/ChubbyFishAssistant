@@ -38,6 +38,8 @@ sha2 = "0.10"
 argon2 = "0.5"
 # 豆包 Chromium cookie v10 解密（AES-256-GCM，doubao_session 诊断/探活兜底）
 aes-gcm = "0.10"
+lettre = { version = "=0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
+zeroize = "1"
 # F-70/F-78：Trae 客户端 tc 信封解密（AES-128-CBC，提取 OAuth 设备 EC P-256 私钥）
 # + ExchangeToken DeviceProof 签名（ECDSA P-256/SHA-256，服务端 20405 Device proof required）
 aes = "0.8"

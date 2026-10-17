@@ -159,6 +159,8 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 
 // 所有 invoke 封装集中于此，字段名严格遵循 Rust 端 snake_case 约定。
 export const api = {
+  backupUnlock: (password: string) => invoke<string>('backup_unlock', { password }),
+  backupAction: <T>(session: string, request: Record<string, unknown>) => invoke<T>('backup_action', { session, request }),
   env: {
     // TraeWork 合并后唯一客户端检测（原 env_check 已删，统一走 Trae CN 通道）
     check: () => invoke<EnvStatus>('env_check_trae_cn'),

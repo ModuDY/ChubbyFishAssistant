@@ -5,6 +5,7 @@ import { Copy, Minus, Square, X } from 'lucide-react';
 import { useAppStore } from '../store';
 import { Modal } from './ui';
 import { APP_NAME } from '../lib/about';
+import BackupDialog from './backup/BackupDialog';
 
 const win = getCurrentWindow();
 
@@ -38,6 +39,7 @@ export function BrandMark({ size = 24, iconSize = 14 }: { size?: number; iconSiz
 export default function TitleBar() {
   const [showCloseConfirm, setShowCloseConfirm] = useState(false);
   const [maximized, setMaximized] = useState(false);
+  const [showBackup, setShowBackup] = useState(false);
   const proxyRunning = useAppStore((s) => s.proxy.running);
 
   // issue #46：跟踪窗口真实最大化状态——toggleMaximize 在无边框窗口 hide/show 后
@@ -67,12 +69,13 @@ export default function TitleBar() {
       <div
         className="flex h-9 shrink-0 items-center justify-between border-b border-slate-200 bg-slate-50 pl-3 pr-1 dark:border-zinc-800 dark:bg-zinc-950"
       >
-        <div data-tauri-drag-region className="flex flex-1 items-center gap-2">
+        <button type="button" className="flex items-center gap-2" onMouseDown={(e) => e.stopPropagation()} onClick={() => setShowBackup(true)} aria-label={APP_NAME}>
           <BrandMark />
           <span className="text-sm font-semibold text-slate-700 dark:text-zinc-200">
             {APP_NAME}
           </span>
-        </div>
+        </button>
+        <div data-tauri-drag-region className="h-full flex-1" />
         <div className="flex items-center">
           {/* onMouseDown 阻止冒泡：否则事件冒泡到外层 data-tauri-drag-region，Tauri 会启动窗口拖拽而吞掉 click，导致最小/最大化/关闭无响应 */}
           <button
@@ -104,6 +107,7 @@ export default function TitleBar() {
         </div>
       </div>
 
+      {showBackup && <BackupDialog onClose={() => setShowBackup(false)} />}
       <Modal
         open={showCloseConfirm}
         onClose={() => setShowCloseConfirm(false)}

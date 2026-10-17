@@ -157,7 +157,7 @@ pub fn creds_of(source: &Value) -> QoderCreds {
 /// token store 读改写互斥：load→merge→save 非原子，签到/积分/刷新/导入多通道
 /// 并发写会互相覆盖丢更新（last-writer-wins 抹掉彼此的新 token）。进程内全局锁
 /// 串行化表级读改写；仅持锁做本地 IO，不覆盖网络请求路径（无死锁面）。
-static TOKEN_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static TOKEN_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 每账号刷新互斥（审查 H-1）：签到/积分/定时兜底/401 自愈多通道并发触发同一账号
 /// `ensure_fresh` 时，两个线程可能同时拿旧 refresh_token/PAT 换新 token——后落库者

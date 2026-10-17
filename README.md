@@ -55,7 +55,7 @@ Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 1
 - **6 层设备标识重置**：machineid / storage.json 遥测 / aha.device / 注册表 MachineGuid / webview 追踪数据 / aha TinyStorage
 - **快照管理**：查看/备份/恢复/删除账号登录态快照（各应用独立管理）；豆包/WorkBuddy 对话数据独立备份恢复与导出；Qoder / Trae 账号池加密导入导出
 - **暗色模式**：6 套主题，图表动态适配
-- **数据全部本地存储**，不上传任何服务器
+- **账号主数据本地加密存储**；[加密邮件备份](docs/account-backup.md)默认开启，配置 SMTP 授权码后将全部托管账号的加密附件发送到指定邮箱，可关闭
 
 ## 开发
 

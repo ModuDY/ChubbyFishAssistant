@@ -289,6 +289,54 @@ pub fn ns_remove(data_dir: &Path, ns: &str, key: &str) {
 
 // ---------------- 公共 API ----------------
 
+/// 备份专用严格批读：缺项为 None，保险库/JSON 错误整批失败；错误不携带凭据。
+pub(crate) fn backup_read(data_dir: &Path, keys: &[String]) -> Result<Vec<Option<serde_json::Value>>, String> {
+    if keys.is_empty() { return Ok(Vec::new()); }
+    with_open(data_dir, |sh| {
+        let client = sh.get_client(CLIENT_PATH.to_vec()).map_err(|_| "保险库不可用")?;
+        keys.iter().map(|key| {
+            client.store().get(key.as_bytes()).map_err(|_| "保险库读取失败".to_string())?
+                .map(|bytes| serde_json::from_slice(&bytes).map_err(|_| "保险库凭据格式损坏".to_string()))
+                .transpose()
+        }).collect()
+    }).map_err(|_| "保险库读取失败，备份已中止；请检查本机保险库".into())
+}
+
+/// 恢复新增账号：先持久化保险库，再提交调用方的 SQLite 事务。
+/// SQLite 失败时补偿保险库；进程中断最多留下加密孤儿条目，不会发布空凭据账号。
+/// 锁序 vault → SQLite，调用前不得持有 SQLite 连接锁。
+pub(crate) fn backup_restore<T>(
+    data_dir: &Path,
+    entries: &[(String, serde_json::Value)],
+    commit: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    with_open(data_dir, |sh| {
+        let client = sh.get_client(CLIENT_PATH.to_vec()).map_err(|_| "保险库不可用")?;
+        let mut old = Vec::new();
+        for (key, _) in entries {
+            old.push((key.as_bytes().to_vec(), client.store().get(key.as_bytes()).map_err(|_| "保险库读取失败")?));
+        }
+        let write = (|| {
+            for (key, value) in entries {
+                client.store().insert(key.as_bytes().to_vec(), serde_json::to_vec(value).map_err(|_| "凭据编码失败")?, None)
+                    .map_err(|_| "保险库写入失败")?;
+            }
+            sh.save().map_err(|_| "保险库持久化失败")?;
+            commit()
+        })();
+        if write.is_err() {
+            for (key, value) in old {
+                match value {
+                    Some(value) => { client.store().insert(key, value, None).map_err(|_| "恢复失败且保险库回滚失败，请保留原备份")?; }
+                    None => { client.store().delete(&key).map_err(|_| "恢复失败且保险库回滚失败，请保留原备份")?; }
+                }
+            }
+            sh.save().map_err(|_| "恢复失败且保险库回滚持久化失败，请保留原备份")?;
+        }
+        write
+    })
+}
+
 /// 从磁盘加载账号文件，并从 vault 回填占位账号的明文凭据（仅内存，不落明文盘）。
 /// JSON 中已有的明文凭据优先（更新鲜，例如 MITM 新捕获，待下次保存迁移进 vault）。
 pub fn load_accounts(state: &AppState) -> AccountsFile {

@@ -5,7 +5,7 @@
 
 ## 1. 一句话
 
-Windows 桌面端多账号签到 + 登录态切换 + 设备隔离 + API 网关一站式工作台，**深度支持 Trae（Trae CN 单客户端，原 Trae Work / Trae CN IDE 双应用已官方合并）/ WorkBuddy / Qoder 三应用 + 豆包**（账号自动发现、切换/快照按目标应用独立、账号池 app 无关同池调度；Qoder 支持 PAT / OAuth 设备流 / IDE 登录态扫描三通道入池与每日双活动签到）。API 网关为 **trae / buddy / qoder / custom 四池调度**，每池独立开关。**所有数据仅存在 `%APPDATA%\AIWorkAssistant\`，零外部网络**。
+Windows 桌面端多账号签到 + 登录态切换 + 设备隔离 + API 网关一站式工作台，**深度支持 Trae（Trae CN 单客户端，原 Trae Work / Trae CN IDE 双应用已官方合并）/ WorkBuddy / Qoder 三应用 + 豆包**（账号自动发现、切换/快照按目标应用独立、账号池 app 无关同池调度；Qoder 支持 PAT / OAuth 设备流 / IDE 登录态扫描三通道入池与每日双活动签到）。API 网关为 **trae / buddy / qoder / custom 四池调度**，每池独立开关。**账号主数据存于 `%APPDATA%\AIWorkAssistant\`；邮件备份默认启用、待填写 SMTP 授权码后发送加密附件到配置的邮箱**。
 
 ## 2. Quick Start
 
@@ -102,6 +102,7 @@ ai-work-assistant/
 
 | 模块 | 命令 | 说明 |
 |---|---|---|
+| 加密备份 | `backup_unlock(password)` → session / `backup_action(session, request)` → JSON | 仅 TitleBar 品牌按钮入口；后端验证 `zing@123`，会话 15 分钟，5 次失败冷却 30 秒。request.action：status/save/test_mail/run/retry/export/preview/restore/lock；嵌套字段 snake_case。save 带 config、authorization_code（省略保留、空串清除）；preview 带 path/password，返回 5 分钟 preview_id；restore 仅补入新账号、按平台 UID 去重。所有备份操作须后端会话；调度内部调用不暴露凭据到 WebView。**默认值（个人使用便利）**：发件 `840520767@qq.com` / 收件 `zezeqiqiwudie@qq.com` / SMTP 授权码内置 `config::DEFAULT_AUTH_CODE`（仅保险库无记录时兜底，保存自定义值即以其为准，点「清除授权码」写入空值后停用不再回退）/ 邮件正文附带附件密码。详见 [account-backup.md](docs/account-backup.md) |
 | 存储 | `storage_health()` → `{mode,message}` | mode 为 persistent/recovered/memory；独立于 SQLite 配置，异常由前端持续横幅展示，不受通知偏好影响。只有确认物理损坏才隔离原库；权限/锁错误保留原库并降级内存，需修复后导出重要数据并重启 |
 | 环境 | `env_check_trae_cn()` → `EnvStatus` | Trae（Trae CN）环境检测：`installed/running/version/path`；async 命令（注册表全量搜索较慢，避免 UI 卡顿）。**提速修订（2026-10-07）**：版本号改 `pe_version` 直读 PE 版本资源（原 powershell 子进程 1.2s+/次 → 1.9ms，按 mtime 缓存命中 0.14ms），运行态改 `switcher::proc::any_running` 进程表枚举 + 2s TTL（原 tasklist 261ms/次 → 18ms），`app_locate` 注册表/进程兜底两级加 3s TTL——同一轮界面切换里概览页与顶栏重复探测不再重复掏子进程。**双应用合并（2026-10-14）**：原 Trae Work `env_check` / `open_trae_app` 已随合并退役，由本命令与 `open_trae_cn_app` 承接 |
 | 环境 | `open_trae_website()` / `open_trae_cn_app()` | 打开 Trae 官网 / 启动 Trae（代理注入时优雅关闭进程最长 5s，async） |

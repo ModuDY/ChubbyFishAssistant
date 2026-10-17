@@ -1635,3 +1635,52 @@ export interface StorageHealth {
   mode: 'persistent' | 'recovered' | 'memory' | 'unavailable';
   message: string | null;
 }
+export interface AccountBackupConfig {
+  enabled: boolean;
+  sender: string;
+  recipient: string;
+  smtp_host: string;
+  smtp_port: number;
+  interval_hours: number;
+  daily_time: string;
+}
+
+export interface AccountBackupRun {
+  id: string;
+  created_at: string;
+  status: string;
+  total: number;
+  missing_credentials: number;
+  message: string;
+  attempt: number;
+  next_retry: number | null;
+  schedule_key: string | null;
+}
+
+export interface AccountBackupStatus {
+  config: AccountBackupConfig;
+  smtp_configured: boolean;
+  /** 授权码是否来自内置默认值（未保存过自定义授权码） */
+  smtp_builtin: boolean;
+  status: string;
+  history: AccountBackupRun[];
+  scope: 'all';
+  retention: number;
+  runtime: { checked_at?: string; error?: string | null } | null;
+}
+
+export interface AccountBackupPreview {
+  preview_id: string;
+  created_at: string;
+  total: number;
+  new_accounts: number;
+  skipped: number;
+  accounts: {
+    platform: 'trae' | 'buddy' | 'qoder' | 'doubao';
+    name: string;
+    has_credential: boolean;
+    has_refresh_token: boolean;
+    expires_at: string | number | null;
+    will_add: boolean;
+  }[];
+}
