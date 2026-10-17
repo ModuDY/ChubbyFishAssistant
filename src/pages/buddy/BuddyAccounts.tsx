@@ -248,10 +248,18 @@ export default function BuddyAccounts() {
     return accounts.filter((a) => a.group_id === filter);
   }, [accounts, filter]);
 
-  const refresh = useCallback(async () => {
+  /**
+   * 拉取账号列表与关联状态。
+   *
+   * `freshCredits`：积分查询是否绕过后端 ≥5min 缓存。仅「刷新」按钮传 true——
+   * 手动刷新若仍命中缓存，积分/会员套餐列不会有任何变化，用户感知为「点了没反应」；
+   * 挂载/切号事件回刷保持缓存语义，避免每次进页面都全量拉取。
+   */
+  const refresh = useCallback(async (opts?: { freshCredits?: boolean }) => {
     setLoading(true);
     try {
-      const accs = await api.workbuddy.accountsList();
+      // 最小可见时长：本地命中时整轮可能 <100ms，加载态一闪而过等同无反馈
+      const accs = await withMinDelay(api.workbuddy.accountsList(), 300);
       setAccounts(accs);
       // 会话备份状态徽标：逐账号轻量查询 chatdata_info（按当前会话域，经 ref 取最新值）；
       // 任一失败仅该账号不显示徽标（纯状态降级，不阻断列表）
@@ -265,16 +273,17 @@ export default function BuddyAccounts() {
         .cliStatus()
         .then((s) => setCliActiveId(s.active_account_id))
         .catch(() => setCliActiveId(null));
-      // 积分缓存查询（≥5min 缓存，失败不阻断列表展示）
+      // 积分查询（默认 ≥5min 缓存，失败不阻断列表展示；手动刷新时强制取新）
       api.workbuddy
-        .creditsFetch()
+        .creditsFetch(undefined, opts?.freshCredits ?? false)
         .then((r: WbCreditsResult) => {
           const m = new Map<string, WbCreditPackage[]>();
           for (const a of r.accounts) m.set(a.user_id, a.packages ?? []);
           setCredits(m);
-          // 套餐回填发生在积分拉取链路（payment-type → edition_type，仅补空）：
-          // 静默重取列表刷新会员套餐列（有新回填时才与原列表不同，无副作用）
-          if (accs.some((a) => !a.edition_type)) {
+          // 套餐回填发生在积分拉取链路（payment-type → edition_type，仅补空）；
+          // 手动刷新（freshCredits）时积分已写回账号池，必须重取列表才能让
+          // 余额/会员套餐列反映新值——只按 edition 判空重取会让「刷新」看着没反应
+          if (opts?.freshCredits || accs.some((a) => !a.edition_type)) {
             api.workbuddy
               .accountsList()
               .then((fresh) => setAccounts(fresh))
@@ -783,7 +792,12 @@ export default function BuddyAccounts() {
         }
         actions={
           <>
-            <button onClick={() => void refresh()} className="btn-outline" disabled={loading}>
+            <button
+              onClick={() => void refresh({ freshCredits: true })}
+              className="btn-outline"
+              disabled={loading}
+              title="重新读取账号列表，并强制刷新积分与会员套餐（绕过 5 分钟缓存）"
+            >
               <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> 刷新
             </button>
             <button
