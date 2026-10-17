@@ -21,6 +21,12 @@ pub const INVITE_LINK: &str =
 pub fn device_reset(state: State<AppState>, user_id: String) -> Result<(), String> {
     // SQLite 化（P3）：device_map.json → device_map 表
     let store = crate::store::db(&state.data_dir);
+    // 整表 load→remove→save 必须持 DEVICE_MAP_LOCK（叶子锁）：与签到
+    // get_device_for 写回、OAuth writeback_oauth_device、一键重派并发时，
+    // 无锁的读改写会用旧副本整表覆盖，把其它账号刚写入的设备指纹抹掉
+    let _g = crate::store::docs::DEVICE_MAP_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut map: DeviceMap = crate::store::docs::device_map_load(&store);
     map.remove(&user_id);
     crate::store::docs::device_map_save(&store, &map)?;

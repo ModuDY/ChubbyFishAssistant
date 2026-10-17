@@ -245,6 +245,13 @@ pub fn prepare_llm_chat_body(
     obj_mut.insert("app_id".into(), json!(super::APP_ID));
     obj_mut.insert("package_type".into(), json!("stable_cn"));
 
+    // tool 配对清理（出站前最后一道防线）：调用与结果必须双侧齐全，否则上游
+    // 整条请求 400（11101/11148）。客户端工具执行失败留下的坏历史会在每次重试
+    // 时重放——这里按 id 对称裁剪，让会话自愈
+    if let Some(msgs) = obj_mut.get_mut("messages").and_then(Value::as_array_mut) {
+        super::tool_pairing::normalize_tool_pairing(msgs);
+    }
+
     serde_json::to_vec(&obj).unwrap_or_else(|_| src.to_vec())
 }
 
@@ -722,6 +729,8 @@ mod tests {
                     {"role": "user", "content": "see Main branch (you will usually use this with PRs)"},
                     {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
                         "function": {"name": "f", "arguments": "{\"q\":\"Main branch (you will usually use this with PRs)\"}"}}]},
+                    // 配对清理会裁掉「有调用无结果」的条目，修复类用例须给出结果
+                    {"role": "tool", "tool_call_id": "c1", "content": "ok"},
                 ],
                 "tools": [{"type": "function", "function": {"name": "f", "description": "Main branch (you will usually use this with PRs)", "parameters": {}}}],
             })

@@ -841,10 +841,8 @@ fn run_wb_stream(
                     match retry_plan(status, &resp_body, same_attempt, retry_after) {
                         RetryAction::RetrySame { delay_ms } => {
                             same_attempt += 1;
-                            std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(60_000)));
-                            // 断连检测：重试等待期间客户端离开则终止，不再占用该账号并发槽
-                            // （审查 M5：补记失败终态用量）
-                            if tx.is_closed() {
+                            // 可中断 + 有时限的退避（客户端断连即刻退出，不长期占用阻塞线程）
+                            if !super::wait_backoff_interruptible(delay_ms, || tx.is_closed()) {
                                 let duration_ms = start_ts.elapsed().as_millis() as u64;
                                 state.record_usage(true, model, &picked.uid, key_id, false, true, duration_ms, 0, 0);
                                 return;
@@ -1196,7 +1194,8 @@ pub async fn wb_aggregate_chat(
                         match retry_plan(status, &resp_body, same_attempt, retry_after) {
                             RetryAction::RetrySame { delay_ms } => {
                                 same_attempt += 1;
-                                std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(60_000)));
+                                // 非流式路径：无下行通道可查断连，但同样限制单次等待上限
+                                super::wait_backoff_interruptible(delay_ms, || false);
                                 continue;
                             }
                             RetryAction::SwitchKey => {
@@ -1595,9 +1594,8 @@ pub async fn wb_tool_exec_chat(
                         match retry_plan(status, &resp_body, same_attempt, retry_after) {
                             RetryAction::RetrySame { delay_ms } => {
                                 same_attempt += 1;
-                                std::thread::sleep(std::time::Duration::from_millis(
-                                    delay_ms.min(60_000),
-                                ));
+                                // 非流式路径：同上限约束，避免长退避长期占用阻塞线程
+                                super::wait_backoff_interruptible(delay_ms, || false);
                                 continue;
                             }
                             RetryAction::SwitchKey => {

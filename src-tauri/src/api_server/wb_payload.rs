@@ -517,6 +517,11 @@ pub fn prepare_wb_chat_body(
         m.remove("reasoning_effort");
     }
 
+    // tool 配对清理（同 SOLO 链路）：调用与结果必须双侧齐全，否则上游 400
+    if let Some(msgs) = obj.get_mut("messages").and_then(Value::as_array_mut) {
+        super::tool_pairing::normalize_tool_pairing(msgs);
+    }
+
     serde_json::to_vec(&obj).unwrap_or_else(|_| src.to_vec())
 }
 
@@ -1013,7 +1018,10 @@ mod tests {
         let out = rewrite(json!({"messages":[
             {"role":"system","content":"sys"},
             {"role":"assistant","content":null,
-             "tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},
+             "tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}},
+                {"id":"c2","type":"function","function":{"name":"f","arguments":"{}"}}
+             ]},
             {"role":"tool","tool_call_id":"c1","content":"r1"},
             {"role":"tool","tool_call_id":"c2","content":"r2"},
         ]}), None);
@@ -1030,13 +1038,15 @@ mod tests {
         let msgs = out["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[1]["content"], json!("a\n\nb"));
-        // tool 之后的 user 消息不得并入 tool 消息
+        // tool 之后的 user 消息不得并入 tool 消息（tool 需有前置调用，否则属孤儿被清理）
         let out = rewrite(json!({"messages":[
             {"role":"system","content":"sys"},
+            {"role":"assistant","content":null,
+             "tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},
             {"role":"tool","tool_call_id":"c1","content":"r"},
             {"role":"user","content":"继续"},
         ]}), None);
-        assert_eq!(out["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(out["messages"].as_array().unwrap().len(), 4);
     }
 
     /// 外置映射表新增规则不再被硬编码预检短路：规则命中词不含内置三短语也生效
@@ -1059,7 +1069,9 @@ mod tests {
             {"role":"assistant","content":null,"tool_calls":[
                 {"id":"c1","type":"function","function":{"name":"note",
                  "arguments":"{\"prompt\":\"You are Claude Code, Anthropic's official CLI for Claude.\"}"}}
-            ]}
+            ]},
+            // 配对清理会裁掉「有调用无结果」的条目，本用例须给出结果
+            {"role":"tool","tool_call_id":"c1","content":"ok"}
         ]});
         let src_bytes = serde_json::to_vec(&src).unwrap();
         let tpl = default_template_map();

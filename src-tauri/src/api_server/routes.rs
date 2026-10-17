@@ -1672,9 +1672,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             RetryAction::RetrySame { delay_ms } => {
                                 // 同账号重试：不 note_error 不冷却
                                 same_attempt += 1;
-                                std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(60_000)));
-                                // 断连检测：重试等待期间客户端离开则终止（审查 M5：补记失败终态用量）
-                                if tx.is_closed() {
+                                // 可中断 + 有时限的退避：客户端断连即刻退出，
+                                // 且不再为 40s/60s 级退避长期占用阻塞线程
+                                if !super::wait_backoff_interruptible(delay_ms, || tx.is_closed()) {
                                     state.record_usage(
                                         false, &model, &picked.uid, &key_id, false, stream,
                                         start_ts.elapsed().as_millis() as u64, 0, 0,
@@ -2135,9 +2135,11 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                         // 分级重试策略表（T2.2/F-33 v1.2，与 wb_route 保持一致）
                         match retry_plan(status, &resp_body, same_attempt, retry_after) {
                             RetryAction::RetrySame { delay_ms } => {
-                                // 同账号重试：不 note_error 不冷却
+                                // 同账号重试：不 note_error 不冷却。
+                                // 非流式无下行通道可查断连，但仍要限制单次等待上限，
+                                // 避免长退避占满阻塞池
                                 same_attempt += 1;
-                                std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(60_000)));
+                                super::wait_backoff_interruptible(delay_ms, || false);
                                 continue;
                             }
                             RetryAction::SwitchKey => {

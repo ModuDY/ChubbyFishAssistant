@@ -1120,7 +1120,8 @@ fn run_qoder_stream(
                             // 审查修复：分段 sleep + 断连感知（原整段 sleep 最长 60s，
                             // 断连后仍空等；原 sleep 后的 is_closed 检查一并合并）
                             if !sleep_interruptible(
-                                Duration::from_millis(delay_ms.min(60_000)),
+                                // 与其它池同口径：退避等待设上限，避免长期占用阻塞线程
+                                Duration::from_millis(delay_ms.min(super::BACKOFF_WAIT_CAP_MS)),
                                 Some(tx),
                             ) {
                                 // 审查 M5：断连为请求终局，补记失败终态用量
@@ -1617,7 +1618,7 @@ pub async fn qoder_aggregate_chat(
                             RetryAction::RetrySame { delay_ms } => {
                                 same_attempt += 1;
                                 sleep_interruptible(
-                                    Duration::from_millis(delay_ms.min(60_000)),
+                                    Duration::from_millis(delay_ms.min(super::BACKOFF_WAIT_CAP_MS)),
                                     None,
                                 );
                                 continue;

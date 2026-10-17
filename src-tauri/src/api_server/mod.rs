@@ -21,6 +21,7 @@ pub mod retry;
 pub mod routes;
 pub mod server;
 pub mod sse;
+pub mod tool_pairing;
 pub mod unified_catalog;
 pub mod usage;
 pub mod wb_catalog;
@@ -730,6 +731,32 @@ pub fn finish_with_tools(upstream: &str, has_tools: bool) -> String {
     upstream.to_string()
 }
 
+/// 单次退避等待的上限（毫秒）。
+///
+/// 上游 503/529 的指数退避是 10/20/40s、429 还可能带 Retry-After（可到 60s）。
+/// 这些等待跑在**阻塞线程**上，原实现直接 `sleep` 满时长：客户端早就断开、
+/// 线程仍被占着，并发一多就会把阻塞池耗尽，表现为「所有 SSE 都不出字」。
+/// 超过该上限不再干等，提前重试或换号（重试次数上限不变）。
+pub const BACKOFF_WAIT_CAP_MS: u64 = 10_000;
+
+/// 可中断的退避等待：每 100ms 醒一次检查 `aborted()`，客户端断连即返回 false。
+///
+/// 返回 true = 等满；false = 期间被中断（调用方应终止本次请求）。
+/// 阻塞线程上的退避必须走这里，不要直接 `std::thread::sleep`。
+pub fn wait_backoff_interruptible(total_ms: u64, aborted: impl Fn() -> bool) -> bool {
+    const SLICE_MS: u64 = 100;
+    let mut left = total_ms.min(BACKOFF_WAIT_CAP_MS);
+    while left > 0 {
+        if aborted() {
+            return false;
+        }
+        let step = left.min(SLICE_MS);
+        std::thread::sleep(std::time::Duration::from_millis(step));
+        left -= step;
+    }
+    !aborted()
+}
+
 /// 聚合响应是否零内容（OpenAI chat / legacy text / Anthropic message 三形态）：
 /// 无正文 + 无工具调用即视为空完成（换号重试）。
 /// 注意：思考链（`reasoning_content` / Anthropic `thinking` 块）**不计入**交付物
@@ -797,6 +824,39 @@ pub fn stream_runtime() -> &'static tokio::runtime::Runtime {
             .build()
             .expect("stream runtime 初始化失败")
     })
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+
+    /// 退避等待必须设上限：上游 503/529 指数退避 40s、429 Retry-After 可达 60s，
+    /// 原实现整段 sleep 会长期占用阻塞线程
+    #[test]
+    fn long_backoff_is_capped() {
+        assert_eq!(BACKOFF_WAIT_CAP_MS, 10_000);
+        assert_eq!(60_000u64.min(BACKOFF_WAIT_CAP_MS), 10_000);
+        assert_eq!(3_000u64.min(BACKOFF_WAIT_CAP_MS), 3_000);
+    }
+
+    /// 客户端已断连：立即返回 false（原实现会先睡满退避再检查，最长 60s）
+    #[test]
+    fn abort_is_immediate_when_client_gone() {
+        let t = std::time::Instant::now();
+        assert!(!wait_backoff_interruptible(60_000, || true));
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(1),
+            "断连必须立刻退出，实际耗时 {:?}",
+            t.elapsed()
+        );
+    }
+
+    /// 无中断：短等待正常走完并返回 true；0 直接返回
+    #[test]
+    fn completes_when_not_aborted() {
+        assert!(wait_backoff_interruptible(0, || false));
+        assert!(wait_backoff_interruptible(150, || false));
+    }
 }
 
 #[cfg(test)]
