@@ -256,6 +256,9 @@ export default function BuddyAccounts() {
    * 挂载/切号事件回刷保持缓存语义，避免每次进页面都全量拉取。
    */
   const refresh = useCallback(async (opts?: { freshCredits?: boolean }) => {
+    // 手动刷新（按钮触发）需要明确的完成反馈：此前成功路径完全静默，
+    // 用户只能靠列表内容是否变化判断，感知上等同「点了没反应」
+    const manual = opts?.freshCredits ?? false;
     setLoading(true);
     try {
       // 最小可见时长：本地命中时整轮可能 <100ms，加载态一闪而过等同无反馈
@@ -275,22 +278,36 @@ export default function BuddyAccounts() {
         .catch(() => setCliActiveId(null));
       // 积分查询（默认 ≥5min 缓存，失败不阻断列表展示；手动刷新时强制取新）
       api.workbuddy
-        .creditsFetch(undefined, opts?.freshCredits ?? false)
+        .creditsFetch(undefined, manual)
         .then((r: WbCreditsResult) => {
           const m = new Map<string, WbCreditPackage[]>();
           for (const a of r.accounts) m.set(a.user_id, a.packages ?? []);
           setCredits(m);
           // 套餐回填发生在积分拉取链路（payment-type → edition_type，仅补空）；
-          // 手动刷新（freshCredits）时积分已写回账号池，必须重取列表才能让
-          // 余额/会员套餐列反映新值——只按 edition 判空重取会让「刷新」看着没反应
-          if (opts?.freshCredits || accs.some((a) => !a.edition_type)) {
-            api.workbuddy
+          // 手动刷新时积分已写回账号池，必须重取列表才能让余额/会员套餐列反映
+          // 新值——只按 edition 判空重取会让「刷新」看着没反应
+          if (manual || accs.some((a) => !a.edition_type)) {
+            void api.workbuddy
               .accountsList()
-              .then((fresh) => setAccounts(fresh))
-              .catch(() => {});
+              .then((fresh) => {
+                setAccounts(fresh);
+                if (manual) {
+                  pushToast('success', `刷新完成：${fresh.length} 个账号，积分已更新`);
+                }
+              })
+              .catch(() => {
+                if (manual) pushToast('success', `刷新完成：${accs.length} 个账号`);
+              });
+          } else if (manual) {
+            pushToast('success', `刷新完成：${accs.length} 个账号`);
           }
         })
-        .catch(() => pushToast('warn', '积分缓存查询失败，积分包列为空'));
+        .catch(() => {
+          pushToast(
+            'warn',
+            manual ? '积分刷新失败（账号列表已更新）' : '积分缓存查询失败，积分包列为空',
+          );
+        });
       // 今日签到状态（失败静默，不阻断列表）
       api.workbuddy
         .checkinResults(1)
