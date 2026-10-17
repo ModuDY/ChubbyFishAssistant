@@ -475,17 +475,24 @@ mod tests {
     #[test]
     fn scheduling_and_bounded_retry() {
         let mut c = Config::default();
-        let before: DateTime<Local> = DateTime::parse_from_rfc3339("2026-10-17T09:29:00+08:00")
-            .unwrap()
-            .with_timezone(&Local);
-        // Local timezone in CI may differ: construct local times explicitly.
+        // 时刻从默认配置派生（原硬编码 09:29/09:30 与现默认 15:30 脱节，
+        // 导致「到点」断言恒为 None）
         use chrono::TimeZone;
-        let before = Local
-            .from_local_datetime(&before.naive_local().date().and_hms_opt(9, 29, 0).unwrap())
-            .single()
-            .unwrap();
-        assert!(schedule_key(&c, before).is_none());
-        assert!(schedule_key(&c, before + chrono::Duration::minutes(1)).is_some());
+        let daily = chrono::NaiveTime::parse_from_str(&c.daily_time, "%H:%M").unwrap();
+        let day = Local::now().date_naive();
+        let at = |t: chrono::NaiveTime| {
+            Local
+                .from_local_datetime(&day.and_time(t))
+                .single()
+                .expect("本地时间应唯一")
+        };
+        let before = at(daily - chrono::Duration::minutes(1));
+        assert!(schedule_key(&c, before).is_none(), "每日时刻前不得触发");
+        assert!(
+            schedule_key(&c, at(daily)).is_some(),
+            "到点后必须触发（daily_time={}）",
+            c.daily_time
+        );
         c.enabled = false;
         assert!(schedule_key(&c, before + chrono::Duration::hours(2)).is_none());
         let mut run = Run {

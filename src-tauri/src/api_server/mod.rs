@@ -669,9 +669,16 @@ pub fn classify_solo_error(code: i64, msg: &str) -> ErrKind {
 
 // ==================== 空完成识别（issue #57：影子风控） ====================
 
-/// 空完成哨兵码：上游 HTTP 200 正常收流但零内容（影子风控静默拦截 / 上游异常）。
+/// 空完成哨兵码：上游 HTTP 200 正常收流但无可交付内容（影子风控静默拦截 /
+/// 上游异常 / 「思考完就停」）。
 /// 取负数避免与上游业务码（正整数）冲突；SSE 转换层不发收尾帧、以该哨兵上抛，
 /// 调用方按可重试失败换号处理（is_empty_completion 识别）
+///
+/// 「无可交付内容」判据：正文与工具调用皆空。思考链（reasoning_content /
+/// Anthropic thinking 块）**不计入**——下游 AI SDK 系客户端只认正文与
+/// tool_calls，只吐思考链的响应会被判为「模型返回数据异常，未输出最终回答」，
+/// 故与零内容同口径处置；若思考增量已下发（sent_any），则改为就地发明确
+/// 错误帧收束，避免换号向同一 SSE 流拼接第二份响应。
 ///
 /// # 处置口径（有意按路径分轨，均为换号重试且 tried 集合有界无循环风险）
 ///
@@ -692,23 +699,29 @@ pub fn is_empty_completion(code: i64, msg: &str) -> bool {
 }
 
 /// 聚合响应是否零内容（OpenAI chat / legacy text / Anthropic message 三形态）：
-/// 无正文 + 无思考链 + 无工具调用即视为空完成（换号重试）。
+/// 无正文 + 无工具调用即视为空完成（换号重试）。
+/// 注意：思考链（`reasoning_content` / Anthropic `thinking` 块）**不计入**交付物
+/// ——上游「思考完就停」时正文为空，下游只看到一条空回复（AI SDK 系客户端判为
+/// 「模型返回数据异常」），与流式路径的 has_visible 口径保持一致。
 /// legacy `message.function_call` 一并判定（防御性：聚合器当前会把
 /// function_call 归一为 tool_calls，此处兜底防未来透传形态漏判）
 pub fn aggregated_response_is_empty(r: &serde_json::Value) -> bool {
-    // Anthropic message：顶层 content 块数组
+    // Anthropic message：顶层 content 块数组（仅 thinking 块同样视为空）
     if let Some(blocks) = r.get("content").and_then(|c| c.as_array()) {
-        return blocks.is_empty();
+        return !blocks.iter().any(|b| {
+            b.get("type")
+                .and_then(|t| t.as_str())
+                .map_or(true, |t| t != "thinking")
+        });
     }
-    // OpenAI chat（message.content/reasoning_content/tool_calls/function_call）与
-    // legacy text（choices[0].text）统一判定（缺字段视为空）
+    // OpenAI chat（message.content/tool_calls/function_call）与 legacy text
+    // （choices[0].text）统一判定（缺字段视为空）
     let empty_at = |p: &str| -> bool {
         r.pointer(p)
             .and_then(|v| v.as_str())
             .map_or(true, str::is_empty)
     };
     empty_at("/choices/0/message/content")
-        && empty_at("/choices/0/message/reasoning_content")
         && r.pointer("/choices/0/message/tool_calls")
             .and_then(|t| t.as_array())
             .map_or(true, |a| a.is_empty())

@@ -246,6 +246,10 @@ pub fn stream_forward_ex(
     // 真实内容标记（正文/思考链/工具调用任一非空）：空完成（影子风控）检测依据
     // （issue #57）；占位帧（Responses created / 空 delta chunk）不计入
     let mut has_content = false;
+    // 可交付输出标记（正文或工具调用）：思考链不是交付物。上游「思考完就停」
+    // 时 has_content 为真而本标记为假——下游 AI SDK 系客户端只认正文/tool_calls，
+    // 静默收尾会被判为「模型返回数据异常，未输出最终回答」，故按空完成处置
+    let mut has_visible = false;
     let mut usage: Option<Value> = None;
     let mut error_info: Option<(i64, String)> = None;
 
@@ -312,6 +316,36 @@ pub fn stream_forward_ex(
                 );
             }
         };
+    }
+
+    // 流内错误就地透传（按协议分组）：正文/思考链已流出后不得再换号重试
+    // （否则同一 SSE 流会拼接第二份响应），只能以明确的错误帧收束，
+    // 避免客户端把「静默截断」误判为数据异常
+    macro_rules! inline_error {
+        ($code:expr, $msg:expr) => {{
+            let m: String = $msg.to_string();
+            match proto {
+                crate::api_server::routes::Protocol::Anthropic => {
+                    let err = json!({"type":"error","error":{"type":"api_error","message":m}});
+                    send!(format!("event: error\ndata: {}\n\n", err));
+                }
+                crate::api_server::routes::Protocol::Responses => {
+                    resp_ensure_created!();
+                    // 流内错误 → response.failed（Responses 无 [DONE] 帧）
+                    let mut resp = responses_object(chat_id, model, "failed", vec![], None);
+                    resp["error"] = json!({"code": ($code).to_string(), "message": m});
+                    resp_send(tx, "response.failed", json!({
+                        "type": "response.failed",
+                        "response": resp,
+                    }));
+                }
+                _ => {
+                    let body = json!({"error":{"message":m,"type":"api_error","code":$code}});
+                    send!(format!("data: {}\n\n", body));
+                    send!("data: [DONE]\n\n");
+                }
+            }
+        }};
     }
 
     // 正常收尾序列（审查 P1-5）：上游 Done 与「EOF 断流但有内容」共用，
@@ -495,6 +529,25 @@ pub fn stream_forward_ex(
                     ));
                     break;
                 }
+                // 纯思考链收尾（正文与工具调用皆空）：不算可交付回复。上游正常
+                // 收流却只吐了 reasoning——客户端只认正文/tool_calls，若照常补
+                // 收尾帧会被判为「模型返回数据异常，未输出最终回答」（issue #57
+                // 口径扩展）。思考增量已流出时就地报错（换号会在同一流拼接第二
+                // 份响应）；未流出则交回调用方换号重试
+                if !has_visible {
+                    if sent_any {
+                        inline_error!(
+                            super::EMPTY_COMPLETION_CODE,
+                            super::EMPTY_COMPLETION_MSG.to_string()
+                        );
+                        failed_inline = true;
+                    }
+                    error_info = Some((
+                        super::EMPTY_COMPLETION_CODE,
+                        super::EMPTY_COMPLETION_MSG.to_string(),
+                    ));
+                    break;
+                }
                 // Done 与 EOF 断流共用收尾序列（P1-5 提取为 finish_stream!）
                 finish_stream!();
                 finished = true;
@@ -506,27 +559,7 @@ pub fn stream_forward_ex(
                     // 已有数据流出：就地透传错误并收尾（failed_inline 标记给调用方）；
                     // 空 message 兜底（issue #71）：inline 与延迟透传同防线
                     let msg = stream_msg_or_fallback(&msg, code);
-                    match proto {
-                        crate::api_server::routes::Protocol::Anthropic => {
-                            let err = json!({"type":"error","error":{"type":"api_error","message":msg}});
-                            send!(format!("event: error\ndata: {}\n\n", err));
-                        }
-                        crate::api_server::routes::Protocol::Responses => {
-                            // 流内错误 → response.failed（Responses 无 [DONE] 帧）
-                            resp_ensure_created!();
-                            let mut resp = responses_object(chat_id, model, "failed", vec![], None);
-                            resp["error"] = json!({"code": code.to_string(), "message": msg});
-                            resp_send(tx, "response.failed", json!({
-                                "type": "response.failed",
-                                "response": resp,
-                            }));
-                        }
-                        _ => {
-                            let body = json!({"error":{"message":msg,"type":"api_error","code":code}});
-                            send!(format!("data: {}\n\n", body));
-                            send!("data: [DONE]\n\n");
-                        }
-                    }
+                    inline_error!(code, msg);
                     sent_any = true;
                     failed_inline = true;
                 } else {
@@ -545,17 +578,24 @@ pub fn stream_forward_ex(
                     usage = Some(x);
                 }
                 // 真实内容标记（issue #57 空完成检测）：空 delta chunk 不计入
-                if delta.get("content").and_then(|c| c.as_str()).map_or(false, |s| !s.is_empty())
-                    || delta
-                        .get("reasoning_content")
-                        .and_then(|c| c.as_str())
-                        .map_or(false, |s| !s.is_empty())
-                    || delta
-                        .get("tool_calls")
-                        .and_then(|t| t.as_array())
-                        .map_or(false, |a| !a.is_empty())
-                {
+                let frame_text = delta
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .map_or(false, |s| !s.is_empty());
+                let frame_tools = delta
+                    .get("tool_calls")
+                    .and_then(|t| t.as_array())
+                    .map_or(false, |a| !a.is_empty());
+                let frame_thinking = delta
+                    .get("reasoning_content")
+                    .and_then(|c| c.as_str())
+                    .map_or(false, |s| !s.is_empty());
+                if frame_text || frame_thinking || frame_tools {
                     has_content = true;
+                }
+                // 可交付输出：仅正文/工具调用计入（思考链不构成交付物）
+                if frame_text || frame_tools {
+                    has_visible = true;
                 }
                 if proto == crate::api_server::routes::Protocol::Anthropic {
                     anthropic_start(tx, &mut message_started, chat_id, model);
@@ -801,9 +841,19 @@ pub fn stream_forward_ex(
     // sse.rs SOLO finish_stream 语义）：已有内容 → 按协议补齐终止帧，避免
     // 严格客户端因未闭合的 content_block / message 项挂起；零内容不伪装
     // 成功，走下方空完成哨兵换号重试
-    if error_info.is_none() && !finished && !failed_inline && has_content && !tx.is_closed() {
-        finish_stream!();
-        sent_any = true;
+    if error_info.is_none() && !finished && !failed_inline && !tx.is_closed() {
+        if has_visible {
+            finish_stream!();
+            sent_any = true;
+        } else if has_content {
+            // 纯思考链断流：同 Done 口径，不以「正常完成」伪装（否则客户端拿到
+            // 一条无正文的完整响应）→ 就地报错收束
+            inline_error!(
+                super::EMPTY_COMPLETION_CODE,
+                super::EMPTY_COMPLETION_MSG.to_string()
+            );
+            failed_inline = true;
+        }
     }
 
     // 空完成兜底（issue #57）：EOF 且零内容零错误 → 哨兵上抛；判定与客户端
@@ -1464,6 +1514,79 @@ mod tests {
         assert!(sent_any);
         assert!(!failed_inline);
         assert!(usage.is_none(), "上游未下发 usage 时不得伪造");
+    }
+
+    /// 「思考完就停」：正文与工具调用皆空、仅思考链有内容 —— 上游 HTTP 200
+    /// 正常收流，但客户端只认正文/tool_calls，若照常补收尾帧会被判为「模型
+    /// 返回数据异常」。此处按空完成处置：思考增量已流出 → 就地发错误帧 +
+    /// [DONE]，failed_inline 置位（不换号，避免同一流拼接第二份响应）
+    #[test]
+    fn stream_forward_reasoning_only_flags_empty_completion() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let src = lines(&[
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"想一想\"}}]}",
+            "",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+            "",
+            "data: [DONE]",
+            "",
+        ]);
+        let (err, sent_any, failed_inline, _u) = stream_forward_ex(
+            src, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m", &HashSet::new(),
+        );
+        let (code, msg) = err.expect("纯思考链收尾必须上抛空完成哨兵");
+        assert!(crate::api_server::is_empty_completion(code, &msg));
+        assert!(sent_any, "思考增量已流出");
+        assert!(failed_inline, "已流出时须就地报错，不得换号");
+        drop(tx);
+        let mut body = String::new();
+        while let Ok(frame) = rx.try_recv() {
+            body.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+        }
+        assert!(body.contains("empty completion"), "必须下发明确错误帧，不能静默收尾");
+        assert!(body.ends_with("data: [DONE]\n\n"), "错误帧后仍需 [DONE] 收尾");
+    }
+
+    /// 对照组：思考链之后有正文 → 正常完成（不得误判空完成）
+    #[test]
+    fn stream_forward_reasoning_then_content_is_success() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let src = lines(&[
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"想一想\"}}]}",
+            "",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"答案\"}}]}",
+            "",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+            "",
+            "data: [DONE]",
+            "",
+        ]);
+        let (err, sent_any, failed_inline, _u) = stream_forward_ex(
+            src, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m", &HashSet::new(),
+        );
+        assert!(err.is_none(), "有正文不得判空完成");
+        assert!(sent_any);
+        assert!(!failed_inline);
+    }
+
+    /// 对照组：仅工具调用无正文 → 同样是可交付输出（不得误判空完成）
+    #[test]
+    fn stream_forward_tool_calls_only_is_success() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let src = lines(&[
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"t1\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}}]}",
+            "",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+            "",
+            "data: [DONE]",
+            "",
+        ]);
+        let (err, sent_any, failed_inline, _u) = stream_forward_ex(
+            src, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m", &HashSet::new(),
+        );
+        assert!(err.is_none(), "工具调用不得判空完成");
+        assert!(sent_any);
+        assert!(!failed_inline);
     }
 
     /// 流内失败标记对 Anthropic 协议同样生效（event: error 就地下发）

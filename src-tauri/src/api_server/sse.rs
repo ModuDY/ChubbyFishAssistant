@@ -178,6 +178,10 @@ fn stream_convert_src(
     // 真实内容标记（正文/思考链/工具调用任一非空）；占位 role chunk 不计入。
     // 空完成（影子风控）检测依据（issue #57）
     let mut has_content = false;
+    // 可交付输出标记（正文或工具调用）：思考链不是交付物。上游「思考完就停」
+    // 时 has_content 为真而本标记为假——下游 AI SDK 系客户端只认正文/tool_calls，
+    // 静默收尾会被判为「模型返回数据异常，未输出最终回答」，故按空完成处置
+    let mut has_visible = false;
     let mut error_info: Option<(i64, String)> = None;
 
     let write_chunk = |delta: Value, finish: &str, pending_usage: &Option<Value>| -> String {
@@ -258,6 +262,10 @@ fn stream_convert_src(
                     }
                     if !delta.is_empty() {
                         has_content = true;
+                        // 可交付输出：仅正文/工具调用计入（思考链不构成交付物）
+                        if delta.contains_key("content") || delta.contains_key("tool_calls") {
+                            has_visible = true;
+                        }
                         let data = write_chunk(Value::Object(delta), "", &pending_usage);
                         // 客户端断连检测：发送失败即退出读循环，释放上游与账号并发槽
                         if sender.blocking_send(Ok(bytes::Bytes::from(data))).is_err() {
@@ -292,6 +300,28 @@ fn stream_convert_src(
                             crate::api_server::EMPTY_COMPLETION_CODE,
                             super::EMPTY_COMPLETION_MSG.to_string(),
                         ));
+                        break;
+                    }
+                    if !has_visible {
+                        // 纯思考链收尾（正文与工具调用皆空）：不算可交付回复。
+                        // 下游只认正文/tool_calls，照常补收尾帧会被判为「模型返回
+                        // 数据异常」。思考增量已流出，换号会在同一流拼接第二份响应，
+                        // 故就地发错误帧 + [DONE] 收束（调用方按已流出处置）
+                        let code = crate::api_server::EMPTY_COMPLETION_CODE;
+                        let msg = super::EMPTY_COMPLETION_MSG.to_string();
+                        error_info = Some((code, msg.clone()));
+                        let error_chunk = json!({
+                            "error": {"message": msg, "type": "api_error", "code": code}
+                        });
+                        if sender
+                            .blocking_send(Ok(bytes::Bytes::from(format!("data: {}\n\n", error_chunk))))
+                            .is_err()
+                        {
+                            break;
+                        }
+                        let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+                        saw_done = true;
+                        sent_any = true;
                         break;
                     }
                     let data = write_chunk(json!({}), &ev.finish_reason, &pending_usage);
@@ -338,6 +368,19 @@ fn stream_convert_src(
                 crate::api_server::EMPTY_COMPLETION_CODE,
                 super::EMPTY_COMPLETION_MSG.to_string(),
             ));
+        } else if !has_visible {
+            // 纯思考链断流：同 done 口径就地报错，不伪装成正常完成
+            let code = crate::api_server::EMPTY_COMPLETION_CODE;
+            let msg = super::EMPTY_COMPLETION_MSG.to_string();
+            error_info = Some((code, msg.clone()));
+            let error_chunk = json!({
+                "error": {"message": msg, "type": "api_error", "code": code}
+            });
+            let _ = sender.blocking_send(Ok(bytes::Bytes::from(format!(
+                "data: {}\n\n",
+                error_chunk
+            ))));
+            let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
         } else {
             let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
         }
@@ -1318,6 +1361,28 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_only_done_reports_empty_completion_inline() {
+        // 「思考完就停」：只有 reasoning_content，无正文/tool_calls。上游正常
+        // 收流但客户端拿不到可交付内容 → 就地发错误帧 + [DONE]（思考已流出，
+        // 换号会在同一流拼接第二份响应）
+        let input = "event: output\ndata: {\"reasoning_content\":\"想一想\"}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let (error_info, sent_any, _) = stream_convert_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "c1",
+        );
+        let (code, msg) = error_info.expect("纯思考链收尾必须上抛空完成哨兵");
+        assert!(crate::api_server::is_empty_completion(code, &msg));
+        assert!(sent_any, "思考增量已流出");
+        let joined = collect_events(rx).join("\n");
+        assert!(joined.contains("想一想"), "思考增量照常转发");
+        assert!(joined.contains("empty completion"), "必须下发明确错误帧");
+        assert!(joined.ends_with("data: [DONE]"), "错误帧后仍需 [DONE] 收尾");
+    }
+
+    #[test]
     fn normal_done_with_output_not_flagged_empty() {
         // 对照组：有内容时 done 正常收尾，无哨兵且发 [DONE]
         let input = "event: output\ndata: {\"response\":\"hi\"}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
@@ -1368,6 +1433,20 @@ mod tests {
         // Anthropic 有文本块 → 非空
         let blocks = serde_json::json!({"content": [{"type": "text", "text": "hi"}]});
         assert!(!crate::api_server::aggregated_response_is_empty(&blocks));
+        // 仅思考链（OpenAI）：正文为空 → 视为空完成（口径同流式 has_visible）
+        let reasoning_only = serde_json::json!({
+            "choices": [{"message": {"content": "", "reasoning_content": "想一想"}, "finish_reason": "stop"}]
+        });
+        assert!(crate::api_server::aggregated_response_is_empty(&reasoning_only));
+        // Anthropic 仅 thinking 块 → 同样视为空
+        let thinking_only =
+            serde_json::json!({"content": [{"type": "thinking", "thinking": "想一想"}]});
+        assert!(crate::api_server::aggregated_response_is_empty(&thinking_only));
+        // thinking + text → 非空
+        let mixed = serde_json::json!({
+            "content": [{"type": "thinking", "thinking": "想"}, {"type": "text", "text": "hi"}]
+        });
+        assert!(!crate::api_server::aggregated_response_is_empty(&mixed));
     }
     #[test]
     fn normalize_openai_usage_maps_cache_read_token() {
