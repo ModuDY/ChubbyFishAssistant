@@ -473,6 +473,8 @@ export const api = {
     creditsHistoryList: () =>
       invoke<{ snapshots: WbCreditsSnapshot[] }>('workbuddy_credits_history_list'),
     editionsBackfill: () => invoke<number>('workbuddy_editions_backfill'),
+    // 补齐缺失的 uid（离线读快照槽）：返回 [补齐条数, 仍缺的账号 id]
+    uidBackfill: () => invoke<[number, string[]]>('workbuddy_uid_backfill'),
     settingsGet: () => invoke<WorkBuddySettings>('workbuddy_settings_get'),
     settingsSet: (patch: WorkBuddySettings) => invoke('workbuddy_settings_set', { patch }),
     // 打开 auth 文件所在目录（资源管理器；人工覆盖路径优先）

@@ -77,6 +77,13 @@ pub fn auth_file_uid(path: &Path) -> Option<String> {
     auth_file_uid_value(&j)
 }
 
+/// 槽位内 auth 文件副本路径（与 backup_authfile 写入路径同源）。
+/// 供账号池 uid 回填读取——槽槽隔离，取到的是该账号自己的登录态，
+/// 而非 auth 文件当前生效的那一个（后者只反映当前登录账号）。
+pub(crate) fn slot_auth_file(profiles_dir: &Path, slot: &str) -> PathBuf {
+    profiles_dir.join(slot).join("auth").join(WB_AUTH_FILE_NAME)
+}
+
 /// 纯 Value 版 uid 提取（四键兼容，供快照合成后自检复用）
 fn auth_file_uid_value(j: &serde_json::Value) -> Option<String> {
     for v in [

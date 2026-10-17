@@ -153,6 +153,18 @@ export default function BuddyCheckin() {
           // 回填失败静默：套餐列维持「—」，不影响签到流程
         }
       }
+      // uid 补空（离线读本机快照槽，无网络开销）：缺 uid 的账号其活跃上报与
+      // 任务判据都无法归属到账号，等于空转。已补齐则命令直接返回 0，不重复读盘
+      if (accs.some((a) => !a.uid)) {
+        try {
+          const [filled] = await api.workbuddy.uidBackfill();
+          if (filled > 0) {
+            setAccounts(await api.workbuddy.accountsList().catch(() => accs));
+          }
+        } catch {
+          // 回填失败静默：uid 列维持空，不影响签到流程
+        }
+      }
       // 仅保留今天的记录（days=1 会含昨日）
       const today = new Date();
       const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;

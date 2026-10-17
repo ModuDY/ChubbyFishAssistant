@@ -326,6 +326,7 @@ fn main() {
             commands::workbuddy::workbuddy_account_remove,
             commands::workbuddy::workbuddy_scan_auth_file,
             commands::workbuddy::workbuddy_account_import_auth,
+            commands::workbuddy::workbuddy_uid_backfill,
             commands::workbuddy::workbuddy_refresh_token,
             commands::workbuddy::workbuddy_checkin_start,
             commands::workbuddy::workbuddy_growth_run,

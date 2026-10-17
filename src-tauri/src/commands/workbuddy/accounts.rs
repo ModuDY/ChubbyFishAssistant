@@ -271,7 +271,10 @@ pub fn workbuddy_scan_auth_file(state: State<AppState>) -> Result<Option<WorkBud
     // 失败分类报错（issue #58）：null/空串 → 未登录提示，键不存在 → 结构变更 + 键名诊断
     let access = extract_access_token(&raw)?;
     let id = account_id_of(&access);
-    let uid = as_str(fs_utils::dig(&raw, &["uid"])).unwrap_or_default();
+    // 四键兼容（account.uid / uid / auth.account.uid / auth.uid）：与切换侧
+    // auth_file_uid 同口径。此前只认顶层 uid，客户端把身份放在 account.uid
+    // 下时导入即读空——池条目与 token store 双双落空串，签到侧拿不到 uid
+    let uid = crate::switcher::authfile::auth_file_uid(&path).unwrap_or_default();
     let pool = load_pool(&state);
     let exists = pool.accounts.iter().any(|a| a.id == id);
     let already_in_pool = !uid.is_empty() && pool.accounts.iter().any(|a| a.uid == uid);
@@ -432,7 +435,8 @@ pub fn workbuddy_account_import_auth(state: State<AppState>, name: Option<String
     // 5.8.2+ refreshToken 为 $wbEncrypted 包装时透明解密
     let refresh = dig_plain_string(&raw, &["refreshToken", "refresh_token"]);
     let id = account_id_of(&access);
-    let uid = as_str(fs_utils::dig(&raw, &["uid"])).unwrap_or_default();
+    // 四键兼容（与 scan 同口径）：只认顶层 uid 会在身份存于 account.uid 时读空
+    let uid = crate::switcher::authfile::auth_file_uid(&path).unwrap_or_default();
     let nickname = name
         .clone()
         .or_else(|| dig_plain_string(&raw, &["nickname", "displayName", "name"]))
@@ -483,6 +487,77 @@ pub fn workbuddy_account_import_auth(state: State<AppState>, name: Option<String
         .into_iter()
         .find(|v| v.id == target_id)
         .ok_or_else(|| "导入后回读失败".into())
+}
+
+/// 从快照槽读回 uid（两级真源，均离线且按账号槽隔离）。
+///
+/// ① `<槽>/meta.json` 的 `uid`——保存快照时由四键读取写入，直接可用；
+/// ② `<槽>/auth/workbuddy-desktop.info` 走四键 `auth_file_uid`——meta 缺失
+///    （合成快照写失败等）时回退到原始登录态文件。
+///
+/// 刻意不读共享 auth 文件：它只反映**当前登录**的那一个账号，拿它回填会把
+/// A 的身份写到 B 名下。
+fn uid_from_snapshot_slot(profiles_dir: &std::path::Path, slot: &str) -> Option<String> {
+    let meta = fs_utils::read_json::<serde_json::Value>(&profiles_dir.join(slot).join("meta.json"));
+    let from_meta = meta
+        .get("uid")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    if from_meta.is_some() {
+        return from_meta;
+    }
+    crate::switcher::authfile::auth_file_uid(&crate::switcher::authfile::slot_auth_file(
+        profiles_dir,
+        slot,
+    ))
+}
+
+/// 补齐账号池里缺失的 uid（离线，无需逐个重新登录）。
+///
+/// uid 是签到侧「活跃上报/任务判据」的归属凭据（`creds.uid` 进事件
+/// `userId`）；缺失时这些上报无法计分，Active/成长任务全部空转。补齐源是本机
+/// 快照槽——每个槽存有该账号自己的登录态，逐个切号重登代价远高于此。
+///
+/// 只填空、不覆盖：已在池里的 uid 一律保留（避免把别名类字段写坏）。
+#[tauri::command(async)]
+pub fn workbuddy_uid_backfill(
+    state: State<AppState>,
+) -> Result<(usize, Vec<String>), String> {
+    let profiles_dir = state.data_dir.join("data").join("profiles_workbuddy");
+    // 池读-改-写互斥（wb_pool_lock）：覆盖整段读-改-写
+    let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pool = load_pool(&state);
+    let mut filled = 0usize;
+    let mut missing: Vec<String> = Vec::new();
+    for a in pool.accounts.iter_mut() {
+        if !a.uid.trim().is_empty() {
+            continue;
+        }
+        // id 参与路径拼接，先过白名单（对齐 account_remove 的目录逃逸防护）
+        if fs_utils::ensure_uid_safe(&a.id).is_err() {
+            missing.push(a.id.clone());
+            continue;
+        }
+        let Some(uid) = uid_from_snapshot_slot(&profiles_dir, &a.id) else {
+            missing.push(a.id.clone());
+            continue;
+        };
+        a.uid = uid.clone();
+        // 同步进 token store：签到侧 creds.uid 取自这里，只补池条目不生效
+        let _ = upsert_token_store(&state, &a.id, &serde_json::json!({ "uid": uid }));
+        filled += 1;
+    }
+    save_pool(&state, &pool)?;
+    drop(_guard);
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "workbuddy: uid 回填 补齐 {filled} / 仍缺 {}",
+            missing.len()
+        ),
+    );
+    Ok((filled, missing))
 }
 
 // ── M3 凭证续期（F-09，Rust 侧手动触发；schtasks 每周兜底走 python --renew-only）──
@@ -915,7 +990,7 @@ pub fn workbuddy_accounts_import(
 mod tests {
     use super::{
         as_str, as_ts_seconds, extract_access_token, lazy_renew_skippable, merge_auth_entry,
-        AuthMerge, WorkBuddyAccount, WbPool,
+        uid_from_snapshot_slot, AuthMerge, WorkBuddyAccount, WbPool,
     };
     // auth_key_names 仅测试直用（非测试代码已改经 extract_access_token 间接引用）
     use super::super::common::auth_key_names;
@@ -928,6 +1003,66 @@ mod tests {
             nickname: nickname.into(),
             ..Default::default()
         }
+    }
+
+    /// 建一个临时快照槽根目录（调用方负责清理）
+    fn tmp_profiles(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("wb_uid_bf_{tag}"));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 快照槽取 uid：meta.json 优先
+    #[test]
+    fn slot_uid_prefers_meta() {
+        let p = tmp_profiles("meta");
+        let slot = p.join("wb-1");
+        std::fs::create_dir_all(slot.join("auth")).unwrap();
+        std::fs::write(
+            slot.join("meta.json"),
+            r#"{"layout":"authfile","uid":"from-meta"}"#,
+        );
+        // auth 文件给的是另一个值——不应被采用
+        std::fs::write(
+            slot.join("auth").join("workbuddy-desktop.info"),
+            r#"{"uid":"from-authfile"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            uid_from_snapshot_slot(&p, "wb-1").as_deref(),
+            Some("from-meta")
+        );
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    /// meta 缺失/空值时回退到槽内 auth 文件，且走四键兼容
+    /// （身份存于 account.uid 也能读出——这是顶层 uid 读不到的形态）
+    #[test]
+    fn slot_uid_falls_back_to_authfile_with_nested_key() {
+        let p = tmp_profiles("fallback");
+        let slot = p.join("wb-2");
+        std::fs::create_dir_all(slot.join("auth")).unwrap();
+        std::fs::write(
+            slot.join("auth").join("workbuddy-desktop.info"),
+            r#"{"account":{"uid":"nested-uid"},"nickname":"n"}"#,
+        )
+        .unwrap();
+        // meta 存在但 uid 为空 → 必须回退，不能拿空串当结果
+        std::fs::write(slot.join("meta.json"), r#"{"uid":""}"#).unwrap();
+        assert_eq!(
+            uid_from_snapshot_slot(&p, "wb-2").as_deref(),
+            Some("nested-uid")
+        );
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    /// 两级真源都没有 → None（调用方据此把该账号列入「仍需快照」）
+    #[test]
+    fn slot_uid_none_when_slot_missing() {
+        let p = tmp_profiles("empty");
+        assert_eq!(uid_from_snapshot_slot(&p, "wb-3"), None);
+        let _ = std::fs::remove_dir_all(&p);
     }
 
     fn auth_merge(id: &str, uid: &str, exp: Option<i64>) -> AuthMerge {
