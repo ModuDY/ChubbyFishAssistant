@@ -435,8 +435,11 @@ pub fn workbuddy_env_reset(
         push_notify(
             Some(&app),
             &state.data_dir,
-            "WorkBuddy 环境重置",
-            &format!("清理完成，{fail_n} 项失败，请查看详情"),
+            "WorkBuddy 环境重置完成",
+            &format!(
+                "共清理 {} 项，其中 {fail_n} 项失败\n请到结果详情查看具体项",
+                items.len()
+            ),
             crate::notify::NotifyEvent::Other,
         );
     }

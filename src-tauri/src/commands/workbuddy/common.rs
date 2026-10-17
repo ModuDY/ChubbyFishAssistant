@@ -244,11 +244,7 @@ pub fn push_notify(app: Option<&AppHandle>, data_dir: &std::path::Path, title: &
     if !on {
         return;
     }
-    let channels = crate::notify::NotifyChannels {
-        bark_url: s.notify_bark_url.clone().filter(|x| !x.trim().is_empty()),
-        wechat_webhook: s.notify_webhook_url.clone().filter(|x| !x.trim().is_empty()),
-        serverchan_sendkey: s.notify_serverchan_sendkey.clone().filter(|x| !x.trim().is_empty()),
-    };
+    let channels = crate::notify::NotifyChannels::from_settings(&s);
     crate::notify::notify_all(app, data_dir, title, body, &channels);
 }
 

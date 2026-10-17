@@ -148,7 +148,15 @@ pub fn start_checkin_core(
 }
 
 /// 发送最终汇总 done 事件（checkin-progress + checkin-done），并按需发系统通知
-fn emit_final_done(app: &AppHandle, ok: usize, already: usize, failed: usize, total: usize, notify_done: bool) {
+fn emit_final_done(
+    app: &AppHandle,
+    data_dir: &std::path::Path,
+    ok: usize,
+    already: usize,
+    failed: usize,
+    total: usize,
+    notify_done: bool,
+) {
     let payload = serde_json::json!({
         "type": "done", "ok": ok, "already": already, "failed": failed, "total": total
     });
@@ -156,10 +164,21 @@ fn emit_final_done(app: &AppHandle, ok: usize, already: usize, failed: usize, to
     // 终态事件：emit 失败落日志（issue #44 遗留项——前端签到横幅依赖 done 复位）
     crate::events::emit_logged(app, "checkin-done", payload, None);
     if notify_done {
-        crate::notify::notify(
-            app,
-            "签到完成",
-            &format!("成功 {ok} · 已签 {already} · 失败 {failed}"),
+        // 走 push_notify 而非裸 notify：界面点按钮签到也能推到手机
+        // （此前只有托盘一键签到路径接了渠道，同一个动作两个入口两种待遇）
+        let body = if failed > 0 {
+            format!(
+                "共 {total} 个账号：新签 {ok} · 已签 {already} · 失败 {failed}\n有账号未签到成功，请到签到页查看原因"
+            )
+        } else {
+            format!("共 {total} 个账号：新签 {ok} · 已签 {already} · 失败 {failed}")
+        };
+        crate::commands::workbuddy::push_notify(
+            Some(app),
+            data_dir,
+            "Trae 签到完成",
+            &body,
+            crate::notify::NotifyEvent::CheckinDone,
         );
     }
 }
@@ -179,7 +198,13 @@ fn run_checkin_worker(
         Err(_) => {
             fs_utils::app_log(&state.data_dir, "签到拒绝: 已有签到任务运行中");
             if notify_done {
-                crate::notify::notify(app, "签到跳过", "已有签到任务正在进行中");
+                crate::commands::workbuddy::push_notify(
+                    Some(app),
+                    &state.data_dir,
+                    "Trae 签到已跳过",
+                    "已有签到任务在执行中，本次未重复启动",
+                    crate::notify::NotifyEvent::Other,
+                );
             }
             let _ = tx.send(Err("已有签到任务正在进行中".into()));
             return;
@@ -324,7 +349,13 @@ fn run_checkin_worker(
             Some(&state.data_dir),
         );
         if notify_done {
-            crate::notify::notify(app, "签到完成", "没有需要签到的账号（全部已签/冷却中）");
+            crate::commands::workbuddy::push_notify(
+                Some(app),
+                &state.data_dir,
+                "Trae 签到完成",
+                "没有需要签到的账号（全部已签或处于冷却中）",
+                crate::notify::NotifyEvent::CheckinDone,
+            );
         }
         drop(held);
         let _ = tx.send(Ok(()));
@@ -456,7 +487,7 @@ fn run_checkin_worker(
             .collect();
         crate::checkin_results::record_today(&state.data_dir, entries);
     }
-    emit_final_done(app, ok, already, failed, total_all, notify_done);
+    emit_final_done(app, &state.data_dir, ok, already, failed, total_all, notify_done);
     // _held 持有到全部轮次结束，线程退出自动释放
     let _held = held;
 }

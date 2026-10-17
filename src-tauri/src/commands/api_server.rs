@@ -721,11 +721,20 @@ pub async fn do_start(
     // 同步托盘菜单文本 + 系统通知（账号数分池展示：Trae 池空 ≠ 无资源，Buddy 池可能正常服务）
     sync_tray_api_text(app, true);
     let notify_body = if pool_file.wb_enabled {
-        format!("端口 {port}，Trae 池 {pool_count} 个账号，Buddy 池 {wb_pool_count} 个账号")
+        format!(
+            "监听端口 {port}\nTrae 池 {pool_count} 个账号 · Buddy 池 {wb_pool_count} 个账号"
+        )
     } else {
-        format!("端口 {port}，池内 {pool_count} 个账号")
+        format!("监听端口 {port}\nTrae 池 {pool_count} 个账号")
     };
-    crate::notify::notify(app, "API 网关已启动", &notify_body);
+    // 走 push_notify：网关启停此前只弹桌面，配了渠道也收不到
+    crate::commands::workbuddy::push_notify(
+        Some(app),
+        &state.data_dir,
+        "API 网关已启动",
+        &notify_body,
+        crate::notify::NotifyEvent::Other,
+    );
 
     Ok(status)
 }
@@ -753,7 +762,13 @@ pub async fn do_stop(
         fs_utils::app_log(&state.data_dir, "API 服务已停止");
         drop(guard);
         sync_tray_api_text(app, false);
-        crate::notify::notify(app, "API 网关已停止", "本地网关已关闭");
+        crate::commands::workbuddy::push_notify(
+            Some(app),
+            &state.data_dir,
+            "API 网关已停止",
+            "本地网关已关闭，网关地址已不再可用",
+            crate::notify::NotifyEvent::Other,
+        );
     }
     Ok(())
 }

@@ -320,8 +320,8 @@ pub fn startup_auto_checkin(app: &AppHandle, state: &AppState) {
             crate::commands::workbuddy::push_notify(
                 Some(&app2),
                 &state2.data_dir,
-                "Qoder 签到提醒",
-                &format!("启动补签有 {failed_actionable} 个账号失败，请在 Qoder 签到页查看"),
+                "Qoder 签到失败",
+                &format!("启动补签：{failed_actionable} 个账号未签到成功\n请到 Qoder 签到页查看原因"),
                 crate::notify::NotifyEvent::TaskFail,
             );
         }

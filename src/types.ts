@@ -464,6 +464,10 @@ export interface Settings {
   notify_bark_url: string | null;
   /** 通用 Webhook 地址（POST JSON，兼容企业微信群机器人等自建端；空 = 关闭） */
   notify_webhook_url: string | null;
+  /** 企业微信 Webhook 的 @ 范围：'none'（不 @）/ 'all'（@所有人）/ 'some'（@指定成员） */
+  notify_wechat_mention: string | null;
+  /** @ 指定成员名单（mention='some' 时生效）：企业微信 userid 或手机号 */
+  notify_wechat_mention_list: string[] | null;
   /** Server酱 SendKey（空 = 关闭） */
   notify_serverchan_sendkey: string | null;
   // ── 侧边栏应用显示（仅 UI 偏好：隐藏不停功能、不删数据、不影响计划任务） ──

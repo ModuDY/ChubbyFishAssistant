@@ -251,6 +251,8 @@ function defaultSettings(): Settings {
     notify_on_task_fail: true,
     notify_bark_url: null,
     notify_webhook_url: null,
+    notify_wechat_mention: null,
+    notify_wechat_mention_list: null,
     notify_serverchan_sendkey: null,
     // 侧边栏应用显示：默认固定 Trae，其余应用全部显示
     pinned_app: 'trae',

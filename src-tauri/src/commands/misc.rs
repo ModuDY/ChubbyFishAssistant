@@ -839,11 +839,7 @@ pub fn settings_get(state: State<AppState>) -> Settings {
 #[tauri::command(async)]
 pub fn notify_test(state: State<AppState>) -> Result<String, String> {
     let s = state.settings();
-    let channels = crate::notify::NotifyChannels {
-        bark_url: s.notify_bark_url.clone().filter(|x| !x.trim().is_empty()),
-        wechat_webhook: s.notify_webhook_url.clone().filter(|x| !x.trim().is_empty()),
-        serverchan_sendkey: s.notify_serverchan_sendkey.clone().filter(|x| !x.trim().is_empty()),
-    };
+    let channels = crate::notify::NotifyChannels::from_settings(&s);
     if channels.is_empty() {
         return Err("尚未配置任何通知渠道（Bark / 通用 Webhook / Server酱）".into());
     }
@@ -851,7 +847,7 @@ pub fn notify_test(state: State<AppState>) -> Result<String, String> {
         return Err("通知推送总开关未启用".into());
     }
     let title = "AI Work Assistant 测试通知";
-    let body = "这是一条测试消息：如果你收到它，说明对应通知渠道配置生效。";
+    let body = "收到本条即说明该渠道配置生效。\n企业微信群内还会按「提醒对象」@ 目标成员，可一并验证。";
     let mut errs: Vec<String> = Vec::new();
     if let Some(bark) = channels.bark_url.as_deref().filter(|x| !x.trim().is_empty()) {
         if let Err(e) = crate::notify::notify_bark(bark, title, body) {
@@ -859,7 +855,8 @@ pub fn notify_test(state: State<AppState>) -> Result<String, String> {
         }
     }
     if let Some(wh) = channels.wechat_webhook.as_deref().filter(|x| !x.trim().is_empty()) {
-        if let Err(e) = crate::notify::notify_wechat_webhook(wh, title, body) {
+        if let Err(e) = crate::notify::notify_wechat_webhook(wh, title, body, &channels.wechat_mention)
+        {
             errs.push(format!("Webhook: {e}"));
         }
     }

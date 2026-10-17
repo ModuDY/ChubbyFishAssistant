@@ -311,8 +311,8 @@ fn tick(app: &AppHandle, st: &AppState) {
                     crate::commands::workbuddy::push_notify(
                         None,
                         &st.data_dir,
-                        &format!("{} 失败", t.name),
-                        &format!("{summary}（{cooldown_min} 分钟后自动重试）"),
+                        &format!("{}失败", t.name),
+                        &format!("{summary}\n{cooldown_min} 分钟后自动重试，连续失败会逐步拉长间隔"),
                         crate::notify::NotifyEvent::TaskFail,
                     );
                 }

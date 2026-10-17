@@ -25,6 +25,19 @@ pub enum NotifyEvent {
     Other,
 }
 
+/// 企业微信群机器人的 @ 目标（仅 Webhook 渠道；Bark / Server酱 无此概念）
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum MentionTarget {
+    /// 不 @ 任何人——群里有对方时可安静投递，避免无事也弹红点
+    #[default]
+    None,
+    /// @所有人（真正需要人响应时才用：连续失败等）
+    All,
+    /// @指定成员：企业微信 userid 与手机号混填，投递时按形态分流
+    /// （11 位纯数字 → mentioned_mobile_list，其余 → mentioned_list）
+    Some(Vec<String>),
+}
+
 /// 可选通知渠道配置（来自 app Settings；None/空 = 关闭该渠道）
 #[derive(Debug, Default, Clone)]
 pub struct NotifyChannels {
@@ -32,6 +45,8 @@ pub struct NotifyChannels {
     pub bark_url: Option<String>,
     /// 通用 Webhook 地址（POST JSON，兼容企业微信群机器人等自建端）
     pub wechat_webhook: Option<String>,
+    /// Webhook 渠道的 @ 范围
+    pub wechat_mention: MentionTarget,
     /// Server酱 SendKey（https://sctapi.ftqq.com/<sendkey>.send）
     pub serverchan_sendkey: Option<String>,
 }
@@ -42,6 +57,34 @@ impl NotifyChannels {
         [self.bark_url.as_deref(), self.wechat_webhook.as_deref(), self.serverchan_sendkey.as_deref()]
             .iter()
             .all(|c| c.map_or(true, |s| s.trim().is_empty()))
+    }
+
+    /// 从 app Settings 构造：空白一律当作未配置，@ 范围随 Webhook 一起读。
+    ///
+    /// 集中在此供 push_notify 与 notify_test 共用——两处各建一份会漂移
+    /// （「测试」按配置 @ 了，实际推送却没 @，是最难查的一类不一致）。
+    pub fn from_settings(s: &crate::models::Settings) -> Self {
+        let mention = match s.notify_wechat_mention.as_deref().unwrap_or("none") {
+            "all" => MentionTarget::All,
+            "some" => MentionTarget::Some(
+                s.notify_wechat_mention_list
+                    .clone()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect(),
+            ),
+            _ => MentionTarget::None,
+        };
+        Self {
+            bark_url: s.notify_bark_url.clone().filter(|x| !x.trim().is_empty()),
+            wechat_webhook: s.notify_webhook_url.clone().filter(|x| !x.trim().is_empty()),
+            wechat_mention: mention,
+            serverchan_sendkey: s.notify_serverchan_sendkey
+                .clone()
+                .filter(|x| !x.trim().is_empty()),
+        }
     }
 }
 
@@ -72,16 +115,57 @@ pub fn notify_bark(bark_url: &str, title: &str, body: &str) -> Result<(), String
     Ok(())
 }
 
-/// 企业微信群机器人：POST text 消息（零新增依赖，ureq 同步调用）
-pub fn notify_wechat_webhook(webhook: &str, title: &str, body: &str) -> Result<(), String> {
+/// 11 位纯数字视为手机号（企业微信手机号 @ 必须走 mobile 专用字段，
+/// 与 userid 走不同的 key——混用会被对端忽略，导致 @ 静默失效）
+fn is_mobile(s: &str) -> bool {
+    s.len() == 11 && s.chars().all(|c| c.is_ascii_digit())
+}
+
+/// 企业微信群机器人：POST text 消息（零新增依赖，ureq 同步调用）。
+/// `mention` 控制 @ 范围——群里有对方时可以安静投递，只有真需要人响应时才 @。
+fn wechat_text_payload(title: &str, body: &str, mention: &MentionTarget) -> serde_json::Value {
+    let mut text = serde_json::Map::new();
+    text.insert("content".into(), serde_json::json!(format!("{title}\n{body}")));
+    match mention {
+        MentionTarget::None => {}
+        MentionTarget::All => {
+            text.insert("mentioned_list".into(), serde_json::json!(["@all"]));
+        }
+        MentionTarget::Some(list) => {
+            let ids: Vec<&str> = list
+                .iter()
+                .map(String::as_str)
+                .filter(|s| !s.trim().is_empty() && !is_mobile(s))
+                .collect();
+            let mobiles: Vec<&str> = list
+                .iter()
+                .map(String::as_str)
+                .filter(|s| !s.trim().is_empty() && is_mobile(s))
+                .collect();
+            // 名单全空（模式切到「指定成员」但还没填人）→ 两个字段都不发，
+            // 退回普通投递；发空数组会让对端直接拒收整条消息
+            if !ids.is_empty() {
+                text.insert("mentioned_list".into(), serde_json::json!(ids));
+            }
+            if !mobiles.is_empty() {
+                text.insert("mentioned_mobile_list".into(), serde_json::json!(mobiles));
+            }
+        }
+    }
+    serde_json::json!({ "msgtype": "text", "text": text })
+}
+
+pub fn notify_wechat_webhook(
+    webhook: &str,
+    title: &str,
+    body: &str,
+    mention: &MentionTarget,
+) -> Result<(), String> {
     let url = webhook.trim();
     if !url.starts_with("https://") {
         return Err("企业微信 webhook 需为 https:// 地址".into());
     }
-    let payload = serde_json::json!({
-        "msgtype": "text",
-        "text": { "content": format!("{title}\n{body}") },
-    });
+    let payload = wechat_text_payload(title, body, mention);
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(10))
         .build();
@@ -125,7 +209,7 @@ pub fn notify_all(app: Option<&AppHandle>, data_dir: &std::path::Path, title: &s
         }
     }
     if let Some(webhook) = channels.wechat_webhook.as_deref().filter(|s| !s.trim().is_empty()) {
-        if let Err(e) = notify_wechat_webhook(webhook, title, body) {
+        if let Err(e) = notify_wechat_webhook(webhook, title, body, &channels.wechat_mention) {
             crate::fs_utils::app_log(data_dir, &format!("通知渠道(企业微信)失败: {e}"));
         }
     }
@@ -139,6 +223,7 @@ pub fn notify_all(app: Option<&AppHandle>, data_dir: &std::path::Path, title: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     /// 三渠道空判定：默认全空；任一渠道有值（含空白包裹）即非空
     #[test]
@@ -155,6 +240,78 @@ mod tests {
         assert!(notify_bark("http://api.day.app/abc123", "t", "b").is_err(), "非 https 拒绝");
         assert!(notify_bark("https://api.day.app/", "t", "b").is_err(), "空 Key 拒绝");
         assert!(notify_bark("https://api.day.app/ab c!/", "t", "b").is_err(), "非法字符 Key 拒绝");
+    }
+
+    // ── 企业微信 @ 目标（纯 payload 构造，不触网） ───────────────────────────
+
+    /// 不 @：只发内容，不带任何 mention 字段——群里有对方时可安静投递
+    #[test]
+    fn wechat_mention_none_omits_mention_fields() {
+        let p = wechat_text_payload("标题", "正文", &MentionTarget::None);
+        assert_eq!(p["msgtype"], json!("text"));
+        assert_eq!(p["text"]["content"], json!("标题\n正文"));
+        assert!(p["text"].get("mentioned_list").is_none());
+        assert!(p["text"].get("mentioned_mobile_list").is_none());
+    }
+
+    /// @所有人：mentioned_list 填 "@all"
+    #[test]
+    fn wechat_mention_all_targets_everyone() {
+        let p = wechat_text_payload("标题", "正文", &MentionTarget::All);
+        assert_eq!(p["text"]["mentioned_list"], json!(["@all"]));
+        assert!(p["text"].get("mentioned_mobile_list").is_none());
+    }
+
+    /// @指定成员：userid 与手机号混填时按形态分流到对端各自的字段
+    /// （走错字段会被静默忽略，@ 不生效）
+    #[test]
+    fn wechat_mention_some_splits_userid_and_mobile() {
+        let p = wechat_text_payload(
+            "标题",
+            "正文",
+            &MentionTarget::Some(vec![
+                "WangQing".into(),
+                "13800138000".into(),
+                "  ".into(),
+                "zhangsan".into(),
+            ]),
+        );
+        assert_eq!(p["text"]["mentioned_list"], json!(["WangQing", "zhangsan"]));
+        assert_eq!(p["text"]["mentioned_mobile_list"], json!(["13800138000"]));
+    }
+
+    /// 选了「指定成员」但名单还空着 → 退回普通投递，不发空数组
+    /// （空数组会让对端直接拒收整条消息）
+    #[test]
+    fn wechat_mention_some_empty_list_falls_back_to_plain() {
+        let p = wechat_text_payload("标题", "正文", &MentionTarget::Some(vec![]));
+        assert!(p["text"].get("mentioned_list").is_none());
+        assert!(p["text"].get("mentioned_mobile_list").is_none());
+        assert_eq!(p["text"]["content"], json!("标题\n正文"));
+    }
+
+    /// 配置 → @ 目标映射：Some 模式顺带裁掉空白项（空白不该被当作成员发出去）；
+    /// 未配置或未知值一律按「不 @」处理，不猜用户意图
+    #[test]
+    fn from_settings_maps_mention_modes() {
+        let s = crate::models::Settings {
+            notify_wechat_mention: Some("all".into()),
+            ..Default::default()
+        };
+        assert_eq!(NotifyChannels::from_settings(&s).wechat_mention, MentionTarget::All);
+
+        let s = crate::models::Settings {
+            notify_wechat_mention: Some("some".into()),
+            notify_wechat_mention_list: Some(vec!["WangQing".into(), " ".into()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            NotifyChannels::from_settings(&s).wechat_mention,
+            MentionTarget::Some(vec!["WangQing".into()])
+        );
+
+        let s = crate::models::Settings::default();
+        assert_eq!(NotifyChannels::from_settings(&s).wechat_mention, MentionTarget::None);
     }
 
     /// 事件门控映射完整（Other 不受事件开关限制，在 push_notify 层处理）
@@ -197,6 +354,7 @@ mod tests {
             bark_url: Some("http://api.day.app/abc".into()),          // 非 https 拒绝
             wechat_webhook: Some("ftp://qyapi.example.com/x".into()), // 非 https 拒绝
             serverchan_sendkey: Some("SCT abc!".into()),              // 含空格/非法字符拒绝
+            ..Default::default()
         };
         notify_all(None, &dir, "标题", "内容", &ch);
         let log = read_log(&dir);

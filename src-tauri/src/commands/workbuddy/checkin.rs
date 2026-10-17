@@ -91,8 +91,17 @@ pub fn workbuddy_checkin_start(app: AppHandle, state: State<AppState>, opts: WbC
         skip_expired: opts.skip_expired,
         lazy_hours: opts.lazy_hours.unwrap_or(24),
     };
+    // 与托盘一键签到同口径发通知：此前界面点签到完全静默（只有托盘路径会推），
+    // 同一个动作两个入口两种待遇
     spawn_wb_round(app, state.inner().clone(), round, move |app, st| {
-        wb_checkin::run_checkin_round(st, &o, &mut |ev| emit_wb_event(app, ev));
+        let done = wb_checkin::run_checkin_round(st, &o, &mut |ev| emit_wb_event(app, ev));
+        push_notify(
+            Some(app),
+            &st.data_dir,
+            "WorkBuddy 签到完成",
+            &checkin_round_body(&done),
+            crate::notify::NotifyEvent::CheckinDone,
+        );
     })
 }
 
@@ -108,6 +117,13 @@ pub fn workbuddy_growth_run(app: AppHandle, state: State<AppState>) -> Result<()
     };
     spawn_wb_round(app, state.inner().clone(), round, move |app, st| {
         wb_checkin::run_growth_round(st, &flags, &[], &mut |ev| emit_wb_event(app, ev));
+        push_notify(
+            Some(app),
+            &st.data_dir,
+            "WorkBuddy 成长计划完成",
+            &growth_round_body(&flags),
+            crate::notify::NotifyEvent::CheckinDone,
+        );
     })
 }
 
@@ -388,12 +404,55 @@ pub fn startup_auto_checkin(app: &AppHandle, state: &AppState) {
             push_notify(
                 Some(&app2),
                 &state2.data_dir,
-                "WorkBuddy 签到提醒",
-                &format!("启动补签有 {failed} 个账号失败，请在签到与成长页查看"),
+                "WorkBuddy 签到失败",
+                &format!("启动补签：{failed} 个账号未签到成功\n请到签到与成长页查看原因"),
                 crate::notify::NotifyEvent::TaskFail,
             );
         }
     });
+}
+
+/// 签到轮次的单行结果摘要（供日志与通知正文复用）
+fn checkin_round_summary(done: &Value) -> String {
+    match (done["ok"].as_i64(), done["already"].as_i64(), done["failed"].as_i64()) {
+        (Some(o), Some(a), Some(f)) => {
+            format!("共 {} 个账号：新签 {o} · 已签 {a} · 失败 {f}", o + a + f)
+        }
+        _ => "签到流程已结束".to_string(),
+    }
+}
+
+/// 签到轮次的通知正文（托盘一键签到与界面签到共用）。
+///
+/// 只有真的失败了才补行动指引——否则手机端每轮都会收到一句没有信息量的
+/// 「请查看原因」，看久了就自动忽略，真出事时也一起被忽略掉。
+fn checkin_round_body(done: &Value) -> String {
+    let summary = checkin_round_summary(done);
+    if done["failed"].as_i64().unwrap_or(0) > 0 {
+        format!("{summary}\n有账号未签到成功，请到签到与成长页查看原因")
+    } else {
+        summary
+    }
+}
+
+/// 成长轮次的通知正文：明示本轮实际执行了哪些项——各项可独立开关，
+/// 一句「完成」看不出到底跑了什么
+fn growth_round_body(flags: &GrowthOpts) -> String {
+    let mut ran: Vec<&str> = Vec::new();
+    if flags.travel {
+        ran.push("旅行");
+    }
+    if flags.lottery {
+        ran.push("盲盒");
+    }
+    if flags.tasks {
+        ran.push("成长任务");
+    }
+    if ran.is_empty() {
+        "本轮无可执行的成长项（各项开关均已关闭）".to_string()
+    } else {
+        format!("本轮已执行 {}", ran.join("、"))
+    }
 }
 
 // ── 托盘一键签到（Trae 之外的两个阶段由 main.rs 托盘线程调用）──────────────
@@ -407,23 +466,29 @@ pub fn tray_checkin_all(app: &AppHandle, state: &AppState) {
     let Ok(_round) = try_acquire_wb_round() else {
         let msg = "已有签到/成长任务在执行中，一键签到已跳过";
         fs_utils::app_log(&state.data_dir, msg);
-        push_notify(Some(app), &state.data_dir, "一键签到", msg, crate::notify::NotifyEvent::Other);
+        push_notify(
+            Some(app),
+            &state.data_dir,
+            "WorkBuddy 签到已跳过",
+            "已有签到或成长任务在执行中，本次未重复启动",
+            crate::notify::NotifyEvent::Other,
+        );
         return;
     };
     let s = load_settings(state);
     // 阶段 1：签到（每日任务同款参数：skip_checked + lazy 24h）
     let done = wb_checkin::run_checkin_round(state, &CheckinOpts::daily(), &mut |_| {});
-    let summary = match (
-        done["ok"].as_i64(),
-        done["already"].as_i64(),
-        done["failed"].as_i64(),
-    ) {
-        (Some(o), Some(a), Some(f)) => format!("成功 {o}，已签 {a}，失败 {f}"),
-        _ => "完成".to_string(),
-    };
-    let msg = format!("WorkBuddy 签到: {summary}");
+    // 与界面签到入口同口径：先给总账，再给明细；有失败才补行动指引，
+    // 否则手机端每轮都收到一句无意义的「请查看原因」
+    let msg = format!("WorkBuddy 签到: {}", checkin_round_summary(&done));
     fs_utils::app_log(&state.data_dir, &msg);
-    push_notify(Some(app), &state.data_dir, "一键签到", &msg, crate::notify::NotifyEvent::CheckinDone);
+    push_notify(
+        Some(app),
+        &state.data_dir,
+        "WorkBuddy 签到完成",
+        &checkin_round_body(&done),
+        crate::notify::NotifyEvent::CheckinDone,
+    );
     // 阶段 2：成长计划（旅行/盲盒/任务开关随设置）
     let flags = GrowthOpts {
         travel: s.growth_travel,
@@ -431,14 +496,59 @@ pub fn tray_checkin_all(app: &AppHandle, state: &AppState) {
         tasks: s.growth_tasks,
     };
     wb_checkin::run_growth_round(state, &flags, &[], &mut |_| {});
-    let msg = "WorkBuddy 成长计划: 完成";
-    fs_utils::app_log(&state.data_dir, msg);
-    push_notify(Some(app), &state.data_dir, "一键签到", msg, crate::notify::NotifyEvent::CheckinDone);
+    fs_utils::app_log(&state.data_dir, "WorkBuddy 成长计划: 完成");
+    push_notify(
+        Some(app),
+        &state.data_dir,
+        "WorkBuddy 成长计划完成",
+        &growth_round_body(&flags),
+        crate::notify::NotifyEvent::CheckinDone,
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::parse_task_names_from_csv;
+    use super::{checkin_round_body, growth_round_body};
+    use crate::tasks::wb_checkin::GrowthOpts;
+
+    /// 全成功：只给结果，不加行动指引——
+    /// 每轮都挂一句「请查看原因」会让人自动忽略，真出事时也一起被忽略
+    #[test]
+    fn 签到正文_全成功不附指引() {
+        let done = serde_json::json!({ "ok": 4, "already": 2, "failed": 0 });
+        assert_eq!(checkin_round_body(&done), "共 6 个账号：新签 4 · 已签 2 · 失败 0");
+    }
+
+    /// 有失败：结果之后补一行行动指引
+    #[test]
+    fn 签到正文_有失败则附指引() {
+        let done = serde_json::json!({ "ok": 1, "already": 0, "failed": 2 });
+        assert_eq!(
+            checkin_round_body(&done),
+            "共 3 个账号：新签 1 · 已签 0 · 失败 2\n有账号未签到成功，请到签到与成长页查看原因"
+        );
+    }
+
+    /// 缺字段（上游返回结构变更）→ 退化文案，不 panic
+    #[test]
+    fn 签到正文_缺统计字段退化为结束语() {
+        assert_eq!(checkin_round_body(&serde_json::json!({})), "签到流程已结束");
+    }
+
+    /// 成长正文按实际开关列出执行项；全关时说明为何没有执行项
+    /// （否则「完成」二字会让人以为任务都跑了）
+    #[test]
+    fn 成长正文_按开关列出执行项() {
+        let all = GrowthOpts { travel: true, lottery: true, tasks: true };
+        assert_eq!(growth_round_body(&all), "本轮已执行 旅行、盲盒、成长任务");
+
+        let partial = GrowthOpts { travel: true, lottery: false, tasks: false };
+        assert_eq!(growth_round_body(&partial), "本轮已执行 旅行");
+
+        let none = GrowthOpts { travel: false, lottery: false, tasks: false };
+        assert_eq!(growth_round_body(&none), "本轮无可执行的成长项（各项开关均已关闭）");
+    }
 
     #[test]
     fn csv_解析_三列无主机名_本机实测列序() {

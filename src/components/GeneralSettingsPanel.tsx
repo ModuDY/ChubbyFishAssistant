@@ -453,6 +453,42 @@ export default function GeneralSettingsPanel() {
                 className="input"
               />
             </div>
+            <div>
+              <label className="label">提醒对象（仅企业微信群机器人）</label>
+              <select
+                value={form.notify_wechat_mention ?? 'none'}
+                onChange={(e) => update('notify_wechat_mention', e.target.value)}
+                className="input"
+              >
+                <option value="none">不提醒任何人</option>
+                <option value="all">提醒所有人（@all）</option>
+                <option value="some">提醒指定成员</option>
+              </select>
+              <p className="mt-1 text-xs text-slate-400">
+                仅当 Webhook 指向企业微信群机器人时生效；填了其它自建端请保持「不提醒」。
+              </p>
+            </div>
+            {form.notify_wechat_mention === 'some' && (
+              <div>
+                <label className="label">成员名单</label>
+                <input
+                  type="text"
+                  value={(form.notify_wechat_mention_list ?? []).join(',')}
+                  onChange={(e) => {
+                    const arr = e.target.value
+                      .split(/[,，]/)
+                      .map((s) => s.trim())
+                      .filter(Boolean);
+                    update('notify_wechat_mention_list', arr.length > 0 ? arr : null);
+                  }}
+                  placeholder="成员 userid 或手机号，多个用逗号分隔"
+                  className="input"
+                />
+                <p className="mt-1 text-xs text-slate-400">
+                  填企业微信成员 userid（如 WangQing）或手机号，两种可混填。
+                </p>
+              </div>
+            )}
           </div>
         </div>
       </section>

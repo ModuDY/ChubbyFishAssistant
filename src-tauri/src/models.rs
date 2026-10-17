@@ -275,6 +275,14 @@ pub struct Settings {
     /// 通用 Webhook 地址（POST JSON，兼容企业微信群机器人等自建端；空 = 关闭）
     #[serde(default)]
     pub notify_webhook_url: Option<String>,
+    /// 企业微信 Webhook 的 @ 范围：`none`（不 @）/ `all`（@所有人）/ `some`（@指定成员）。
+    /// 仅对填了通用 Webhook 且对端是群机器人的场景有效；其它自建端忽略该字段。
+    #[serde(default)]
+    pub notify_wechat_mention: Option<String>,
+    /// @ 指定成员名单（`notify_wechat_mention` = `some` 时生效）：
+    /// 企业微信 userid 或手机号混填，投递时按形态分流到对应字段。
+    #[serde(default)]
+    pub notify_wechat_mention_list: Option<Vec<String>>,
     /// Server酱 SendKey（空 = 关闭）
     #[serde(default)]
     pub notify_serverchan_sendkey: Option<String>,
