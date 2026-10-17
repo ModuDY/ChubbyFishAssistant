@@ -452,6 +452,8 @@ export interface Settings {
   /** Trae 模型列表同步触发时刻 HH:MM（默认 05:40） */
   trae_models_sync_hhmm: string;
   // ── 通知渠道（F-19；Trae/Buddy 全平台共用，系统设置页通知渠道面板维护） ──
+  /** 内容拦截降级重试（P3-1，默认关）：被内容策略拦截时换中性提示词重试一次 */
+  prompt_degrade_enabled?: boolean;
   /** 通知总开关（默认开；关闭后所有事件渠道静默） */
   notify_enabled: boolean;
   /** 签到完成时推送（默认开） */

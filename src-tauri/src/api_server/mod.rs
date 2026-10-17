@@ -4,6 +4,7 @@ pub mod auth;
 pub mod config_cache;
 pub mod custom_models;
 pub mod custom_route;
+pub mod degrade;
 pub mod dispatch;
 pub mod discovery;
 pub mod doubao_payload;
@@ -16,6 +17,7 @@ pub mod models_sync;
 pub mod org_index;
 pub mod pool;
 pub mod payload;
+pub mod prompt;
 pub mod qoder_route;
 pub mod retry;
 pub mod routes;
@@ -63,6 +65,9 @@ pub struct ApiSharedState {
     pub wb_enabled: std::sync::atomic::AtomicBool,
     /// WB 指纹清洗开关（F-30，默认开；wb_template_map 清洗联动）
     pub wb_sanitize: std::sync::atomic::AtomicBool,
+    /// 内容拦截降级重试开关（P3-1，默认关）：命中内容策略拦截时换中性提示词
+    /// 重试一次。热应用（设置页切换即时生效，无需重启网关）
+    pub prompt_degrade_enabled: std::sync::atomic::AtomicBool,
     /// 默认深度思考（T5.3/F-62）：客户端未显式请求 reasoning_effort 时默认 high
     pub wb_default_thinking: std::sync::atomic::AtomicBool,
     /// 工具代执行（T5.5/F-64）：客户端声明 web_search 类工具时代理侧代执行
@@ -739,13 +744,18 @@ pub fn finish_with_tools(upstream: &str, has_tools: bool) -> String {
 /// 超过该上限不再干等，提前重试或换号（重试次数上限不变）。
 pub const BACKOFF_WAIT_CAP_MS: u64 = 10_000;
 
-/// 可中断的退避等待：每 100ms 醒一次检查 `aborted()`，客户端断连即返回 false。
+/// 可中断等待：每 100ms 醒一次检查 `aborted()`，客户端断连即提前返回 false。
 ///
 /// 返回 true = 等满；false = 期间被中断（调用方应终止本次请求）。
-/// 阻塞线程上的退避必须走这里，不要直接 `std::thread::sleep`。
-pub fn wait_backoff_interruptible(total_ms: u64, aborted: impl Fn() -> bool) -> bool {
+/// 阻塞线程上的等待必须走这里（或 `wait_backoff_interruptible`），
+/// 不要直接 `std::thread::sleep`——整段 sleep 期间线程无法感知断连，
+/// 会被白白占用到时长耗尽。
+///
+/// 本函数**不封顶**：用于必须原样遵守的等待时长（如上游排队
+/// `retryAfterSeconds`——提前唤醒会被模型冷却短路成 429）。
+pub fn wait_interruptible(total_ms: u64, aborted: impl Fn() -> bool) -> bool {
     const SLICE_MS: u64 = 100;
-    let mut left = total_ms.min(BACKOFF_WAIT_CAP_MS);
+    let mut left = total_ms;
     while left > 0 {
         if aborted() {
             return false;
@@ -755,6 +765,14 @@ pub fn wait_backoff_interruptible(total_ms: u64, aborted: impl Fn() -> bool) -> 
         left -= step;
     }
     !aborted()
+}
+
+/// 可中断的退避等待：`wait_interruptible` + `BACKOFF_WAIT_CAP_MS` 封顶。
+///
+/// 用于自有退避时长（指数退避、Retry-After），等待多久由我们决定，
+/// 超时上限外提前重试即可，无需干等。
+pub fn wait_backoff_interruptible(total_ms: u64, aborted: impl Fn() -> bool) -> bool {
+    wait_interruptible(total_ms.min(BACKOFF_WAIT_CAP_MS), aborted)
 }
 
 /// 聚合响应是否零内容（OpenAI chat / legacy text / Anthropic message 三形态）：
@@ -857,6 +875,23 @@ mod backoff_tests {
         assert!(wait_backoff_interruptible(0, || false));
         assert!(wait_backoff_interruptible(150, || false));
     }
+
+    /// 排队等待必须原样遵守上游时长：`wait_interruptible` 不封顶
+    /// （提前唤醒会被模型冷却短路成 429），但仍可中断
+    #[test]
+    fn interruptible_wait_is_not_capped() {
+        assert!(wait_interruptible(0, || false));
+        // 若被错误封顶，30s 会被截到 10s——这里用短于上限的时长无法区分，
+        // 故直接断言两者在同一时长上的行为一致，且中断语义成立
+        let t = std::time::Instant::now();
+        assert!(!wait_interruptible(60_000, || true));
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(1),
+            "断连必须立刻退出，实际耗时 {:?}",
+            t.elapsed()
+        );
+        assert!(wait_interruptible(120, || false));
+    }
 }
 
 #[cfg(test)]
@@ -901,6 +936,7 @@ mod inflight_tests {
             wb_pool: pool::ApiPool::new(),
             wb_enabled: std::sync::atomic::AtomicBool::new(true),
             wb_sanitize: std::sync::atomic::AtomicBool::new(true),
+            prompt_degrade_enabled: std::sync::atomic::AtomicBool::new(false),
             wb_default_thinking: std::sync::atomic::AtomicBool::new(false),
             wb_tool_exec: std::sync::atomic::AtomicBool::new(false),
             wb_bg_downgrade: std::sync::atomic::AtomicBool::new(false),

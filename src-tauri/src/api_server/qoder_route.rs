@@ -186,28 +186,6 @@ fn now_cn_timestamp() -> String {
         .to_string()
 }
 
-/// 排队/退避分段等待（审查修复）：长 sleep 切成 ≤500ms 片段逐段睡，每段后
-/// 检查流通道是否关闭——客户端已断连即提前退出，不再空等数十秒排队/退避
-/// 时长；返回 false = 已断连。非流式路径无下行通道可查（handler 返回
-/// Response 前无断连通知机制），保持整段 sleep
-fn sleep_interruptible(
-    total: Duration,
-    tx: Option<&tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>>,
-) -> bool {
-    let mut left = total;
-    while !left.is_zero() {
-        let step = left.min(Duration::from_millis(500));
-        std::thread::sleep(step);
-        left = left.saturating_sub(step);
-        if let Some(t) = tx {
-            if t.is_closed() {
-                return false;
-            }
-        }
-    }
-    true
-}
-
 /// 从上游 usage JSON 提取 Qoder 积分测量（issue #82 T2）：
 /// 返回 (credits, original_credits)。credits 取复数字段——单数 `credit` 是旧版
 /// 字段，读它恒为 0（qoder2api-hub issue #22 命门），故仅在复数缺失时参与回退。
@@ -983,7 +961,13 @@ fn run_qoder_stream(
                                         }
                                         note_model_cooldown(model, secs);
                                         queue_same += 1;
-                                        if !sleep_interruptible(Duration::from_secs(secs), Some(tx)) {
+                                        // 排队时长由上游指定（retryAfterSeconds），必须原样
+                                        // 等满：提前唤醒会被模型冷却短路成 429。走不封顶的
+                                        // 可中断等待——客户端断连立即释放阻塞线程
+                                        if !super::wait_interruptible(
+                                            secs.saturating_mul(1_000),
+                                            || tx.is_closed(),
+                                        ) {
                                             // 审查 M5：断连为请求终局，补记失败终态用量
                                             state.record_usage_qoder(
                                                 model, &win_uid, key_id, false, true,
@@ -1117,13 +1101,9 @@ fn run_qoder_stream(
                     match retry_plan(status, &resp_body, same_attempt, retry_after) {
                         RetryAction::RetrySame { delay_ms } => {
                             same_attempt += 1;
-                            // 审查修复：分段 sleep + 断连感知（原整段 sleep 最长 60s，
-                            // 断连后仍空等；原 sleep 后的 is_closed 检查一并合并）
-                            if !sleep_interruptible(
-                                // 与其它池同口径：退避等待设上限，避免长期占用阻塞线程
-                                Duration::from_millis(delay_ms.min(super::BACKOFF_WAIT_CAP_MS)),
-                                Some(tx),
-                            ) {
+                            // 与其它池同口径：退避等待分段 + 断连感知 + 上限封顶
+                            // （原整段 sleep 最长 60s，断连后仍空等）
+                            if !super::wait_backoff_interruptible(delay_ms, || tx.is_closed()) {
                                 // 审查 M5：断连为请求终局，补记失败终态用量
                                 state.record_usage_qoder(
                                     model, &picked.uid, key_id, false, true,
@@ -1172,7 +1152,11 @@ fn run_qoder_stream(
                                 }
                                 note_model_cooldown(model, secs);
                                 queue_same += 1;
-                                if !sleep_interruptible(Duration::from_secs(secs), Some(tx)) {
+                                // 同流内 Queued 分支：排队时长原样等满，可中断
+                                if !super::wait_interruptible(
+                                    secs.saturating_mul(1_000),
+                                    || tx.is_closed(),
+                                ) {
                                     // 审查 M5：断连为请求终局，补记失败终态用量
                                     state.record_usage_qoder(
                                         model, &picked.uid, key_id, false, true,
@@ -1557,10 +1541,12 @@ pub async fn qoder_aggregate_chat(
                                             }
                                             note_model_cooldown(&model, secs);
                                             queue_same += 1;
-                                            // 统一走 sleep_interruptible(None)：分段等待，
-                                            // 与流式实现口径一致（非流式无下行通道传 None，
-                                            // 语义等同整段 sleep，仅封装统一）
-                                            sleep_interruptible(Duration::from_secs(secs), None);
+                                            // 排队时长原样等满（同流式分支）；非流式无
+                                            // 下行通道可查，aborted 恒为 false
+                                            super::wait_interruptible(
+                                                secs.saturating_mul(1_000),
+                                                || false,
+                                            );
                                             continue;
                                         }
                                         break; // 超限换号
@@ -1617,10 +1603,8 @@ pub async fn qoder_aggregate_chat(
                         match retry_plan(status, &resp_body, same_attempt, retry_after) {
                             RetryAction::RetrySame { delay_ms } => {
                                 same_attempt += 1;
-                                sleep_interruptible(
-                                    Duration::from_millis(delay_ms.min(super::BACKOFF_WAIT_CAP_MS)),
-                                    None,
-                                );
+                                // 与其它池同口径：退避等待上限封顶（阻塞线程不长期占用）
+                                super::wait_backoff_interruptible(delay_ms, || false);
                                 continue;
                             }
                             RetryAction::SwitchKey => {
@@ -1655,10 +1639,9 @@ pub async fn qoder_aggregate_chat(
                                     }
                                     note_model_cooldown(&model, secs);
                                     queue_same += 1;
-                                    // 审查 Low：对齐同函数其余非流式退避点，统一走
-                                    // sleep_interruptible(None)（分段等待，非流式无
-                                    // 下行通道传 None，语义等同整段 sleep，仅封装统一）
-                                    sleep_interruptible(Duration::from_secs(secs), None);
+                                    // 排队时长原样等满（同流式分支）；非流式无
+                                    // 下行通道可查，aborted 恒为 false
+                                    super::wait_interruptible(secs.saturating_mul(1_000), || false);
                                     continue;
                                 }
                                 let kind = classified.kind.to_err_kind();

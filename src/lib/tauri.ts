@@ -789,6 +789,13 @@ export const api = {
      */
     poolPause: (pool: 'trae' | 'wb' | 'qoder' | 'doubao', uid: string, paused: boolean) =>
       invoke<boolean>('api_pool_pause', { pool, uid, paused }),
+    /** 内容拦截降级状态（P3-1）：active + 自动恢复时刻 */
+    promptDegradeStatus: () =>
+      invoke<{ active: boolean; until: number | null }>('prompt_degrade_status'),
+    /** 立即恢复：清掉降级期，不必等次日 00:00 */
+    promptDegradeClear: () => invoke<void>('prompt_degrade_clear'),
+    /** 开关「内容拦截降级重试」（落盘 + 热应用） */
+    promptDegradeSet: (enabled: boolean) => invoke<boolean>('prompt_degrade_set', { enabled }),
     /** Qoder 池实时状态（Qoder「资源调度」页：含 per-account inflight 在途计数） */
     qoderPoolStatus: () => invoke<PoolStatus[]>('qoder_pool_status'),
     /** 手动同步 Qoder 模型目录（复用每日调度任务入口；返回采纳模型数） */

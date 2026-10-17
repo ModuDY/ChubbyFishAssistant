@@ -664,6 +664,8 @@ fn run_wb_stream(
         };
 
         let mut same_attempt: u32 = 0;
+        // 内容拦截降级每请求只做一次（与流式路径同口径）
+        let mut degrade_retried = false;
         loop {
             // 客户端断连检测：重试等待/长路径期间离开则终止（同账号 guard 随 Drop 释放）。
             // 审查 M5：断连为请求终局，补记一行失败用量（已绑定 picked 账号）
@@ -799,6 +801,28 @@ fn run_wb_stream(
                     }
                 }
                 Err((status, resp_body, retry_after)) => {
+                    // 内容拦截降级（P3-1，默认关闭）：上游按 system 指纹逐字匹配误杀。
+                    // 换中性提示词同号重试一次；成功后进入降级期（次日 00:00 恢复）
+                    if !degrade_retried
+                        && state.prompt_degrade_enabled.load(std::sync::atomic::Ordering::Relaxed)
+                        && super::retry::is_content_policy_block(status, &resp_body)
+                    {
+                        degrade_retried = true;
+                        super::degrade::trigger();
+                        state.logger.log_sched_event(
+                            "内容拦截：已切换中性提示词重试（至次日 00:00 自动恢复，可在设置中立即恢复）",
+                        );
+                        let base = wb_payload::prepare_wb_chat_body(
+                            body_vec, model, &picked.uid, &conv_id, effort.as_deref(), sanitize, &templates,
+                        );
+                        converted = super::prompt::apply_degraded_system(&base);
+                        if !super::wait_backoff_interruptible(200, || tx.is_closed()) {
+                            let duration_ms = start_ts.elapsed().as_millis() as u64;
+                            state.record_usage(true, model, &picked.uid, key_id, false, true, duration_ms, 0, 0);
+                            return;
+                        }
+                        continue;
+                    }
                     // 11128 渠道风控（issue #57）：按请求指纹拦截、与账号/模型无关，
                     // 换号无意义。清洗未启用时强制清洗后同号重试一次；已清洗仍命中
                     // → 走下方 retry_plan 原样 Fatal（需更新 wb_template_map.json）
@@ -1060,6 +1084,8 @@ pub async fn wb_aggregate_chat(
             };
 
             let mut same_attempt: u32 = 0;
+        // 内容拦截降级每请求只做一次（与流式路径同口径）
+        let mut degrade_retried = false;
             loop {
                 let ttfb_start = Instant::now();
                 match wb_upstream::make_wb_request(&creds, &converted) {
@@ -1162,6 +1188,23 @@ pub async fn wb_aggregate_chat(
                         }
                     }
                     Err((status, resp_body, retry_after)) => {
+                        // 内容拦截降级（P3-1，默认关闭）：WB 非流式同口径
+                        if !degrade_retried
+                            && state.prompt_degrade_enabled.load(std::sync::atomic::Ordering::Relaxed)
+                            && super::retry::is_content_policy_block(status, &resp_body)
+                        {
+                            degrade_retried = true;
+                            super::degrade::trigger();
+                            state.logger.log_sched_event(
+                                "内容拦截：已切换中性提示词重试（至次日 00:00 自动恢复，可在设置中立即恢复）",
+                            );
+                            let base = wb_payload::prepare_wb_chat_body(
+                                &body_vec, &model, &picked.uid, &conv_id, effort.as_deref(), sanitize, &templates,
+                            );
+                            converted = super::prompt::apply_degraded_system(&base);
+                            super::wait_backoff_interruptible(200, || false);
+                            continue;
+                        }
                         // 11128 渠道风控（issue #57）：清洗未启用时强制清洗后同号重试一次
                         if status == 400 && super::retry::is_illegal_channel_error(&resp_body) {
                             if !sanitize {

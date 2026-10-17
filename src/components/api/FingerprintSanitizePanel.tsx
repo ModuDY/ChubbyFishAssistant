@@ -31,8 +31,58 @@ export default function FingerprintSanitizePanel() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
+  // ── 内容拦截降级（P3-1，默认关闭）──
+  const settings = useAppStore((s) => s.settings);
+  const [degradeOn, setDegradeOn] = useState(settings?.prompt_degrade_enabled ?? false);
+  const [degradeActive, setDegradeActive] = useState(false);
+  const [degradeUntil, setDegradeUntil] = useState<number | null>(null);
+  const [degradeBusy, setDegradeBusy] = useState(false);
   // 「恢复内置默认」二次确认倒计时句柄：重复点击需先撤销旧定时器，卸载必须清理
   const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /** 降级状态（网关未启动时读不到，保持原值不报错） */
+  const loadDegrade = useCallback(async () => {
+    try {
+      const st = await api.apiServer.promptDegradeStatus();
+      setDegradeActive(st.active);
+      setDegradeUntil(st.until);
+    } catch {
+      /* 网关未运行 */
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadDegrade();
+    const id = setInterval(() => void loadDegrade(), 30_000);
+    return () => clearInterval(id);
+  }, [loadDegrade]);
+
+  const toggleDegrade = async (next: boolean) => {
+    setDegradeBusy(true);
+    try {
+      await api.apiServer.promptDegradeSet(next);
+      setDegradeOn(next);
+      await loadDegrade();
+      toast('success', next ? '已开启内容拦截降级重试' : '已关闭内容拦截降级重试');
+    } catch (e) {
+      toast('error', `保存失败：${e}`);
+    } finally {
+      setDegradeBusy(false);
+    }
+  };
+
+  const clearDegrade = async () => {
+    setDegradeBusy(true);
+    try {
+      await api.apiServer.promptDegradeClear();
+      await loadDegrade();
+      toast('success', '已恢复：后续请求重新使用客户端原始提示词');
+    } catch (e) {
+      toast('error', `恢复失败：${e}`);
+    } finally {
+      setDegradeBusy(false);
+    }
+  };
 
   useEffect(
     () => () => {
@@ -144,6 +194,39 @@ export default function FingerprintSanitizePanel() {
             {savedAt && !builtin && ` 最近保存：${fmtTs(savedAt)}`}
           </p>
         </div>
+      </div>
+
+      {/* 内容拦截降级（P3-1）：默认关闭。规则改写漏网时，被 400 拦下还能救回来 */}
+      <div className="rounded-lg border border-slate-200 px-3 py-2 dark:border-zinc-700">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-sm font-medium">内容拦截降级重试</span>
+          <Badge tone={degradeOn ? 'blue' : 'slate'}>{degradeOn ? '已开启' : '已关闭'}</Badge>
+          {degradeActive && <Badge tone="amber">降级生效中</Badge>}
+          <label className="ml-auto flex items-center gap-2 text-xs text-slate-500 dark:text-zinc-400">
+            <input
+              type="checkbox"
+              checked={degradeOn}
+              disabled={degradeBusy}
+              onChange={(e) => void toggleDegrade(e.target.checked)}
+            />
+            启用
+          </label>
+        </div>
+        <p className="mt-1 text-xs text-slate-400">
+          命中上游内容策略拦截时，整条请求会被 400 拒绝。开启后网关换一段极简中性提示词，同号重试一次；
+          成功则进入降级期至次日 00:00（+08:00），期间直接用中性提示词，避免反复撞墙。
+          降级期内模型缺少客户端系统提示词约束，表现可能偏松散——可随时「立即恢复」。
+        </p>
+        {degradeActive && (
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+            <span className="text-amber-600 dark:text-amber-400">
+              降级至 {degradeUntil ? new Date(degradeUntil * 1000).toLocaleString('zh-CN', { hour12: false }) : '次日 00:00'}
+            </span>
+            <button className="underline" disabled={degradeBusy} onClick={() => void clearDegrade()}>
+              立即恢复
+            </button>
+          </div>
+        )}
       </div>
 
       {/* 操作条 */}

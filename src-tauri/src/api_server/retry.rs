@@ -33,6 +33,35 @@ pub fn is_illegal_channel_error(body: &str) -> bool {
         || contains_code_11128(body)
 }
 
+/// 内容策略拦截识别（P3-1 降级重试的触发条件）。
+///
+/// 与 11128 渠道风控刻意区分：那个按请求指纹判定、处置是强制清洗；
+/// 本判据针对**内容审核**，处置是换中性提示词重试一次，且不罚账号。
+///
+/// 判定保守：只认标注清楚的审核文案，避免把普通参数错误 400
+/// （context_too_long、tool schema 非法等）误判成内容拦截而白打一次上游。
+pub fn is_content_policy_block(status: u16, body: &str) -> bool {
+    // 上游内容拦截以 400 为主，少数网关用 403
+    if status != 400 && status != 403 {
+        return false;
+    }
+    // 渠道风控优先：11128 有自己的处置路径，不得被当成内容拦截
+    if is_illegal_channel_error(body) {
+        return false;
+    }
+    let low = body.to_ascii_lowercase();
+    const EN: [&str; 6] = [
+        "content policy",
+        "content_policy",
+        "inappropriate content",
+        "sensitive content",
+        "violates our usage polic",
+        "content filter",
+    ];
+    const ZH: [&str; 4] = ["内容安全", "内容审核", "审核不通过", "违反使用政策"];
+    EN.iter().any(|k| low.contains(k)) || ZH.iter().any(|k| body.contains(k))
+}
+
 /// `"code": 11128` 宽松匹配：容忍键/冒号/值之间的序列化空白差异
 /// （Go encoding/json 紧凑无空格，但报文可能经中间层重序列化）；
 /// 值须带数字边界（`111280`/`111289` 不误撞），键名引号边界天然排除
@@ -211,6 +240,32 @@ mod tests {
         assert_eq!(retry_plan(400, "quota exceeded", 0, None), RetryAction::Fatal);
         // 非 400 状态码不受影响
         assert_eq!(retry_plan(500, "insufficient credit", 0, None), RetryAction::SwitchKey);
+    }
+
+    /// 内容拦截判定：只认审核文案，且与 11128 渠道风控互斥
+    #[test]
+    fn content_policy_block_is_conservative() {
+        // 明确的内容审核文案 → 命中
+        assert!(is_content_policy_block(
+            400,
+            r#"{"error":{"message":"Blocked by content policy"}}"#
+        ));
+        assert!(is_content_policy_block(400, "内容审核未通过"));
+        assert!(is_content_policy_block(403, "sensitive content detected"));
+        // 11128 渠道风控有自己的处置路径，不得误判为内容拦截
+        assert!(!is_content_policy_block(
+            400,
+            r#"{"code":11128,"msg":"Illegal API invocation from channel"}"#
+        ));
+        // 普通参数错误 400：不得命中（否则每次白白多打一次上游）
+        assert!(!is_content_policy_block(
+            400,
+            r#"{"code":4001,"message":"context_too_long"}"#
+        ));
+        assert!(!is_content_policy_block(400, "tool_calls[i].function.name invalid"));
+        // 非 400/403：不命中
+        assert!(!is_content_policy_block(429, "content policy"));
+        assert!(!is_content_policy_block(500, "content policy"));
     }
 
     #[test]

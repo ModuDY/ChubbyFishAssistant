@@ -1411,6 +1411,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             // 分级重试（T2.2/F-33，与 wb_route 同一张表）：same_attempt 为同账号
             // 重试计数，换号后随新账号归零；总轮换上限仍受 MAX_ROTATE 约束
             let mut same_attempt: u32 = 0;
+            // 内容拦截降级每请求只做一次（换中性提示词重试后仍被拦 → 走原分级重试）
+            let mut degrade_retried = false;
             loop {
                 // TTFB 计时（请求发起 → 上游首行到达，与 wb_route 同语义）：
                 // AtomicU64 0 哨兵 = 尚未读到首行（首字超时等失败路径不产出 ttfb）
@@ -1626,6 +1628,34 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                         return; // 流式结束后直接返回
                     }
                     Err((status, resp_body, retry_after)) => {
+                        // 内容拦截降级（P3-1，默认关闭）：上游按 system 指纹逐字匹配误杀。
+                        // 换中性提示词同号重试一次；成功后进入降级期（次日 00:00 恢复），
+                        // 期间直接发中性提示词，不再反复撞墙
+                        if !degrade_retried
+                            && state.prompt_degrade_enabled.load(std::sync::atomic::Ordering::Relaxed)
+                            && super::retry::is_content_policy_block(status, &resp_body)
+                        {
+                            degrade_retried = true;
+                            super::degrade::trigger();
+                            state.logger.log_sched_event(
+                                "内容拦截：已切换中性提示词重试（至次日 00:00 自动恢复，可在设置中立即恢复）",
+                            );
+                            let base = super::payload::prepare_llm_chat_body(
+                                &body_vec, &state.default_model, &picked.uid,
+                                &picked.device_id, &picked.machine_id,
+                                &super::models_sync::load_models(&state.data_dir),
+                                sanitize, &templates,
+                            );
+                            converted = super::prompt::apply_degraded_system(&base);
+                            if !super::wait_backoff_interruptible(200, || tx.is_closed()) {
+                                state.record_usage(
+                                    false, &model, &picked.uid, &key_id, false, stream,
+                                    start_ts.elapsed().as_millis() as u64, 0, 0,
+                                );
+                                return;
+                            }
+                            continue;
+                        }
                         // 11128 渠道风控（issue #57）：按请求指纹拦截、与账号/模型无关，
                         // 换号无意义。清洗未启用时强制清洗后同号重试一次；已清洗仍命中
                         // → 走下方 retry_plan 原样 Fatal（需更新 wb_template_map.json）
@@ -1967,6 +1997,8 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
             // 分级重试（T2.2/F-33，与 wb_route 同一张表）：same_attempt 为同账号
             // 重试计数，换号后随新账号归零；总轮换上限仍受 MAX_ROTATE 约束
             let mut same_attempt: u32 = 0;
+            // 内容拦截降级每请求只做一次（同流式路径口径）
+            let mut degrade_retried = false;
             loop {
                 match make_upstream_request(&picked.jwt, &picked.uid, &picked.device_id, &picked.machine_id, &converted) {
                     Ok((reader, primary_hdr)) => {
@@ -2100,6 +2132,26 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                         }
                     }
                     Err((status, resp_body, retry_after)) => {
+                        // 内容拦截降级（P3-1，默认关闭）：非流式同口径
+                        if !degrade_retried
+                            && state.prompt_degrade_enabled.load(std::sync::atomic::Ordering::Relaxed)
+                            && super::retry::is_content_policy_block(status, &resp_body)
+                        {
+                            degrade_retried = true;
+                            super::degrade::trigger();
+                            state.logger.log_sched_event(
+                                "内容拦截：已切换中性提示词重试（至次日 00:00 自动恢复，可在设置中立即恢复）",
+                            );
+                            let base = super::payload::prepare_llm_chat_body(
+                                &body_vec, &state.default_model, &picked.uid,
+                                &picked.device_id, &picked.machine_id,
+                                &super::models_sync::load_models(&state.data_dir),
+                                sanitize, &templates,
+                            );
+                            converted = super::prompt::apply_degraded_system(&base);
+                            super::wait_backoff_interruptible(200, || false);
+                            continue;
+                        }
                         // 11128 渠道风控（issue #57）：清洗未启用时强制清洗后同号重试一次；
                         // 已清洗仍命中 → 走下方 retry_plan 原样 Fatal
                         if status == 400 && super::retry::is_illegal_channel_error(&resp_body) {
@@ -2887,6 +2939,7 @@ mod tests {
             fallback_log_last_ms: std::sync::Mutex::new(std::collections::HashMap::new()),
             wb_enabled: std::sync::atomic::AtomicBool::new(true),
             wb_sanitize: std::sync::atomic::AtomicBool::new(true),
+            prompt_degrade_enabled: std::sync::atomic::AtomicBool::new(false),
             wb_default_thinking: std::sync::atomic::AtomicBool::new(false),
             wb_tool_exec: std::sync::atomic::AtomicBool::new(false),
             wb_bg_downgrade: std::sync::atomic::AtomicBool::new(false),

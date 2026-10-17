@@ -88,6 +88,49 @@ fn save_paused(
         .map_err(|e| format!("保存暂停状态失败: {e}"))
 }
 
+// ── 内容拦截降级（P3-1）──────────────────────────────────────────────────
+
+/// 降级状态：是否处于降级期 + 自动恢复时刻（Unix 秒）
+#[tauri::command]
+pub fn prompt_degrade_status() -> serde_json::Value {
+    let until = crate::api_server::degrade::until_ts();
+    serde_json::json!({
+        "active": until > 0,
+        "until": if until > 0 { serde_json::json!(until) } else { serde_json::Value::Null },
+    })
+}
+
+/// 立即恢复：清掉降级期，不必等次日 00:00（降级期内模型会缺系统提示词约束）
+#[tauri::command]
+pub fn prompt_degrade_clear() {
+    crate::api_server::degrade::clear();
+}
+
+/// 开启/关闭「内容拦截降级重试」：落盘 app_settings 并热应用（无需重启网关）。
+/// 关闭时顺带清除进行中的降级期，避免状态残留。
+#[tauri::command]
+pub fn prompt_degrade_set(
+    state: State<'_, AppState>,
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+    enabled: bool,
+) -> Result<bool, String> {
+    let store = crate::store::db(&state.data_dir);
+    let mut s: crate::models::Settings = store.kv_get("app_settings");
+    s.prompt_degrade_enabled = enabled;
+    store
+        .kv_set("app_settings", &s)
+        .map_err(|e| format!("保存设置失败: {e}"))?;
+    if let Some(rt) = safe_lock(&runtime).as_ref() {
+        rt.shared
+            .prompt_degrade_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+    if !enabled {
+        crate::api_server::degrade::clear();
+    }
+    Ok(enabled)
+}
+
 /// 账号级「暂停选号」开关：只影响选号，签到/保活/额度刷新照常。
 /// `pool`: trae | wb | qoder | doubao
 #[tauri::command]
@@ -394,6 +437,10 @@ pub async fn do_start(
         fallback_log_last_ms: std::sync::Mutex::new(std::collections::HashMap::new()),
         wb_enabled: std::sync::atomic::AtomicBool::new(pool_file.wb_enabled),
         wb_sanitize: std::sync::atomic::AtomicBool::new(true),
+        // 内容拦截降级重试（P3-1）：开关来自 app_settings，默认关闭
+        prompt_degrade_enabled: std::sync::atomic::AtomicBool::new(
+            state.settings().prompt_degrade_enabled,
+        ),
         // T5.3/T5.5/T5.6③ 开关（api_pool.json，serde default 兼容旧文件）
         wb_default_thinking: std::sync::atomic::AtomicBool::new(pool_file.wb_default_thinking),
         wb_tool_exec: std::sync::atomic::AtomicBool::new(pool_file.wb_tool_exec),

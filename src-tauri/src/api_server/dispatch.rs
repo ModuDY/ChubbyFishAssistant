@@ -1030,6 +1030,7 @@ mod tests {
             fallback_log_last_ms: std::sync::Mutex::new(std::collections::HashMap::new()),
             wb_enabled: AtomicBool::new(true),
             wb_sanitize: AtomicBool::new(true),
+            prompt_degrade_enabled: AtomicBool::new(false),
             wb_default_thinking: AtomicBool::new(false),
             wb_tool_exec: AtomicBool::new(false),
             wb_bg_downgrade: AtomicBool::new(false),

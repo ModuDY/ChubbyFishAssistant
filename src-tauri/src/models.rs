@@ -255,6 +255,11 @@ pub struct Settings {
     #[serde(default = "default_trae_models_sync_hhmm")]
     pub trae_models_sync_hhmm: String,
     // ── 通知渠道（F-19；Trae/Buddy 全平台共用，系统设置页通知渠道面板维护） ──
+    /// 内容拦截降级重试（P3-1）：命中上游内容策略拦截时，换中性提示词同号
+    /// 重试一次，并进入降级期至次日 00:00（+08:00）。
+    /// **默认关闭**：开启前请先确认没有把普通 400 误判成内容拦截
+    #[serde(default)]
+    pub prompt_degrade_enabled: bool,
     /// 通知总开关（默认开；关闭后所有事件渠道静默）
     #[serde(default = "default_true")]
     pub notify_enabled: bool,
