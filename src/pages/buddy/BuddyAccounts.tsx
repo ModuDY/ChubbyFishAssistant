@@ -956,7 +956,7 @@ export default function BuddyAccounts() {
         </div>
       ) : (
         <div className="mt-5 card overflow-x-auto">
-          <table className="w-full min-w-[980px] text-sm">
+          <table className="w-full min-w-[1240px] whitespace-nowrap text-sm">
             <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-zinc-900">
               <tr>
                 <th className="px-4 py-2 text-left">账号</th>

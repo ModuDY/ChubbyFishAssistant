@@ -483,7 +483,7 @@ export default function Accounts() {
         ))}
       </div>
 
-      <div className="card overflow-hidden">
+      <div className="card overflow-x-auto">
         {filtered.length === 0 ? (
           <div className="p-6">
             <EmptyState
@@ -493,7 +493,7 @@ export default function Accounts() {
             />
           </div>
         ) : (
-          <table className="w-full text-sm">
+          <table className="w-full min-w-[1240px] whitespace-nowrap text-sm">
             <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-zinc-900">
               <tr>
                 <th className="px-4 py-2 text-left">账号</th>
