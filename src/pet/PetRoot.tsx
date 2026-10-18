@@ -12,12 +12,12 @@
  * - 右键菜单禁用（窗口无边框，菜单会飞出屏幕）。
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { PointerEvent as ReactPointerEvent } from 'react';
+import type { CSSProperties, PointerEvent as ReactPointerEvent } from 'react';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { api } from '../lib/tauri';
 import PetBubble from './PetBubble';
-import PetSprite from './PetSprite';
+import PetSprite, { type SpriteBox } from './PetSprite';
 import { coreAction, makeTransient, raise } from './petState';
 import type { PetCoreState, PetTransient } from './petState';
 import { pickLine } from './lines';
@@ -55,6 +55,8 @@ export default function PetRoot() {
   const [bubbleEnabled, setBubbleEnabled] = useState(true);
   const [opacity, setOpacity] = useState(1);
   const [sleepMinutes, setSleepMinutes] = useState(5);
+  /** 角色可见包围盒（首帧 alpha 采样得出，窗口百分比）；null = 尚未测量 */
+  const [hitBox, setHitBox] = useState<SpriteBox | null>(null);
 
   /** 核心态最新值：事件回调与定时器里避免读到闭包旧值 */
   const coreRef = useRef(core);
@@ -261,6 +263,8 @@ export default function PetRoot() {
   /** 稳定引用：否则父组件每次渲染都会重置气泡的自动消失计时器 */
   const clearBubble = useCallback(() => setBubble(null), []);
 
+  const handleMeasure = useCallback((box: SpriteBox) => setHitBox(box), []);
+
   const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
     dragRef.current = { x: e.clientX, y: e.clientY, started: false };
@@ -317,26 +321,52 @@ export default function PetRoot() {
     if (core === 'sad') setCore('idle');
   }, [transient, core]);
 
+  // 热区：测量前用偏保守的居中区域（覆盖角色主体，避免"点了没反应"）；
+  // 测量后严格贴合 alpha 包围盒，左右/上各留少量容错，方便点到头发边缘
+  const hitStyle: CSSProperties = hitBox
+    ? {
+        // alpha 阈值会把头发/裙摆边缘的半透明像素排掉，故四周各补一点余量，
+        // 但远小于"整窗可点"——空白区域（左右两侧与顶部大片）仍然不响应
+        left: `${Math.max(0, hitBox.left - 4)}%`,
+        top: `${Math.max(0, hitBox.top - 3)}%`,
+        width: `${Math.min(100, hitBox.width + 8)}%`,
+        height: `${Math.min(100, hitBox.height + 4)}%`,
+      }
+    : { left: '14%', top: '52%', width: '72%', height: '48%' };
+
+  // 气泡底边贴在角色头顶上方 8px（距底部 = 100 - top%）
+  const bubbleBottom = hitBox ? `calc(${(100 - hitBox.top).toFixed(2)}% + 8px)` : '48%';
+
   return (
-    <div
-      className={`pet-root ${dragging ? 'dragging' : ''}`}
-      style={{ opacity }}
-      onPointerDown={onPointerDown}
-      onPointerMove={onPointerMove}
-      onPointerUp={onPointerUp}
-      onPointerCancel={onPointerUp}
-      onDoubleClick={onDoubleClick}
-      onContextMenu={(e) => e.preventDefault()}
-    >
+    <div className={`pet-root ${dragging ? 'dragging' : ''}`} style={{ opacity }}>
       <PetSprite
         actionId={actionId}
         playKey={playKey}
         paused={paused}
         onEnded={onSpriteEnded}
+        onMeasure={handleMeasure}
       />
+      {/* 气泡锚点：底边贴在角色头顶上方，而不是窗口顶部 */}
       {bubbleEnabled && bubble ? (
-        <PetBubble seq={bubble.seq} text={bubble.text} onDone={clearBubble} />
+        <div className="pet-bubble-anchor" style={{ bottom: bubbleBottom }}>
+          <PetBubble seq={bubble.seq} text={bubble.text} onDone={clearBubble} />
+        </div>
       ) : null}
+      {/*
+        点击/拖拽热区：只覆盖角色的可见包围盒。
+        根节点 pointer-events:none，窗口里的空白区域不再触发动作，
+        也不会把「点空白」误判成单击回应。
+      */}
+      <div
+        className={`pet-hit ${dragging ? 'dragging' : ''}`}
+        style={hitStyle}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerCancel={onPointerUp}
+        onDoubleClick={onDoubleClick}
+        onContextMenu={(e) => e.preventDefault()}
+      />
     </div>
   );
 }

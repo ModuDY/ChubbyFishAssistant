@@ -1,7 +1,9 @@
 /* 桌宠窗口样式（仅 `?pet=1` 页面动态加载，不影响主窗口）
  *
- * 关键约束：整页必须是"全透明底"——任何背景色都会让透明窗口变成一块黑/白方块。
- * 因此这里不引用主题变量、不跟随明暗主题。
+ * 关键约束 1：整页必须是"全透明底"——任何背景色都会让透明窗口变成一块黑/白方块。
+ * 关键约束 2：**不要给整窗绑指针事件**——视频画布 640×360，角色只占中间一块，
+ *   若根节点接收事件，点角色旁边一大片空白也会触发点击回应（用户实测反馈）。
+ *   故根节点 `pointer-events: none`，只有 `.pet-hit`（角色包围盒）可交互。
  */
 
 html.pet-window,
@@ -15,8 +17,8 @@ body.pet-window {
 body.pet-window {
   user-select: none;
   -webkit-user-select: none;
-  /* 窗口无边框：禁掉系统级拖选与右键菜单（PetRoot 里也 preventDefault 兜底） */
-  cursor: grab;
+  /* 空白区域不做"可拖拽"暗示，抓手只在角色热区上出现 */
+  cursor: default;
 }
 
 #root {
@@ -28,13 +30,8 @@ body.pet-window {
   inset: 0;
   overflow: hidden;
   background: transparent;
-  /* 触屏/触控板手势不滚动页面 */
   touch-action: none;
-  cursor: grab;
-}
-
-.pet-root.dragging {
-  cursor: grabbing;
+  pointer-events: none;
 }
 
 /* 视频按窗口宽度铺满、贴底对齐：素材 640×360，角色脚底在 y=330，
@@ -49,12 +46,33 @@ body.pet-window {
   pointer-events: none;
 }
 
-/* 气泡：视频上方留白区；不接收指针事件，避免挡住拖拽 */
-.pet-bubble {
+/* 角色热区：几何由 PetRoot 按首帧 alpha 包围盒注入（left/top/width/height 百分比） */
+.pet-hit {
   position: absolute;
-  left: 10px;
-  right: 10px;
-  top: 6px;
+  pointer-events: auto;
+  cursor: grab;
+  touch-action: none;
+}
+
+.pet-hit.dragging {
+  cursor: grabbing;
+}
+
+/* 气泡锚点：底边贴在角色头顶（bottom 由 PetRoot 注入），水平居中 */
+.pet-bubble-anchor {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* 气泡本体：宽度随文字收缩但不超过 230px，避免短句拉成一条横条 */
+.pet-bubble {
+  position: relative;
+  max-width: 230px;
   padding: 6px 10px;
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.95);
@@ -69,7 +87,7 @@ body.pet-window {
   animation: pet-bubble-in 0.18s ease-out;
 }
 
-/* 气泡小尾巴，指向角色 */
+/* 气泡小尾巴，指向角色头顶 */
 .pet-bubble::after {
   content: '';
   position: absolute;
