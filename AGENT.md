@@ -267,6 +267,14 @@ ai-work-assistant/
 - **人工确认疑点批（v3.7.0 阶段 6）**：① jt- 换号链路补纯函数单测锁定（`is_pat_channel` 判定 + `job_token_attempts` 探测端点 `/api/v1/me/jobToken` 首位——真实 token 无法离线复现，以单测固化行为契约，含「jt- 无 pat 备份不走 PAT 通道」反例锁定）；② PAT 导入成功后清旧设备流凭证残留（`clear_device_flow_creds`：refresh_token/refresh_expires_at_ms；machine_id/machine_token 保留——有效指纹 PAT 通道仍消费）；③ `qoder_account_save` 脏检查（name/note 均未变跳过网关池 reload）；④ env_reset 第 9 项 `work_client`（QoderWork 客户端 Local State + Network\Cookies；Work 本体进程与 IDE 同名 "Qoder CN.exe"，关闭动作天然覆盖）；⑤ KDF 迁移 Argon2id（见上条②）；⑥ **明文兼容导入通道保留为有意决策**（向后兼容旧版导出文件；仅导入解包瞬间经手，运行期存储/导出/日志凭证红线不变）；⑦ Qoder 签到进行态 store 化（监听与归约移入前端 store 层，见 §6）；⑧ Global 区维持仅 CN 不接线（产品决策：Global 专属模型仅目录可见、显式 404；账号-区域关系 / Global 域 COSY 签名等前置未决项留档 backlog，见 F-80-余 v2）。
 - **切换器**：`target_app="Qoder"`（authfile 布局），快照落 `data/profiles_qoder`；`target_app="QoderWork"`（electron_root 布局，Work 数据目录 `%APPDATA%\com.qodercn.app.stable`）快照落 `data/profiles_qoder_work`。electron_root 根级白名单 9 项含**登录凭据三件套** `auth.v1.dat` / `auth.machine-id` / `auth-profile-overlays.v1.dat`（2026-10-04 切换无效根因修复：Work 登录真源 = 数据目录根级 `auth.v1.dat`（v10 密文 JSON，token/refreshToken/user.id），原白名单仅 6 项 → 恢复 Cookies/LocalStorage 成功但客户端启动仍读旧 `auth.v1.dat`，切了等于没切）；恢复侧**对称清理**——快照不含而数据目录存活的凭据文件删除（旧版快照恢复后不串号：Work 回退未登录态，重登 + 重存快照自愈）；完整性校验对 `auth.v1.dat` 缺失 Warn（旧版快照合法存在，不 fatal）。
 
+### 5.5 桌宠窗口（P0，`commands/pet.rs`）
+
+- **窗口**：`tauri.conf.json` 声明式创建 `label="pet"`（透明/无边框/置顶/skipTaskbar/`visible:false`）；前端复用 `index.html` 的 `?pet=1` 分流（`?pet=1&probe=1` → 渲染诊断页），**不新增 Vite 入口**。
+- **命令**：`pet_show` / `pet_hide` / `pet_toggle`（写 `pet_enabled` 并立即作用窗口）· `pet_status`（enabled/visible/x/y/scale/opacity/bubble/sleepMinutes）· `pet_save_position`（无参：Rust 读 `outer_position` 物理坐标落盘，前端 `moved` 去抖 500ms 调用）· `pet_focus_main`（双击桌宠呼出主窗口）。诊断命令 `pet_probe_ready` / `pet_probe_hide_and_restore` / `pet_probe_report` 仅探针页使用。
+- **生命周期**：`pet_enabled=false` 时必须**真正 hide**（透明窗口留着仍会截点击）；`CloseRequested` 一律 `prevent_close` + hide（窗口销毁后无重建路径，托盘开关会变死按钮）。
+- **设置联动**：`settings_set` 命中 `pet_*` 键即调 `pet::apply_settings`（尺寸/位置/置顶/显隐）并 emit `pet-update`，改完立即生效、无需重启。
+- **红线**：桌宠只**读**前端事件、只写 `pet_*` 设置，不碰账号/签到/积分数据，不新增网络外发（P3 台词走本机 127.0.0.1 网关）。
+
 ## 6. Tauri 事件（Rust → 前端）
 
 | 事件 | payload |
@@ -286,6 +294,7 @@ ai-work-assistant/
 | `qoder-checkin-progress` | `{"type":"start",total}` / `{"type":"account",index,user_id,name,status,message,reward?,campaigns?}` / `{"type":"done",ok,already,failed,failed_empty_campaigns,skipped_busy?}`（Qoder 签到管线，与 wb-checkin-progress 前端组件同构；`failed_empty_campaigns` 为活动未开始/不可用类失败计数，启动补签推送按 `failed - failed_empty_campaigns` 判定；`campaigns` 为 F-80-余 v2 逐活动明细 `[{id,name,kind,reward?}]`，档期日历数据源；`skipped_busy=true` 表示跨进程锁占用本轮跳过——调度稍后自动重试，前端专项提示**不计入**成功/失败统计；**疑点⑦ store 化**：监听与归约在前端 store 层 setupListeners/`applyQoderCheckinLine`（qoderCheckin.running/lines/done/doneRev），页面切走/卸载不丢事件，QoderCheckin 页按 doneRev 联动刷新） |
 | `qoder-oauth-progress` | `{stage:'init'\|'browser'\|'polling'\|'success'\|'error', message, auth_url?}`（Qoder 设备流登录进度；auth_url 仅 browser 阶段携带） |
 | `qoder-oauth-done` | `{ok, id?, nickname?, message}`（设备流结果；成功已入池，凭证不出 Rust） |
+| `pet-update` | `{visible,bubble,opacity,scale,sleepMinutes}`（Rust → pet 窗口；窗口显隐或 `pet_*` 设置变化时发送，桌宠据此暂停/续播视频并同步气泡配置） |
 
 ## 7. 数据文件
 
@@ -295,6 +304,7 @@ ai-work-assistant/
 %APPDATA%\AIWorkAssistant\
 ├── conf/
 │   ├── app_settings.json         # Settings 全字段（snake_case）——UI 可编辑配置保留文件形态
+│   │                             #   含 pet_*（桌宠开关/位置/缩放/透明度/气泡，均 serde(default) 兼容老配置）
 │   ├── vault.stronghold          # jwt/refresh_token 权威加密存储（Stronghold）
 │   └── vault_key.bin             # vault 主密码（DPAPI 加密）
 ├── data/
