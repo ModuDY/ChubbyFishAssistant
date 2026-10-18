@@ -79,5 +79,6 @@ if defined RUNNING (
 )
 
 echo Starting AI Work Assistant...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process '%EXE%'"
+rem 直接 start 拉起（GUI 子系统，无控制台窗口；不再绕 powershell，省一次进程创建与窗口闪烁）
+start "" "%EXE%"
 exit /b 0
