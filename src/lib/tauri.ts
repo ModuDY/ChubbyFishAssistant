@@ -39,6 +39,7 @@ import type {
   OAuthLoginUrl,
   OAuthLoginResult,
   OAuthLoginDoneEvent,
+  PetStatus,
   PoolStatus,
   ProfileInfo,
   ProxyLogListResult,
@@ -276,6 +277,17 @@ export const api = {
     // T8：近 N 天签到结果趋势（Dashboard 堆叠图）
     trends: (days?: number) =>
       invoke<CheckinTrendPoint[]>('checkin_trends', { days: days ?? null }),
+  },
+  // ---- 桌宠（Rust commands/pet.rs；窗口显隐、位置记忆与诊断） ----
+  pet: {
+    show: () => invoke<boolean>('pet_show'),
+    hide: () => invoke<boolean>('pet_hide'),
+    toggle: () => invoke<boolean>('pet_toggle'),
+    status: () => invoke<PetStatus>('pet_status'),
+    /** 记录当前窗口位置（前端在 moved 去抖后调用，无参数；Rust 读窗口实际坐标） */
+    savePosition: () => invoke('pet_save_position'),
+    /** 双击桌宠 → 呼出并聚焦主窗口 */
+    focusMain: () => invoke('pet_focus_main'),
   },
   misc: {
     storageHealth: () => invoke<StorageHealth>('storage_health'),

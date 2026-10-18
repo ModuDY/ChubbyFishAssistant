@@ -22,6 +22,22 @@
         "resizable": true,
         "center": true,
         "maximized": true
+      },
+      {
+        "label": "pet",
+        "title": "AI Work 桌宠",
+        "url": "index.html?pet=1",
+        "width": 300,
+        "height": 360,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focus": false,
+        "visible": false,
+        "center": false
       }
     ],
     "security": {

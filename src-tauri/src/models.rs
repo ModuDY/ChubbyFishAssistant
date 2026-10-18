@@ -368,6 +368,36 @@ pub struct Settings {
     /// 缺失/非法回退 APP_TABS 内置默认图标）
     #[serde(default)]
     pub app_icons: HashMap<String, String>,
+    // ── 桌宠（P0；**每个字段都必须 serde(default)**，否则老配置缺键会导致整表反序列化失败） ──
+    /// 桌宠总开关：默认关（不打扰存量用户），开启后启动即显示 pet 窗口
+    #[serde(default)]
+    pub pet_enabled: bool,
+    /// 窗口左上角 X（物理像素；None = 用主屏右下角默认位）
+    #[serde(default)]
+    pub pet_x: Option<i32>,
+    /// 窗口左上角 Y（物理像素；None = 用主屏右下角默认位）
+    #[serde(default)]
+    pub pet_y: Option<i32>,
+    /// 缩放比例 0.6~1.5（None = 1.0）
+    #[serde(default)]
+    pub pet_scale: Option<f32>,
+    /// 整体透明度 0.3~1.0（None = 1.0）
+    #[serde(default)]
+    pub pet_opacity: Option<f32>,
+    /// 是否显示气泡台词（None = 默认开）。
+    /// 用 Option 而非 `bool + serde(default=true)` 的原因：kv 为空时走 `Settings::default()`
+    /// 而不是 serde 反序列化，derive 的 Default 会给 bool 填 false，与"默认开"矛盾。
+    #[serde(default)]
+    pub pet_bubble: Option<bool>,
+    /// 人格档位（P3 台词/对话用；None = 默认人格）
+    #[serde(default)]
+    pub pet_persona: Option<String>,
+    /// 多久无业务事件进入打盹态（分钟；None = 5）
+    #[serde(default)]
+    pub pet_sleep_minutes: Option<u32>,
+    /// 素材包名（P4 换装预留；None = 内置）
+    #[serde(default)]
+    pub pet_pack: Option<String>,
 }
 
 fn default_api_port() -> u16 {

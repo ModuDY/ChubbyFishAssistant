@@ -34,6 +34,8 @@ use tauri::Manager;
 pub struct TrayMenu {
     pub api_item: MenuItem<tauri::Wry>,
     pub proxy_item: MenuItem<tauri::Wry>,
+    /// 桌宠显隐项：文本随 `pet_enabled` 在「显示桌宠 / 隐藏桌宠」间切换
+    pub pet_item: MenuItem<tauri::Wry>,
 }
 
 /// 主窗口最大化状态记忆（issue #46）：无边框窗口（decorations:false）在最大化状态下
@@ -59,7 +61,7 @@ fn hide_main_window(app: &tauri::AppHandle) -> bool {
 
 /// 显示主窗口：unminimize + show + set_focus；若隐藏前为最大化，则强制
 /// unmaximize→maximize 重建最大化状态（issue #46：即使内部状态已失同步也能恢复）。
-fn show_main_window(app: &tauri::AppHandle) {
+pub(crate) fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let was_maximized = app
             .try_state::<MainWindowMaximized>()
@@ -145,11 +147,15 @@ fn main() {
         .manage(Mutex::new(Option::<commands::api_server::ApiServerRuntime>::None))
         .manage(commands::checkin::CheckinGuard(tokio::sync::Mutex::new(())))
         .invoke_handler(tauri::generate_handler![
-            // 桌宠渲染路线验证（P0，临时；见 commands/pet.rs 头部说明）
+            // 桌宠（P0）：窗口显隐/位置记忆/缩放；诊断页命令保留供 ?probe=1 使用
+            commands::pet::pet_show,
+            commands::pet::pet_hide,
+            commands::pet::pet_toggle,
+            commands::pet::pet_status,
+            commands::pet::pet_save_position,
+            commands::pet::pet_focus_main,
             commands::pet::pet_probe_ready,
             commands::pet::pet_probe_hide_and_restore,
-            commands::pet::pet_toggle,
-            commands::pet::pet_close,
             commands::pet::pet_probe_report,
             commands::backup::backup_unlock,
             commands::backup::backup_action,
@@ -476,6 +482,14 @@ fn main() {
                 let result = (|| -> Result<(), Box<dyn std::error::Error>> {
                     let toggle_item =
                         MenuItem::with_id(app, "toggle", "显示/隐藏", true, None::<&str>)?;
+                    // 桌宠开关：文本按持久化的启用态初始化，切换时同步改文本
+                    let pet_item = MenuItem::with_id(
+                        app,
+                        "pet-toggle",
+                        commands::pet::tray_item_text(settings.pet_enabled),
+                        true,
+                        None::<&str>,
+                    )?;
                     let checkin_item =
                         MenuItem::with_id(app, "checkin", "一键签到", true, None::<&str>)?;
                     let api_item =
@@ -487,9 +501,18 @@ fn main() {
                         MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
                     let menu = Menu::with_items(
                         app,
-                        &[&toggle_item, &sep, &checkin_item, &api_item, &proxy_item, &sep, &quit_item],
+                        &[
+                            &toggle_item,
+                            &pet_item,
+                            &sep,
+                            &checkin_item,
+                            &api_item,
+                            &proxy_item,
+                            &sep,
+                            &quit_item,
+                        ],
                     )?;
-                    app.manage(TrayMenu { api_item, proxy_item });
+                    app.manage(TrayMenu { api_item, proxy_item, pet_item });
 
                     let icon = app
                         .default_window_icon()
@@ -534,6 +557,20 @@ fn main() {
                                         fs_utils::app_log(&st.data_dir, "菜单：显示窗口");
                                     }
                                 }
+                            }
+                            "pet-toggle" => {
+                                // 桌宠显隐：与设置页开关共用同一持久化字段（pet_enabled），
+                                // 菜单文本随状态切换，避免用户看到与实际不符的提示
+                                let enabled = commands::pet::pet_toggle(app.clone());
+                                let st = app.state::<AppState>();
+                                fs_utils::app_log(
+                                    &st.data_dir,
+                                    if enabled { "菜单：显示桌宠" } else { "菜单：隐藏桌宠" },
+                                );
+                                let tray = app.state::<TrayMenu>();
+                                let _ = tray
+                                    .pet_item
+                                    .set_text(commands::pet::tray_item_text(enabled));
                             }
                             "checkin" => {
                                 // 托盘一键签到：Trae（start_checkin_core 内部防重入锁）
@@ -700,6 +737,10 @@ fn main() {
             tasks::scheduler::start(app.handle().clone());
             backup::start(app.handle().clone());
 
+            // 桌宠初始状态（P0）：按 pet_enabled 决定显隐，并应用缩放与位置记忆。
+            // 窗口在配置里声明为 visible:false，这里 show 之前不会闪白
+            commands::pet::apply_settings(app.handle());
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -707,6 +748,18 @@ fn main() {
             // 先隐藏窗口再退出：exit(0) 内部的 WebView2 销毁可能耗时数秒（运行越久越明显），
             // 若直接退出，用户会看到窗口冻结「卡死」。隐藏后清理再慢也无感（issue：关闭卡死）。
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // 桌宠窗口只允许「隐藏」，不允许销毁：窗口一旦 close 就没了，
+                // show 无效、托盘开关变成死按钮（本项目没有运行时重建窗口的路径）
+                if window.label() == commands::pet::PET_LABEL {
+                    api.prevent_close();
+                    let app = window.app_handle();
+                    let _ = commands::pet::pet_hide(app.clone());
+                    let tray = app.state::<TrayMenu>();
+                    let _ = tray
+                        .pet_item
+                        .set_text(commands::pet::tray_item_text(false));
+                    return;
+                }
                 if window.label() != "main" {
                     return;
                 }

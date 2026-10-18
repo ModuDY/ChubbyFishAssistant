@@ -477,6 +477,36 @@ export interface Settings {
   hidden_apps: AppKey[];
   /** 侧边栏应用自定义图标（应用 key → 图标名，lib/appIcons.ts 候选表；缺失/非法回退内置默认图标） */
   app_icons: Partial<Record<AppKey, string>>;
+  // ── 桌宠（Rust Settings 同名字段，snake_case 必须一致） ──
+  /** 桌宠总开关（默认关） */
+  pet_enabled?: boolean;
+  /** 窗口位置（物理像素；null = 主屏右下角默认位） */
+  pet_x?: number | null;
+  pet_y?: number | null;
+  /** 缩放 0.6~1.5（null = 1.0） */
+  pet_scale?: number | null;
+  /** 整体透明度 0.3~1.0（null = 1.0） */
+  pet_opacity?: number | null;
+  /** 是否显示气泡台词（null/缺省 = 默认开） */
+  pet_bubble?: boolean | null;
+  /** 人格档位（P3 用） */
+  pet_persona?: string | null;
+  /** 无事件进入打盹态的分钟数（null = 5） */
+  pet_sleep_minutes?: number | null;
+  /** 素材包（P4 预留） */
+  pet_pack?: string | null;
+}
+
+/** 桌宠窗口实时状态（pet_status 返回值） */
+export interface PetStatus {
+  enabled: boolean;
+  visible: boolean;
+  x: number;
+  y: number;
+  scale: number;
+  opacity: number;
+  bubble: boolean;
+  sleepMinutes: number;
 }
 
 /** F-74：会话域（WorkBuddy = ~/.workbuddy，CodeBuddy = ~/.codebuddy） */

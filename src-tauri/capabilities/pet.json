@@ -1,6 +1,6 @@
 {
   "identifier": "pet",
-  "description": "桌宠窗口权限（验证期最小集）：仅保留拖拽与显隐，置顶/穿透等由 Rust 命令负责",
+  "description": "桌宠窗口权限（最小集）：仅拖拽与窗口自控；显隐/置顶/位置记忆由 Rust 命令负责，业务事件靠 core:default 里的 event:listen 订阅",
   "windows": ["pet"],
   "permissions": [
     "core:default",

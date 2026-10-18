@@ -1,0 +1,95 @@
+/* 桌宠窗口样式（仅 `?pet=1` 页面动态加载，不影响主窗口）
+ *
+ * 关键约束：整页必须是"全透明底"——任何背景色都会让透明窗口变成一块黑/白方块。
+ * 因此这里不引用主题变量、不跟随明暗主题。
+ */
+
+html.pet-window,
+body.pet-window {
+  background: transparent !important;
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
+}
+
+body.pet-window {
+  user-select: none;
+  -webkit-user-select: none;
+  /* 窗口无边框：禁掉系统级拖选与右键菜单（PetRoot 里也 preventDefault 兜底） */
+  cursor: grab;
+}
+
+#root {
+  height: 100%;
+}
+
+.pet-root {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  background: transparent;
+  /* 触屏/触控板手势不滚动页面 */
+  touch-action: none;
+  cursor: grab;
+}
+
+.pet-root.dragging {
+  cursor: grabbing;
+}
+
+/* 视频按窗口宽度铺满、贴底对齐：素材 640×360，角色脚底在 y=330，
+   贴底后"脚踩窗口下沿"，视觉上像站在任务栏上方 */
+.pet-video {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  width: 100%;
+  height: auto;
+  pointer-events: none;
+}
+
+/* 气泡：视频上方留白区；不接收指针事件，避免挡住拖拽 */
+.pet-bubble {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  top: 6px;
+  padding: 6px 10px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.95);
+  color: #1f2937;
+  font-family: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  font-size: 12px;
+  line-height: 1.55;
+  text-align: center;
+  word-break: break-word;
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.18);
+  pointer-events: none;
+  animation: pet-bubble-in 0.18s ease-out;
+}
+
+/* 气泡小尾巴，指向角色 */
+.pet-bubble::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: -5px;
+  width: 10px;
+  height: 10px;
+  margin-left: -5px;
+  background: rgba(255, 255, 255, 0.95);
+  transform: rotate(45deg);
+  border-radius: 2px;
+}
+
+@keyframes pet-bubble-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}

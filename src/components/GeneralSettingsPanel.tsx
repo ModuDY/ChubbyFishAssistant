@@ -375,6 +375,85 @@ export default function GeneralSettingsPanel() {
         </div>
       </section>
 
+      {/* 桌宠（P0）：开关 / 气泡 / 缩放 / 打盹；位置由窗口拖拽自动记忆 */}
+      <section className="card p-4">
+        <h3 className="mb-1 font-medium">桌宠</h3>
+        <p className="mb-3 text-xs text-slate-400">
+          桌面上的「大肥鱼」：把签到、积分、切换账号的进度变成实时动作，不参与业务、不写任何数据。
+          默认关闭；开启后也可以从托盘菜单「显示桌宠 / 隐藏桌宠」随时切换。保存后立即生效。
+        </p>
+        <div className="grid gap-x-8 gap-y-3 text-sm sm:grid-cols-2">
+          <div className="space-y-3">
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.pet_enabled ?? false}
+                onChange={(e) => update('pet_enabled', e.target.checked)}
+              />
+              启用桌面宠物
+            </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.pet_bubble ?? true}
+                onChange={(e) => update('pet_bubble', e.target.checked)}
+              />
+              显示气泡台词
+            </label>
+            <div>
+              <label className="label">大小</label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="range"
+                  min={0.6}
+                  max={1.5}
+                  step={0.1}
+                  value={form.pet_scale ?? 1}
+                  onChange={(e) => update('pet_scale', Number(e.target.value))}
+                  className="w-40"
+                />
+                <span className="text-xs text-slate-400">{Math.round((form.pet_scale ?? 1) * 100)}%</span>
+              </div>
+            </div>
+          </div>
+          <div className="space-y-3">
+            <div>
+              <label className="label">打盹触发（无事件分钟数）</label>
+              <input
+                type="number"
+                min={1}
+                max={120}
+                value={form.pet_sleep_minutes ?? 5}
+                onChange={(e) =>
+                  update('pet_sleep_minutes', Math.min(120, Math.max(1, Number(e.target.value) || 5)))
+                }
+                className="input w-24"
+              />
+            </div>
+            <div>
+              <label className="label">透明度</label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="range"
+                  min={0.3}
+                  max={1}
+                  step={0.05}
+                  value={form.pet_opacity ?? 1}
+                  onChange={(e) => update('pet_opacity', Number(e.target.value))}
+                  className="w-40"
+                />
+                <span className="text-xs text-slate-400">
+                  {Math.round((form.pet_opacity ?? 1) * 100)}%
+                </span>
+              </div>
+            </div>
+            <p className="text-xs text-slate-400">
+              拖到哪记到哪（500ms 去抖后落盘）；双击桌宠可呼出主窗口。
+            </p>
+          </div>
+        </div>
+      </section>
+
       {/* 通知渠道（F-19，Trae/Buddy 全平台共用） */}
       <section className="card p-4">
         <div className="mb-1 flex items-center justify-between">

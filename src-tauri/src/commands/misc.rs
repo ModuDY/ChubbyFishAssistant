@@ -873,7 +873,11 @@ pub fn notify_test(state: State<AppState>) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub fn settings_set(state: State<AppState>, patch: serde_json::Value) -> Result<(), String> {
+pub fn settings_set(
+    app: AppHandle,
+    state: State<AppState>,
+    patch: serde_json::Value,
+) -> Result<(), String> {
     // SQLite 化（P2）：app_settings 入 kv 文档（patch 合并语义不变）
     let store = crate::store::db(&state.data_dir);
     let mut current: serde_json::Value = store.kv_get("app_settings");
@@ -899,7 +903,17 @@ pub fn settings_set(state: State<AppState>, patch: serde_json::Value) -> Result<
             current_obj.insert(k.clone(), v.clone());
         }
     }
-    store.kv_set("app_settings", &current)
+    let saved = store.kv_set("app_settings", &current);
+    // 桌宠字段（开关/缩放/位置/透明度）改完要立刻作用到 pet 窗口，
+    // 否则用户必须重启才能看到效果。失败不阻断保存结果。
+    if patch
+        .as_object()
+        .map(|o| o.keys().any(|k| k.starts_with("pet_")))
+        .unwrap_or(false)
+    {
+        crate::commands::pet::apply_settings(&app);
+    }
+    saved
 }
 
 // ---------------- 积分历史（供看板/趋势图） ----------------
