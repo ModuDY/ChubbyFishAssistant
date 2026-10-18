@@ -4,7 +4,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "AI Work 助手",
+        "title": "大肥鱼助手",
         "width": 1180,
         "height": 760,
         "minWidth": 960,
@@ -16,7 +16,7 @@
       },
       {
         "label": "pet",
-        "title": "桌宠渲染验证",
+        "title": "大肥鱼桌宠（验证期配置）",
         "url": "index.html?pet=1&auto=1",
         "width": 340,
         "height": 420,

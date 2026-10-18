@@ -90,7 +90,7 @@ export default function BackupDialog({ onClose }: { onClose: () => void }) {
   });
 
   const exportFile = () => perform(async () => {
-    const path = await save({ title: '保存加密账号备份（请选择新文件）', defaultPath: `aiwork-${Date.now()}.aiwbak`, filters: [{ name: 'AI Work 加密备份', extensions: ['aiwbak'] }] });
+    const path = await save({ title: '保存加密账号备份（请选择新文件）', defaultPath: `aiwork-${Date.now()}.aiwbak`, filters: [{ name: '大肥鱼助手加密备份', extensions: ['aiwbak'] }] });
     if (!path) return;
     await api.backupAction(session, { action: 'export', path });
     setMessage('加密备份已导出。');
@@ -99,7 +99,7 @@ export default function BackupDialog({ onClose }: { onClose: () => void }) {
 
   const previewFile = () => perform(async () => {
     setPreview(null);
-    const path = await open({ title: '选择加密账号备份', multiple: false, directory: false, filters: [{ name: 'AI Work 加密备份', extensions: ['aiwbak'] }] });
+    const path = await open({ title: '选择加密账号备份', multiple: false, directory: false, filters: [{ name: '大肥鱼助手加密备份', extensions: ['aiwbak'] }] });
     if (!path || Array.isArray(path)) return;
     const password = restorePassword;
     setRestorePassword('');

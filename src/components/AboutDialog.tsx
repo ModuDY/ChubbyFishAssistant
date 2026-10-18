@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { Modal } from './ui';
 import { api } from '../lib/tauri';
+import petAvatar from '../assets/brand/pet-avatar.png';
 import type { UpdateCheckResult, UpdateDownloadProgress, UpdateDownloaded } from '../types';
 import {
   APP_NAME,
@@ -147,16 +148,12 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
       <div className="space-y-4 text-sm text-slate-600 dark:text-zinc-300">
         {/* 品牌头 */}
         <div className="flex items-center gap-3">
-          <span className="flex h-11 w-11 items-center justify-center rounded-xl bg-gradient-to-br from-brand-500 to-brand-700 text-white shadow-md dark:from-brand-400 dark:to-brand-600">
-            <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M12 8V4H8" />
-              <rect width="16" height="12" x="4" y="8" rx="2" />
-              <path d="M2 14h2" />
-              <path d="M20 14h2" />
-              <path d="M15 13v2" />
-              <path d="M9 13v2" />
-            </svg>
-          </span>
+          <img
+            src={petAvatar}
+            alt="大肥鱼助手"
+            draggable={false}
+            className="h-11 w-11 shrink-0 select-none object-contain"
+          />
           <div>
             <div className="flex items-center gap-2 text-base font-bold text-slate-800 dark:text-zinc-100">
               {APP_NAME}
@@ -292,7 +289,7 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
         <div className="overflow-hidden rounded-xl border border-slate-200 dark:border-zinc-700">
           <img
             src={promoBanner}
-            alt="AI Work 助手 — 多账号签到与管理一站式工作台"
+            alt="大肥鱼助手 — 多账号签到与管理一站式工作台"
             className="w-full"
           />
         </div>

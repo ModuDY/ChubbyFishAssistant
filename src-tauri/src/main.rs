@@ -78,7 +78,7 @@ pub(crate) fn show_main_window(app: &tauri::AppHandle) {
 }
 
 fn main() {
-    // 品牌迁移（老版本 Trae Work Assistant → AI Work 助手）：
+    // 品牌迁移（老版本 Trae Work Assistant → AI Work 助手，现更名为「大肥鱼助手」；数据目录沿用旧名）：
     // 必须在 AppState::new 创建新数据目录之前执行；迁移为「复制」语义，
     // 旧数据目录原地保留（老应用可继续使用，两版并存），已迁移过则自动跳过
     let migrate_note = state::migrate_legacy_dirs();
@@ -521,7 +521,7 @@ fn main() {
 
                     TrayIconBuilder::new()
                         .icon(icon)
-                        .tooltip("AI Work 助手")
+                        .tooltip("大肥鱼助手")
                         .menu(&menu)
                         .on_tray_icon_event(|tray, event| {
                             if let TrayIconEvent::Click {

@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="build-assets/app-icon.png" alt="AI Work 助手" width="128" />
+<img src="build-assets/app-icon.png" alt="大肥鱼助手" width="128" />
 
-# AI Work 助手（AI Work Assistant）
+# 大肥鱼助手（AI Work Assistant）
 
 Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 18 + Rust
 
@@ -10,7 +10,7 @@ Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 1
 
 </div>
 
-![AI Work 助手](./docs/images/main.png)
+![大肥鱼助手](./docs/images/main.png)
 
 > 深度支持 **Trae（Trae CN）/ WorkBuddy / CodeBuddy / 豆包 / Qoder** 五应用：多账号签到、登录态切换、积分看板、成长中心自动化、OpenAI / Anthropic / Codex 三协议兼容 API 网关（Trae + WorkBuddy + Qoder + 自定义模型四池调度）、6 层设备标识重置等；WorkBuddy 与 CodeBuddy 共享账号体系，豆包支持快照切换 / 保活 / 额度巡检 / 对话备份，Qoder 支持 PAT / OAuth 设备流 / IDE 登录态扫描三通道入池、每日双活动签到与网关上游接入（当前仅 CN 区）。后续规划扩展更多 AI 应用。
 >
@@ -24,7 +24,7 @@ Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 1
 
 ## 版本与分支
 
-- **v3.x 新版本线（默认分支）**：产品为「AI Work 助手」，支持 Trae（Trae CN）/ WorkBuddy / CodeBuddy / 豆包 / Qoder 多应用；新版本自 **3.0.0** 起开始维护。
+- **v3.x 新版本线（默认分支）**：产品为「大肥鱼助手」（旧名 AI Work 助手，2026-10 更名，**安装显示名/图标/窗口标题已更换，数据目录与 identifier 不变**），支持 Trae（Trae CN）/ WorkBuddy / CodeBuddy / 豆包 / Qoder 多应用；新版本自 **3.0.0** 起开始维护。
 - **原「Trae Work 助手」产品**：通过 **`trae_work_main`** 分支维护，仅支持 Trae Work 单应用，版本停留在 **2.x.x**，仅做必要修复、不再新增功能。
 - **macOS 产品分支（`macos_main`）**：macOS 平台支持的产品化分支——Windows 主线（`main`）功能持续合并对齐，mac 安装包（aarch64 / x64 / universal 三个 dmg）由 GitHub Actions `build-macos.yml` 在 push `macos_main` 时构建发布，与 Windows 随 3.6.x 同步发版。
 - **Docker 简化分支（`docker_main`）**：Web-only Docker 版（独立版本线 1.x）——单进程 `aiwork-server`（管理 REST + OpenAI 兼容网关 + 定时调度 + 浏览器 UI，`docker compose up` 一键部署），裁剪桌面壳 / MITM 抓包 / 账号切换 / 豆包等桌面专属功能，账号经 OAuth 录入或桌面导出导入。
@@ -63,8 +63,8 @@ Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 1
 npm install
 npm run tauri dev      # 开发模式
 npm run tauri build    # 打包（msi + nsis）
-node scripts/rename_release.mjs     # 安装包统一输出到 release/，命名 AI Work 助手_<版本>_x64*
-node scripts/package_portable.mjs   # 便携版 zip（AI Work 助手_<版本>_x64_portable.zip）
+node scripts/rename_release.mjs     # 安装包统一输出到 release/，命名 大肥鱼助手_<版本>_x64*
+node scripts/package_portable.mjs   # 便携版 zip（大肥鱼助手_<版本>_x64_portable.zip）
 ```
 
 前置：Node.js 18+、Rust 1.85+（`Cargo.toml` rust-version）、WebView2 Runtime、VS Build Tools (C++)
@@ -81,6 +81,7 @@ node scripts/package_portable.mjs   # 便携版 zip（AI Work 助手_<版本>_x6
 
 - **旧品牌「Trae Work 助手」（已发布的 v2.4.4 及更早）**：新版安装时会自动结束旧进程、**静默卸载**并清理残留（安装目录 / 卸载键 / 快捷方式），首次启动自动完成数据迁移，无需手动操作。
 - **新品牌「AI Work 助手」（v3.0.0 起）**：产品名一致，直接双击新安装包即走**原生原地升级**，用户数据不受影响。
+- **更名「大肥鱼助手」（2026-10 起）**：显示名、图标、窗口标题全部替换。因 `productName` 变化，NSIS 安装目录与卸载键会换成新名（旧版 `%LOCALAPPDATA%\AI Work 助手` → 新版 `%LOCALAPPDATA%\大肥鱼助手`），**升级时请先卸载旧版再安装新版**；数据目录仍为 `%APPDATA%\AIWorkAssistant`（identifier 未变），账号、设置、计划任务全部沿用，无需迁移。
 - **自动迁移内容**：数据目录 `%APPDATA%\TraeWorkAssistant` → `%APPDATA%\AIWorkAssistant`（**复制**迁移，旧目录原地保留，**老应用可继续使用、新旧两版可并存**；新目录已有数据则自动跳过，不会重复迁移）、界面偏好、每日签到计划任务（按原触发时间重建新任务，旧任务保留给老应用）。
 - **MSI 安装包**：因产品标识变更，老版 MSI 无法原地升级，请先卸载旧版再安装（或改用 NSIS 安装包，推荐）。
 - 旧版定时任务如未自动迁移，请在「设置 → 定时任务」重新注册一次。

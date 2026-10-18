@@ -1,8 +1,8 @@
 // ---------------- 应用自更新（检查 / 下载 / 安装，两步确认制） ----------------
 //
 // 数据源：GitHub Releases（api.github.com）。资产命名约定（见 scripts/rename_release.mjs）：
-//   AI Work 助手_<ver>_x64-setup.exe   ← NSIS 安装包（首选，支持原地升级 + 老版迁移钩子）
-//   AI Work 助手_<ver>_x64_zh-CN.msi   ← MSI（备选；仅同 identifier 的 3.x 间可原地升级）
+//   大肥鱼助手_<ver>_x64-setup.exe   ← NSIS 安装包（首选，支持原地升级 + 老版迁移钩子）
+//   大肥鱼助手_<ver>_x64_zh-CN.msi   ← MSI（备选；仅同 identifier 的 3.x 间可原地升级）
 //
 // 流程（下载与安装拆分，UI 两处确认）：
 //   update_check       解析最新 release 并与 CARGO_PKG_VERSION 比较；同时解析发布校验清单
@@ -33,7 +33,7 @@ pub struct UpdateCheckResult {
     pub has_update: bool,
     pub current_version: String,
     pub latest_version: String,
-    /// 资产文件名，如 "AI Work 助手_3.0.1_x64-setup.exe"
+    /// 资产文件名，如 "大肥鱼助手_3.0.1_x64-setup.exe"
     pub asset_name: String,
     /// 资产下载直链（browser_download_url）
     pub download_url: String,
@@ -65,7 +65,7 @@ fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     Some((a, b, c))
 }
 
-/// 从资产文件名提取版本："AI Work 助手_3.0.1_x64-setup.exe" → (3,0,1)。
+/// 从资产文件名提取版本："大肥鱼助手_3.0.1_x64-setup.exe" → (3,0,1)。
 /// 规则：取倒数第二个下划线段（倒数第一段是 "x64-setup.exe" / "x64_zh-CN.msi" 的尾部）。
 fn version_from_asset(name: &str) -> Option<(u64, u64, u64)> {
     let parts: Vec<&str> = name.split('_').collect();
@@ -201,7 +201,7 @@ fn is_sha256_hex(s: &str) -> bool {
 
 /// 宽松键：仅保留 ASCII 字母数字（小写），其余字符一律折叠为单个 '_'。
 /// GitHub 上传会重写资产名（空格 → '.'、非 ASCII 字符 → '_'，
-/// 如 "AI Work 助手_3.3.3_x64-setup.exe" → "AI.Work._3.3.3_x64-setup.exe"），
+/// 如 "大肥鱼助手_3.3.3_x64-setup.exe" → "AI.Work._3.3.3_x64-setup.exe"），
 /// 清单键保存的是本地原始文件名，用宽松键对两侧归一后即可匹配。
 fn relaxed_key(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -301,7 +301,7 @@ fn fetch_manifest_hash(
     }).map(Some)
 }
 
-/// 本产品（AI Work 助手）产品线起点：只认 >= 3.0.0 的 release。
+/// 本产品（大肥鱼助手，旧名 AI Work 助手）产品线起点：只认 >= 3.0.0 的 release。
 /// 同一仓库还发布 2.x 产品线（Trae Work 助手，另一个产品），必须排除。
 const PRODUCT_MIN_VERSION: (u64, u64, u64) = (3, 0, 0);
 
@@ -680,17 +680,17 @@ mod tests {
         let text = r#"{
             "version": "3.3.3",
             "assets": {
-                "AI Work 助手_3.3.3_x64-setup.exe": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                "AI Work 助手_3.3.3_x64_portable.zip": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+                "大肥鱼助手_3.3.3_x64-setup.exe": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "大肥鱼助手_3.3.3_x64_portable.zip": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
             }
         }"#;
         let m: UpdateManifest = serde_json::from_str(text).unwrap();
         assert_eq!(parse_version(&m.version), Some((3, 3, 3)));
         // 清单键为本地原始文件名（含空格），按原样可精确命中
-        let h = lookup_manifest_hash(&m, "AI Work 助手_3.3.3_x64-setup.exe").unwrap();
+        let h = lookup_manifest_hash(&m, "大肥鱼助手_3.3.3_x64-setup.exe").unwrap();
         assert_eq!(h, "a".repeat(64));
         // 未收录 / 哈希格式非法 → None
-        assert!(lookup_manifest_hash(&m, "AI Work 助手_3.3.3_x64_zh-CN.msi").is_none());
+        assert!(lookup_manifest_hash(&m, "大肥鱼助手_3.3.3_x64_zh-CN.msi").is_none());
         assert!(lookup_manifest_hash(&m, "不存在.exe").is_none());
     }
 
@@ -700,7 +700,7 @@ mod tests {
         let text = r#"{
             "version": "3.3.3",
             "assets": {
-                "AI Work 助手_3.3.3_x64-setup.exe": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                "大肥鱼助手_3.3.3_x64-setup.exe": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
             }
         }"#;
         let m: UpdateManifest = serde_json::from_str(text).unwrap();
@@ -711,7 +711,7 @@ mod tests {
         let text2 = r#"{
             "version": "3.3.3",
             "assets": {
-                "AI Work 助手_3.3.3_x64-setup.exe": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                "大肥鱼助手_3.3.3_x64-setup.exe": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             }
         }"#;
         let m2: UpdateManifest = serde_json::from_str(text2).unwrap();
@@ -719,7 +719,7 @@ mod tests {
         // 格式非法（长度不足）的哈希不命中
         let text3 = r#"{
             "version": "3.3.3",
-            "assets": { "AI Work 助手_3.3.3_x64-setup.exe": "zz" }
+            "assets": { "大肥鱼助手_3.3.3_x64-setup.exe": "zz" }
         }"#;
         let m3: UpdateManifest = serde_json::from_str(text3).unwrap();
         assert!(lookup_manifest_hash(&m3, gh_name).is_none());

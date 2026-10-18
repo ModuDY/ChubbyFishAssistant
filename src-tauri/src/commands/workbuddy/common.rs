@@ -347,7 +347,7 @@ pub(super) fn extract_access_token(raw: &serde_json::Value) -> Result<String, St
             }
             Err(e) => {
                 return Err(format!(
-                    "auth 文件凭证为 WorkBuddy 新版静态加密格式但无法解密：{e}（登录态本身有效，请勿反复退出重登；多为客户端升级更换了加密密钥，请升级 AI Work 助手后重试）"
+                    "auth 文件凭证为 WorkBuddy 新版静态加密格式但无法解密：{e}（登录态本身有效，请勿反复退出重登；多为客户端升级更换了加密密钥，请升级大肥鱼助手后重试）"
                 ));
             }
             Ok(None) => {}

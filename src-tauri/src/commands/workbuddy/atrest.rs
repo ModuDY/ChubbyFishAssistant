@@ -317,7 +317,7 @@ fn open_envelope_auto(b64: &str, framing: Framing) -> Result<Vec<u8>, String> {
         }
     }
     Err(format!(
-        "信封密钥 ID（{}）不在本机已知密钥集合中（客户端可能已更换内置密钥，请升级 AI Work 助手）",
+        "信封密钥 ID（{}）不在本机已知密钥集合中（客户端可能已更换内置密钥，请升级大肥鱼助手）",
         env.key_id
     ))
 }

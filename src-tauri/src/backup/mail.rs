@@ -29,12 +29,12 @@ pub fn send(
     let body = if attachment.is_some() {
         // 邮件正文附上附件密码：恢复时无需再回忆（邮箱本身即访问边界）。
         format!(
-            "AI Work 助手加密账号备份\n备份编号：{id}\n账号数：{total}\n附件密码：{DEFAULT_PASSWORD}\n\
+            "大肥鱼助手加密账号备份\n备份编号：{id}\n账号数：{total}\n附件密码：{DEFAULT_PASSWORD}\n\
              恢复方式：应用左上角品牌图标 → 输入入口密码 → 选择附件并预览恢复。\n\
              服务器接受不代表邮件已投递，请检查收件箱及垃圾箱。"
         )
     } else {
-        "AI Work 助手 SMTP 测试邮件。此邮件不含账号或凭据。".into()
+        "大肥鱼助手 SMTP 测试邮件。此邮件不含账号或凭据。".into()
     };
     let mut multipart = MultiPart::mixed().singlepart(SinglePart::plain(body));
     if let Some(bytes) = attachment {
@@ -46,7 +46,7 @@ pub fn send(
     let msg = Message::builder()
         .from(config.sender.parse().map_err(|_| invalid())?)
         .to(config.recipient.parse().map_err(|_| invalid())?)
-        .subject("AI Work 助手 · 加密备份 / 邮件测试")
+        .subject("大肥鱼助手 · 加密备份 / 邮件测试")
         .message_id(Some(format!("<{id}@backup.aiwork.local>")))
         .multipart(multipart)
         .map_err(|_| invalid())?;

@@ -5,34 +5,25 @@ import { Copy, Minus, Square, X } from 'lucide-react';
 import { useAppStore } from '../store';
 import { Modal } from './ui';
 import { APP_NAME } from '../lib/about';
+import petAvatar from '../assets/brand/pet-avatar.png';
 import BackupDialog from './backup/BackupDialog';
 
 const win = getCurrentWindow();
 
-/** 品牌图标：渐变圆角方块内的机器人（AI）图形 */
-export function BrandMark({ size = 24, iconSize = 14 }: { size?: number; iconSize?: number }) {
+/**
+ * 品牌图标：桌宠「大肥鱼」头像（透明底 PNG，取自桌宠素材首帧的头部特写）。
+ * 用图片而非内联 SVG：这样应用图标、标题栏、关于页三处视觉完全同源。
+ */
+export function BrandMark({ size = 24 }: { size?: number; iconSize?: number }) {
   return (
-    <span
-      className="flex shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-brand-500 to-brand-700 text-white shadow-sm dark:from-brand-400 dark:to-brand-600"
+    <img
+      src={petAvatar}
+      alt=""
+      aria-hidden
+      draggable={false}
+      className="shrink-0 select-none object-contain"
       style={{ width: size, height: size }}
-    >
-      <svg
-        viewBox="0 0 24 24"
-        style={{ width: iconSize, height: iconSize }}
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      >
-        <path d="M12 8V4H8" />
-        <rect width="16" height="12" x="4" y="8" rx="2" />
-        <path d="M2 14h2" />
-        <path d="M20 14h2" />
-        <path d="M15 13v2" />
-        <path d="M9 13v2" />
-      </svg>
-    </span>
+    />
   );
 }
 

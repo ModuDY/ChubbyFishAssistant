@@ -208,12 +208,12 @@ pub fn ccswitch_register(
     };
     let name = format!(
         "{}（{}）",
-        if is_wb { "WorkBuddy 网关" } else { "AI Work 助手网关" },
+        if is_wb { "WorkBuddy 网关" } else { "大肥鱼助手网关" },
         if app == "claude" { "Anthropic" } else { "Codex" }
     );
     let notes = format!(
         "{}本地网关注入（自动生成，可安全删除；base=http://127.0.0.1:{}，写入时间 {}）",
-        if is_wb { "WorkBuddy 上游 " } else { "AI Work 助手 " },
+        if is_wb { "WorkBuddy 上游 " } else { "大肥鱼助手 " },
         port,
         crate::fs_utils::now_iso()
     );
@@ -416,7 +416,7 @@ fn toml_escape(s: &str) -> String {
 /// "Model provider `custom` not found"（issue #20）。两侧 DB 条目 id 仍不同，
 /// 切换为整体替换 config.toml，互不覆盖。
 fn codex_settings_config(port: u16, model: &str, key: &str, is_wb: bool) -> serde_json::Value {
-    let provider_name = if is_wb { "WorkBuddy 网关" } else { "AI Work 助手网关" };
+    let provider_name = if is_wb { "WorkBuddy 网关" } else { "大肥鱼助手网关" };
     let toml = format!(
         "model_provider = \"custom\"\n\
          model = \"{model_esc}\"\n\

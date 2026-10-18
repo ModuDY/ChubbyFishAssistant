@@ -62,7 +62,7 @@ export default function EcoAccess() {
           className="btn-outline flex items-center gap-1 !py-1.5 text-xs"
           onClick={() => void registerCcSwitch('claude')}
           disabled={ccBusy !== null}
-          title="把统一网关 Anthropic 端点（/v1/messages）注册进 CC Switch（统一条目「AI Work 助手网关」），由 CC Switch 负责切换"
+          title="把统一网关 Anthropic 端点（/v1/messages）注册进 CC Switch（统一条目「大肥鱼助手网关」），由 CC Switch 负责切换"
         >
           {ccBusy === 'claude' ? '注册中…' : '注册到 CC Switch（Claude Code）'}
         </button>
@@ -70,7 +70,7 @@ export default function EcoAccess() {
           className="btn-outline flex items-center gap-1 !py-1.5 text-xs"
           onClick={() => void registerCcSwitch('codex')}
           disabled={ccBusy !== null}
-          title="把统一网关 Responses 端点（/v1/responses）注册进 CC Switch（统一条目「AI Work 助手网关」），由 CC Switch 负责切换"
+          title="把统一网关 Responses 端点（/v1/responses）注册进 CC Switch（统一条目「大肥鱼助手网关」），由 CC Switch 负责切换"
         >
           {ccBusy === 'codex' ? '注册中…' : '注册到 CC Switch（Codex）'}
         </button>
@@ -88,7 +88,7 @@ export default function EcoAccess() {
         </p>
       )}
       <p className="mt-2 text-[11px] text-slate-400 dark:text-zinc-500">
-        统一注册单条目「AI Work 助手网关」（默认模型 {gwModel ?? 'glm-5.3'}）：CC Switch
+        统一注册单条目「大肥鱼助手网关」（默认模型 {gwModel ?? 'glm-5.3'}）：CC Switch
         注册会先整库备份至 ~/.cc-switch/backups/，仅写入本网关条目、不改其它 provider；
         写入后需重启 CC Switch 生效。历史 Buddy 条目（aiwork-wb-gateway-*）不再使用，可手动在
         CC Switch 中清理。

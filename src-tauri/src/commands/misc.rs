@@ -846,7 +846,7 @@ pub fn notify_test(state: State<AppState>) -> Result<String, String> {
     if !s.notify_enabled {
         return Err("通知推送总开关未启用".into());
     }
-    let title = "AI Work Assistant 测试通知";
+    let title = "大肥鱼助手 测试通知";
     let body = "收到本条即说明该渠道配置生效。\n企业微信群内还会按「提醒对象」@ 目标成员，可一并验证。";
     let mut errs: Vec<String> = Vec::new();
     if let Some(bark) = channels.bark_url.as_deref().filter(|x| !x.trim().is_empty()) {
@@ -1175,7 +1175,7 @@ fn register_daily_task(state: &AppState, time: &str) -> Result<(), String> {
             return Err(format!(
                 "权限不足（Access Denied）。\n\n\
                  解决方法（任选其一）：\n\
-                 1. 右键 AI Work 助手 →「以管理员身份运行」后重新点击「注册任务」\n\
+                 1. 右键大肥鱼助手 →「以管理员身份运行」后重新点击「注册任务」\n\
                  2. 打开「管理员命令提示符」手动执行：\n\
                     schtasks /Create /TN {TASK_NAME} /TR \"cmd /c set \\\"AIWORKDATA_DIR={}\\\" && \\\"{}\\\" --task-run checkin\" /SC DAILY /ST {time} /F\n\
                  3. 如不需最高权限，可去掉 /RL HIGHEST 后重试",

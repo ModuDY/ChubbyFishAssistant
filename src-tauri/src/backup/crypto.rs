@@ -41,7 +41,7 @@ pub fn seal(plain: &[u8], password: &str) -> Result<Vec<u8>, String> {
 
 pub fn open(sealed: &[u8], password: &str) -> Result<Zeroizing<Vec<u8>>, String> {
     if sealed.len() < 52 || sealed.len() > MAX_BYTES || &sealed[..8] != MAGIC {
-        return Err("不是有效的 AI Work 加密备份，或文件超过 15 MiB".into());
+        return Err("不是有效的大肥鱼助手加密备份，或文件超过 15 MiB".into());
     }
     let key = key(password, &sealed[8..24])?;
     Aes256Gcm::new_from_slice(key.as_ref())
