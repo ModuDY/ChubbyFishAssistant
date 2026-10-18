@@ -628,10 +628,10 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
     let packages = 0;
     let expiring = 0;
     for (const a of accs) {
-      totalCredits += a.balance ?? 0;
+      totalCredits += a.ok && a.balance != null && a.balance >= 0 ? a.balance : 0;
       for (const p of a.packages ?? []) {
         // 包计数与到期日历对齐：remaining > 0 才计
-        if (p.remaining <= 0) continue;
+        if (p.remaining == null || p.remaining <= 0) continue;
         packages += 1;
         if (p.expire_ts != null && p.expire_ts > nowSec && p.expire_ts <= horizon) {
           expiring += p.remaining;

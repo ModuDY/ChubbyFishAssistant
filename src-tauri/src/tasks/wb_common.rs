@@ -8,7 +8,6 @@
 //! P1 先行落地（wb_credits 依赖）；P2 wb_checkin / trae_checkin 直接复用本层。
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -95,13 +94,13 @@ pub fn creds_of(source: &Value) -> Creds {
         .filter(|v| v.is_object())
         .unwrap_or(source);
     Creds {
-        access_token: s_of(fs_utils::dig(auth, &["accessToken", "access_token", "token"])),
-        refresh_token: s_of(fs_utils::dig(auth, &["refreshToken", "refresh_token"])),
+        access_token: s_of(fs_utils::dig(auth, &["access_token", "accessToken", "token"])),
+        refresh_token: s_of(fs_utils::dig(auth, &["refresh_token", "refreshToken"])),
         expires_at_ms: i_of(fs_utils::dig(
             auth,
             &[
-                "expiresAtMs",
                 "expires_at_ms",
+                "expiresAtMs",
                 "expiresAt",
                 "expires_in_ms",
                 "accessTokenExpiresAtMs",
@@ -109,7 +108,7 @@ pub fn creds_of(source: &Value) -> Creds {
         )),
         refresh_expires_at_ms: i_of(fs_utils::dig(
             auth,
-            &["refreshExpiresAtMs", "refresh_expires_at_ms", "refreshExpiresAt"],
+            &["refresh_expires_at_ms", "refreshExpiresAtMs", "refreshExpiresAt"],
         )),
         uid: s_of(fs_utils::dig(account, &["uid", "userId", "user_id", "id"])),
         domain: s_of(fs_utils::dig(source, &["domain"])),
@@ -144,7 +143,7 @@ fn enterprise_flag_of(account: &Value) -> bool {
             _ => false,
         })
     };
-    if truthy(&["isCurrentOneIdEnterprise", "isEnterprise"]) {
+    if truthy(&["enterprise_flag", "isCurrentOneIdEnterprise", "isEnterprise"]) {
         return true;
     }
     fs_utils::dig(account, &["accountType", "account_type"])
@@ -196,7 +195,7 @@ pub fn token_store_load_secure(data_dir: &std::path::Path) -> Value {
         let mut has_access_key = false;
         let mut has_refresh_key = false;
         for k in TOKEN_SENSITIVE_KEYS {
-            let is_access = k.ends_with("ccess_token");
+            let is_access = matches!(k, "access_token" | "accessToken");
             let val = if is_access { acc } else { rt };
             if !rm.contains_key(k) {
                 continue;
@@ -243,17 +242,20 @@ pub fn token_store_upsert_secure(
         if v.is_empty() {
             continue;
         }
-        if k.ends_with("ccess_token") {
-            acc = v.to_string();
-        } else {
+        if matches!(k, "access_token" | "accessToken") {
+            if acc.is_empty() { acc = v.to_string(); }
+        } else if rt.is_empty() {
             rt = v.to_string();
         }
     }
+    let mut changed = false;
     let vault_result = if acc.is_empty() && rt.is_empty() {
         Ok(())
     } else {
         let mut entry = crate::vault::ns_get(data_dir, "wb", id)
             .unwrap_or_else(|| serde_json::json!({}));
+        changed = (!acc.is_empty() && entry.get("access_token").and_then(Value::as_str) != Some(acc.as_str()))
+            || (!rt.is_empty() && entry.get("refresh_token").and_then(Value::as_str) != Some(rt.as_str()));
         if !acc.is_empty() {
             entry["access_token"] = serde_json::json!(acc);
         }
@@ -263,12 +265,12 @@ pub fn token_store_upsert_secure(
         crate::vault::ns_set(data_dir, "wb", id, &entry)
     };
     // 无论 vault 成败，DB 一律占位
-    for k in TOKEN_SENSITIVE_KEYS {
-        if rm.contains_key(k) {
-            rm.insert(k.to_string(), serde_json::json!(""));
-        }
-    }
+    rm.remove("accessToken");
+    rm.remove("refreshToken");
+    rm.insert("access_token".into(), serde_json::json!(""));
+    rm.insert("refresh_token".into(), serde_json::json!(""));
     crate::store::docs::wb_token_store_upsert(&crate::store::db(data_dir), id, &rec)?;
+    if vault_result.is_ok() && changed { super::wb_session::remove_health(data_dir, id)?; }
     vault_result.map_err(|e| {
         format!("WB 凭据加密存储失败（已仅保存占位信息，重新登录可恢复）: {e}")
     })
@@ -282,15 +284,62 @@ pub fn load_token_store(state: &AppState) -> Value {
     token_store_load_secure(&state.data_dir)
 }
 
+/// 删除 token store 记录（账号移除时同步清理 vault 凭证，防悬空凭证残留）：
+/// 池外孤儿凭证的唯一清理出口（对齐 qoder_common::remove_token）。
+/// 顺序（审查 L）：DB 行摘除落库成功后才清 vault——save 失败时保留 vault 凭证并
+/// 返 Err，避免「库里还在、密钥已删」的悬挂态。
+/// 凭证红线（审查 P0）：此处只需摘行，必须读 DB 原始占位表回写——不可走
+/// load_token_store（vault 回填后的明文整表写回，会把其余账号明文凭证重新落库）。
+pub fn remove_token(state: &AppState, id: &str) -> Result<(), String> {
+    let _guard = WB_TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut store = crate::store::docs::wb_token_store_load(&crate::store::db(&state.data_dir));
+    if let Some(tokens) = store.get_mut("tokens").and_then(Value::as_object_mut) {
+        tokens.remove(id);
+    }
+    crate::store::docs::wb_token_store_save(&crate::store::db(&state.data_dir), &store)?;
+    crate::vault::ns_remove_strict(&state.data_dir, "wb", id)?;
+    super::wb_session::remove_health(&state.data_dir, id)
+}
+
 pub fn effective_creds(state: &AppState, acct_id: &str, acct_uid: &str) -> Creds {
-    let store: Value = load_token_store(state);
-    let store_creds = store
-        .get("tokens")
-        .and_then(|t| t.get(acct_id))
-        .map(creds_of)
-        .unwrap_or_default();
-    let mut file_creds = read_auth_file(state);
-    if !acct_uid.is_empty() && !file_creds.uid.is_empty() && file_creds.uid != acct_uid {
+    let pool_account = crate::store::db(&state.data_dir).row_get("wb_accounts", acct_id).ok().flatten();
+    let Some(pool_account) = pool_account else { return Creds::default() };
+    let pool_uid = pool_account.get("uid").and_then(Value::as_str).filter(|uid| !uid.is_empty()).unwrap_or(acct_uid);
+    let stored = select_creds(creds_of(&token_record_secure(&state.data_dir, acct_id)), Creds::default(), pool_uid);
+    let candidate = select_creds(stored.clone(), read_auth_file(state), pool_uid);
+    super::wb_session::select_current(stored, candidate, &super::wb_session::health(&state.data_dir, acct_id))
+}
+
+pub(crate) fn stored_creds(data_dir: &std::path::Path, acct_id: &str) -> Creds {
+    let Some(account) = crate::store::db(data_dir).row_get("wb_accounts", acct_id).ok().flatten() else {
+        return Creds::default();
+    };
+    let uid = account.get("uid").and_then(Value::as_str).unwrap_or_default();
+    select_creds(creds_of(&token_record_secure(data_dir, acct_id)), Creds::default(), uid)
+}
+
+pub fn token_record_secure(data_dir: &std::path::Path, id: &str) -> Value {
+    let mut rec = crate::store::db(data_dir).row_get("wb_tokens", id).ok().flatten().unwrap_or(Value::Null);
+    if let Some(fields) = rec.as_object_mut() {
+        if let Some(secret) = crate::vault::ns_get(data_dir, "wb", id) {
+            for (canonical, alias) in [("access_token", "accessToken"), ("refresh_token", "refreshToken")] {
+                let value = [canonical, alias].iter().find_map(|key| fields.get(*key).and_then(Value::as_str).filter(|value| !value.is_empty()))
+                    .or_else(|| secret.get(canonical).and_then(Value::as_str)).unwrap_or("").to_string();
+                fields.remove(alias);
+                fields.insert(canonical.into(), serde_json::json!(value));
+            }
+        }
+    }
+    rec
+}
+
+fn select_creds(mut store_creds: Creds, mut file_creds: Creds, acct_uid: &str) -> Creds {
+    if !acct_uid.is_empty() {
+        if store_creds.uid.is_empty() { store_creds.uid = acct_uid.to_string(); }
+        if store_creds.uid != acct_uid { store_creds = Creds::default(); }
+    }
+    let expected_uid = if acct_uid.is_empty() { &store_creds.uid } else { acct_uid };
+    if expected_uid.is_empty() || file_creds.uid != expected_uid {
         file_creds = Creds::default();
     }
     let a = store_creds.expires_at_ms;
@@ -318,25 +367,19 @@ pub(crate) static WB_TOKEN_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::
 ///（严重时 refresh_token 一并丢，被迫重登）。以账号 id 为键的进程内锁串行化
 /// 「读凭证→网络刷新→落库」全程；持锁后重读 token store 天然构成二次检查。
 static WB_REFRESH_LOCKS: std::sync::Mutex<
-    Option<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>,
+    Option<std::collections::HashMap<String, std::sync::Weak<std::sync::Mutex<()>>>>,
 > = std::sync::Mutex::new(None);
 
 pub(crate) fn refresh_lock_for(acct_id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
     let mut g = WB_REFRESH_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
-    g.get_or_insert_with(std::collections::HashMap::new)
-        .entry(acct_id.to_string())
-        .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
-        .clone()
+    let map = g.get_or_insert_with(std::collections::HashMap::new);
+    map.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = map.get(acct_id).and_then(std::sync::Weak::upgrade) { return lock; }
+    let lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+    map.insert(acct_id.to_string(), std::sync::Arc::downgrade(&lock));
+    lock
 }
 
-/// 账号移除路径主动清理（P3-L，对齐 qoder refresh_lock_remove）：回收刷新锁表项，
-/// 防止账号删除后条目永驻 HashMap（进程生命周期内每次增删账号泄漏一把锁）。
-pub(crate) fn refresh_lock_remove(acct_id: &str) {
-    let mut g = WB_REFRESH_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = g.as_mut() {
-        map.remove(acct_id);
-    }
-}
 
 /// 跨进程刷新互斥（H-1 ②）：GUI 调度器与 schtasks CLI（--task-run，绕开单实例
 /// 插件）双进程并存，进程内锁无法约束跨进程并发。命名互斥体按账号隔离
@@ -368,39 +411,38 @@ pub(crate) fn cross_refresh_lock(
 /// 凭证收敛（P0-1）：落库走 token_store_upsert_secure——敏感字段进 vault、DB 占位；
 /// vault 写失败时仅落占位并返回 Err（禁止明文落库）。
 pub fn save_token_store(state: &AppState, id: &str, creds: &Creds) -> Result<(), String> {
+    save_token_store_at(&state.data_dir, id, creds)
+}
+
+pub(crate) fn save_token_store_at(data_dir: &std::path::Path, id: &str, creds: &Creds) -> Result<(), String> {
     // H-1：表级读改写互斥（与 commands 侧 upsert_token_store 共锁）
     let _table = WB_TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut store: Value = load_token_store(state);
-    if !store.is_object() {
-        store = serde_json::json!({});
+    if crate::store::db(data_dir).row_get("wb_accounts", id)?.is_none() {
+        return Err("账号已删除，拒绝写回凭证".into());
     }
-    let obj = store.as_object_mut().unwrap();
-    match obj.get("version") {
-        Some(v) if v.as_i64() != Some(1) => {
+    let db = crate::store::db(data_dir);
+    match db.kv_get_raw("wb_tokens_meta") {
+        Some(version) if version.parse::<i64>().ok() != Some(1) => {
             return Err("token_store 版本不识别，拒绝写入".to_string());
         }
         _ => {}
     }
-    obj.insert("version".into(), serde_json::json!(1));
-    let tokens = obj.entry("tokens").or_insert_with(|| serde_json::json!({}));
-    let mut rec = serde_json::json!({});
-    if let Some(t) = tokens.as_object() {
-        if let Some(r) = t.get(id) {
-            rec = r.clone();
-        }
-    }
+    let mut rec = token_record_secure(data_dir, id);
+    if !rec.is_object() { rec = serde_json::json!({}); }
     if let Some(rm) = rec.as_object_mut() {
         let val = serde_json::to_value(creds).map_err(|e| e.to_string())?;
         for (k, v) in val.as_object().into_iter().flatten() {
-            if !v.is_null() {
+            if !v.is_null() && !v.as_str().is_some_and(str::is_empty) {
                 rm.insert(k.clone(), v.clone());
             }
         }
+        rm.insert("expires_at_ms".into(), serde_json::json!(creds.expires_at_ms));
+        rm.insert("refresh_expires_at_ms".into(), serde_json::json!(creds.refresh_expires_at_ms));
         rm.insert("updated_at".into(), serde_json::json!(fs_utils::now_iso()));
     }
-    token_store_upsert_secure(&state.data_dir, id, &rec)?;
+    token_store_upsert_secure(data_dir, id, &rec)?;
     // version 闸门语义不变（整库字段，单行 upsert 不携带 version——写入 kv 元数据）
-    crate::store::docs::wb_token_store_save_version(&crate::store::db(&state.data_dir), 1)
+    crate::store::docs::wb_token_store_save_version(&crate::store::db(data_dir), 1)
 }
 
 // ── 客户端指纹伪装（issue #48）─────────────────────────────────────────────
@@ -606,24 +648,38 @@ pub enum RefreshFail {
     NoRefreshToken,
     /// 网络不可达 / 传输层失败（不标记重登录，下次重试）
     Network,
-    /// HTTP 4xx：refresh token 已失效（应标记 needs_relogin）
+    /// 明确的认证拒绝。
     Auth,
+    RateLimited,
+    Rejected,
+    Cooldown,
     /// 200 但响应无 accessToken（响应结构异常，不标记重登录）
     BadResponse,
     /// H-1：跨进程锁未获取（他方进程正在刷新同账号，本侧幂等跳过；不标记重登录）
     Busy,
+    Persistence,
 }
 
-/// 调 plugin refresh 端点（X-Refresh-Token 仅允许出现在此端点）。
-/// 成功返回新 Creds（expires 字段按 expiresIn/refreshExpiresIn 秒数回填）。
-pub fn refresh_token_once(agent: &ureq::Agent, creds: &Creds) -> Option<Creds> {
-    refresh_token_once_ex(agent, creds).0
+pub(crate) fn refresh_request(agent: &ureq::Agent, creds: &Creds) -> Result<Creds, super::wb_session::RefreshError> {
+    refresh_request_at(agent, creds, REFRESH_URL)
 }
 
-/// refresh_token_once 的带失败原因版本（审查 P1-4）。
-pub fn refresh_token_once_ex(agent: &ureq::Agent, creds: &Creds) -> (Option<Creds>, RefreshFail) {
+fn classify_refresh(status: u16, body: Option<&Value>) -> RefreshFail {
+    if status == 0 || status == 408 || status >= 500 { return RefreshFail::Network; }
+    if status == 429 { return RefreshFail::RateLimited; }
+    let code = body.and_then(|body| body.get("error").and_then(Value::as_str)
+        .or_else(|| body.pointer("/error/code").and_then(Value::as_str))
+        .or_else(|| fs_utils::dig(body, &["code", "errorCode"]).and_then(Value::as_str))).unwrap_or_default();
+    if status == 401 || matches!(code, "invalid_grant" | "invalid_token" | "refresh_token_expired" | "refresh_token_revoked") {
+        RefreshFail::Auth
+    } else if (400..500).contains(&status) { RefreshFail::Rejected }
+    else { RefreshFail::BadResponse }
+}
+
+fn refresh_request_at(agent: &ureq::Agent, creds: &Creds, url: &str) -> Result<Creds, super::wb_session::RefreshError> {
+    use super::wb_session::RefreshError;
     if creds.refresh_token.is_empty() {
-        return (None, RefreshFail::NoRefreshToken);
+        return Err(RefreshError::new(RefreshFail::NoRefreshToken));
     }
     let mut h = build_auth_headers(creds, false);
     h.push(("X-Refresh-Token".to_string(), creds.refresh_token.clone()));
@@ -631,34 +687,42 @@ pub fn refresh_token_once_ex(agent: &ureq::Agent, creds: &Creds) -> (Option<Cred
         "X-Auth-Refresh-Source".to_string(),
         "workbuddy".to_string(),
     ));
-    let (status, body) = post_json(agent, REFRESH_URL, &h, &serde_json::json!({}));
-    if status == 0 {
-        return (None, RefreshFail::Network);
-    }
-    if (400..500).contains(&status) {
-        return (None, RefreshFail::Auth);
-    }
-    if status != 200 {
-        return (None, RefreshFail::Network); // 5xx 等服务端故障：不标记重登录
-    }
-    let Some(body) = body else {
-        return (None, RefreshFail::BadResponse);
+    let mut request = agent.post(url);
+    for (key, value) in &h { request = request.set(key, value); }
+    let response = match request.send_json(serde_json::json!({})) {
+        Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+        Err(_) => return Err(RefreshError::new(RefreshFail::Network)),
     };
-    let acc = s_of(fs_utils::dig(&body, &["accessToken"]));
+    let status = response.status();
+    let retry_after_ms = response.header("Retry-After").and_then(|value| {
+        value.parse::<i64>().ok().filter(|seconds| *seconds >= 0).map(|seconds| seconds.saturating_mul(1000))
+            .or_else(|| chrono::DateTime::parse_from_rfc2822(value).ok()
+                .map(|date| date.timestamp_millis().saturating_sub(chrono::Utc::now().timestamp_millis()).max(0)))
+    });
+    let body: Option<Value> = response.into_json().ok();
+    if status != 200 {
+        return Err(RefreshError { kind: classify_refresh(status, body.as_ref()), http_status: Some(status), retry_after_ms });
+    }
+    let body = body.ok_or_else(|| RefreshError::new(RefreshFail::BadResponse))?;
+    let acc = s_of(fs_utils::dig(&body, &["accessToken", "access_token"]));
     if acc.is_empty() {
-        return (None, RefreshFail::BadResponse);
+        return Err(RefreshError { kind: classify_refresh(status, Some(&body)), http_status: Some(status), retry_after_ms });
     }
     let now_ms = chrono::Utc::now().timestamp_millis();
     let mut out = creds.clone();
     out.access_token = acc;
-    let ref_tok = s_of(fs_utils::dig(&body, &["refreshToken"]));
+    let ref_tok = s_of(fs_utils::dig(&body, &["refreshToken", "refresh_token"]));
+    let rotated = !ref_tok.is_empty() && ref_tok != creds.refresh_token;
     if !ref_tok.is_empty() {
         out.refresh_token = ref_tok;
     }
-    out.expires_at_ms = i_of(fs_utils::dig(&body, &["expiresIn"])).map(|e| now_ms + e * 1000);
+    out.expires_at_ms = i_of(fs_utils::dig(&body, &["expiresIn"])).filter(|seconds| *seconds > 0)
+        .and_then(|seconds| seconds.checked_mul(1000)?.checked_add(now_ms));
+    if out.expires_at_ms.is_none() { return Err(RefreshError::new(RefreshFail::BadResponse)); }
     out.refresh_expires_at_ms = i_of(fs_utils::dig(&body, &["refreshExpiresIn"]))
-        .map(|e| now_ms + e * 1000);
-    (Some(out), RefreshFail::NoRefreshToken)
+        .filter(|seconds| *seconds > 0).and_then(|seconds| seconds.checked_mul(1000)?.checked_add(now_ms))
+        .or(if rotated { None } else { creds.refresh_expires_at_ms });
+    Ok(out)
 }
 
 /// 标记账号需重新登录（审查 P1-4：刷新凭证失效时回写账号池，
@@ -672,6 +736,8 @@ pub fn mark_needs_relogin(state: &AppState, acct_id: &str, reason: &str) {
     if let Some(arr) = pool.get_mut("accounts").and_then(Value::as_array_mut) {
         for a in arr {
             if a.get("id").and_then(Value::as_str) == Some(acct_id) {
+                if a.get("needs_relogin").and_then(Value::as_bool) == Some(true)
+                    && a.get("relogin_reason").and_then(Value::as_str) == Some(reason) { continue; }
                 a["needs_relogin"] = serde_json::json!(true);
                 a["relogin_reason"] = serde_json::json!(reason);
                 changed = true;
@@ -687,124 +753,6 @@ pub fn mark_needs_relogin(state: &AppState, acct_id: &str, reason: &str) {
     }
 }
 
-// ── 本地 quota 端口发现兜底（T5.8/F-21）────────────────────────────────────
-// 云端 billing 全链失败时的最后兜底：WorkBuddy/CodeBuddy 桌面端本地服务在
-// 127.0.0.1 暴露 quota 查询端点。发现顺序：
-// ① ~/.workbuddy/*.port 文件声明的端口；② 固定候选端口；③ 有界端口段。
-// 红线：单次单发不重试、每端口 0.8s 超时、候选总数有界。
-
-const QUOTA_PATH: &str = "/api/v1/quota";
-const QUOTA_PORT_CANDIDATES: [u16; 4] = [18789, 11101, 8890, 8899];
-const QUOTA_PORT_RANGE: std::ops::RangeInclusive<u16> = 18780..=18795;
-
-/// 响应含 remaining/credits/quota/balance 任一键即认定 quota 端点（浅层宽容）。
-fn quota_looks_valid(v: &Value, depth: usize) -> bool {
-    if depth > 3 {
-        return false;
-    }
-    if let Some(map) = v.as_object() {
-        for (k, val) in map {
-            let kl = k.to_ascii_lowercase();
-            if kl == "remaining" || kl == "credits" || kl == "quota" || kl == "balance" {
-                return true;
-            }
-            if quota_looks_valid(val, depth + 1) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn quota_probe_port(agent: &ureq::Agent, port: u16) -> Option<Value> {
-    let url = format!("http://127.0.0.1:{port}{QUOTA_PATH}");
-    let resp = agent
-        .get(&url)
-        .timeout(Duration::from_millis(800))
-        .set("User-Agent", "WorkBuddy")
-        .set("Accept", "application/json")
-        .call()
-        .ok()?;
-    let raw = resp.into_string().ok()?;
-    let v: Value = serde_json::from_str(&raw).ok()?;
-    quota_looks_valid(&v, 0).then_some(v)
-}
-
-/// 发现本机 quota 服务：*.port 声明端口 → 固定候选 → 有界端口段。
-/// 返回已确认可用的 (port, 响应)（按发现序，至多 limit 个）。
-pub fn discover_local_quota_services(
-    agent: &ureq::Agent,
-    limit: usize,
-) -> Vec<(u16, Value)> {
-    let mut found: Vec<(u16, Value)> = vec![];
-    let mut seen: std::collections::HashSet<u16> = Default::default();
-    let mut ports: Vec<u16> = vec![];
-    // ① ~/.workbuddy/*.port（服务启动时落盘的端口声明，最多扫 16 个）
-    if let Ok(home) = std::env::var("USERPROFILE") {
-        let wb_dir = PathBuf::from(home).join(".workbuddy");
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&wb_dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().map(|e| e == "port").unwrap_or(false))
-            .collect();
-        files.sort();
-        for f in files.into_iter().take(16) {
-            if let Ok(txt) = std::fs::read_to_string(&f) {
-                if let Some(first) = txt.split_whitespace().next() {
-                    if let Ok(p) = first.parse::<u16>() {
-                        ports.push(p);
-                    }
-                }
-            }
-        }
-    }
-    // ② 固定候选 ③ 有界端口段
-    for p in ports
-        .into_iter()
-        .chain(QUOTA_PORT_CANDIDATES.into_iter())
-        .chain(QUOTA_PORT_RANGE.clone())
-    {
-        if seen.contains(&p) || p == 0 {
-            continue;
-        }
-        seen.insert(p);
-        if found.len() >= limit {
-            return found;
-        }
-        if let Some(v) = quota_probe_port(agent, p) {
-            found.push((p, v));
-        }
-    }
-    found
-}
-
-/// 本地 quota 兜底余额：首个可用端点的 remaining/credits/balance 取数；无可用端点 None。
-pub fn local_quota_balance(agent: &ureq::Agent) -> Option<f64> {
-    for (_port, v) in discover_local_quota_services(agent, 2) {
-        if let Some(num) = dig_num(fs_utils::dig(
-            &v,
-            &["remaining", "RemainingCapacity", "credits", "balance"],
-        )) {
-            return Some(num);
-        }
-    }
-    None
-}
-
-/// 宽容取数：递归摘出首个数值（含数字字符串）。
-pub fn dig_num(v: Option<&Value>) -> Option<f64> {
-    let v = v?;
-    match v {
-        Value::Null => None,
-        Value::Bool(_) => None,
-        Value::Number(n) => n.as_f64(),
-        Value::String(s) => s.trim().parse::<f64>().ok(),
-        Value::Object(m) => m.values().find_map(|c| dig_num(Some(c))),
-        Value::Array(a) => a.iter().find_map(|c| dig_num(Some(c))),
-    }
-}
 
 // ── 惰性刷新（F-09/F-55，原 wb_common.ensure_fresh）────────────────────────
 
@@ -827,43 +775,13 @@ pub fn ensure_fresh(
     if creds.access_token.is_empty() {
         return (creds, false, "no_credential");
     }
-    if let Some(exp) = creds.expires_at_ms {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let remain_h = (exp - now_ms) as f64 / 3_600_000.0;
-        if remain_h > lazy_hours as f64 {
-            return (creds, false, "fresh");
-        }
-        if remain_h < 0.0 && creds.refresh_token.is_empty() {
-            return (creds, false, "expired_needs_relogin");
+    match super::wb_session::refresh(&state.data_dir, acct_id, &creds, super::wb_session::RefreshMode::Due(lazy_hours), agent) {
+        Ok((current, refreshed)) => (current, refreshed, if refreshed { "refreshed" } else { "fresh" }),
+        Err(error) => {
+            if error.permanent() { mark_needs_relogin(state, acct_id, &error.message()); }
+            (creds, false, error.note())
         }
     }
-    // H-1 ①：进程内每账号锁串行化；②跨进程命名互斥体（GUI/CLI 双进程）
-    let lock = refresh_lock_for(acct_id);
-    let _refresh_guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(_cross) = cross_refresh_lock(&state.data_dir, acct_id) else {
-        // 他方进程刷新中：幂等跳过（沿用现有凭证，不误标 needs_relogin）
-        return (creds, false, "refresh_failed");
-    };
-    // 二次检查：他人已刷新落库 → 直接复用新凭证（不发网络请求）
-    let creds = effective_creds(state, acct_id, acct_uid);
-    if creds.access_token.is_empty() {
-        return (creds, false, "no_credential");
-    }
-    if let Some(exp) = creds.expires_at_ms {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let remain_h = (exp - now_ms) as f64 / 3_600_000.0;
-        if remain_h > lazy_hours as f64 {
-            return (creds, false, "fresh");
-        }
-        if remain_h < 0.0 && creds.refresh_token.is_empty() {
-            return (creds, false, "expired_needs_relogin");
-        }
-    }
-    if let Some(new) = refresh_token_once(agent, &creds) {
-        let _ = save_token_store(state, acct_id, &new);
-        return (new, true, "refreshed");
-    }
-    (creds, false, "refresh_failed")
 }
 
 /// 401 自愈专用加锁刷新（H-1）：串行化「网络刷新→落库」并做二次检查——他人已刷新
@@ -877,32 +795,150 @@ pub fn refresh_token_once_locked(
     acct_id: &str,
     stale: &Creds,
 ) -> (Option<Creds>, Option<RefreshFail>) {
-    let lock = refresh_lock_for(acct_id);
-    let _refresh_guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(_cross) = cross_refresh_lock(&state.data_dir, acct_id) else {
-        return (None, Some(RefreshFail::Busy));
-    };
-    // 二次检查：store 权威源中该账号已换新 token（他人刷新落库）→ 直接复用。
-    // 仅比对 store 记录（刷新产物只落 store，不落 auth 文件），避免 auth 文件
-    // 属于其他账号时误判
-    let store_cur: Creds = load_token_store(state)
-        .get("tokens")
-        .and_then(|t| t.get(acct_id))
-        .map(creds_of)
-        .unwrap_or_default();
-    if !store_cur.access_token.is_empty() && store_cur.access_token != stale.access_token {
-        return (Some(store_cur), None);
+    match super::wb_session::refresh(&state.data_dir, acct_id, stale, super::wb_session::RefreshMode::Recover, agent) {
+        Ok((creds, _)) => (Some(creds), None),
+        Err(error) => {
+            if error.permanent() { mark_needs_relogin(state, acct_id, &error.message()); }
+            (None, Some(error.kind))
+        }
     }
-    let (new, fail) = refresh_token_once_ex(agent, stale);
-    if let Some(n) = &new {
-        let _ = save_token_store(state, acct_id, n);
-    }
-    (new, Some(fail))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_refresh_classification_requires_explicit_auth_evidence() {
+        for status in [0, 408, 500, 502, 503] { assert_eq!(classify_refresh(status, None), RefreshFail::Network); }
+        assert_eq!(classify_refresh(429, None), RefreshFail::RateLimited);
+        assert_eq!(classify_refresh(401, None), RefreshFail::Auth);
+        for status in [400, 403, 404, 422] { assert_eq!(classify_refresh(status, None), RefreshFail::Rejected); }
+        assert_eq!(classify_refresh(400, Some(&serde_json::json!({"error":"invalid_grant"}))), RefreshFail::Auth);
+        assert_eq!(classify_refresh(403, Some(&serde_json::json!({"error":{"code":"refresh_token_revoked"}}))), RefreshFail::Auth);
+        assert_eq!(classify_refresh(429, Some(&serde_json::json!({"error":"invalid_grant"}))), RefreshFail::RateLimited);
+    }
+
+    fn mock_session_response(status: u16, extra: &str, body: &str, creds: &Creds) -> Result<Creds, crate::tasks::wb_session::RefreshError> {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/refresh", listener.local_addr().unwrap());
+        let response = format!("HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}", body.len());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 2048];
+            loop {
+                let size = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..size]);
+                if size == 0 { break; }
+                if let Some(end) = request.windows(4).position(|chunk| chunk == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length = headers.lines().find_map(|line| line.split_once(':')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("Content-Length"))
+                        .and_then(|(_, value)| value.trim().parse::<usize>().ok())).unwrap_or(0);
+                    if request.len() >= end + 4 + length { break; }
+                }
+            }
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let result = refresh_request_at(&crate::tasks::http_agent(5), creds, &url);
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn session_refresh_http_429_keeps_actual_status_and_retry_after_without_secrets() {
+        let creds = Creds { access_token: "synthetic-access".into(), refresh_token: "synthetic-refresh".into(), ..Default::default() };
+        let error = mock_session_response(429, "Retry-After: 120\r\n", r#"{"message":"secret upstream body"}"#, &creds).err().unwrap();
+        assert_eq!(error.kind, RefreshFail::RateLimited);
+        assert_eq!(error.http_status, Some(429));
+        assert_eq!(error.retry_after_ms, Some(120_000));
+        assert!(!error.message().contains("需重新登录"));
+        assert!(!error.message().contains("401"));
+        assert!(!error.message().contains("secret upstream body"));
+        assert!(!format!("{error:?}").contains("synthetic-refresh"));
+    }
+
+    #[test]
+    fn session_refresh_rotated_rt_drops_old_expiry_and_supports_envelopes() {
+        let creds = Creds { access_token: "synthetic-access".into(), refresh_token: "synthetic-refresh".into(), refresh_expires_at_ms: Some(123_000), ..Default::default() };
+        let result = mock_session_response(200, "", r#"{"data":{"accessToken":"synthetic-new-access","refreshToken":"synthetic-new-refresh","expiresIn":3600}}"#, &creds).unwrap();
+        assert_eq!(result.access_token, "synthetic-new-access");
+        assert_eq!(result.refresh_token, "synthetic-new-refresh");
+        assert_eq!(result.refresh_expires_at_ms, None);
+        let retained = mock_session_response(200, "", r#"{"accessToken":"synthetic-new-access","expiresIn":3600}"#, &creds).unwrap();
+        assert_eq!(retained.refresh_token, creds.refresh_token);
+        assert_eq!(retained.refresh_expires_at_ms, creds.refresh_expires_at_ms);
+    }
+
+    #[test]
+    fn session_refresh_rejects_missing_or_overflowing_lifetime() {
+        let creds = Creds { refresh_token: "synthetic-refresh".into(), ..Default::default() };
+        for body in [r#"{"accessToken":"synthetic-new"}"#, r#"{"accessToken":"synthetic-new","expiresIn":9223372036854775807}"#] {
+            assert_eq!(mock_session_response(200, "", body, &creds).err().unwrap().kind, RefreshFail::BadResponse);
+        }
+    }
+
+    #[test]
+    fn credential_selection_requires_positive_identity_match() {
+        let stored = || Creds { access_token: "stored-access".into(), ..Default::default() };
+        let local = |uid: &str| Creds { uid: uid.into(), access_token: "local-access".into(), expires_at_ms: Some(99999), ..Default::default() };
+        assert_eq!(select_creds(stored(), local("other"), "target").access_token, "stored-access");
+        assert_eq!(select_creds(stored(), local(""), "target").access_token, "stored-access");
+        assert_eq!(select_creds(Creds::default(), local("other"), "").access_token, "");
+        assert_eq!(select_creds(stored(), local("target"), "target").access_token, "local-access");
+        let recovered = select_creds(stored(), Creds::default(), "target");
+        assert_eq!(recovered.uid, "target");
+        assert!(build_auth_headers(&recovered, false).contains(&("X-User-Id".into(), "target".into())));
+        let wrong_store = Creds { uid: "other".into(), ..stored() };
+        assert!(select_creds(wrong_store, Creds::default(), "target").access_token.is_empty());
+    }
+
+    #[test]
+    fn canonical_fields_override_legacy_aliases() {
+        let creds = creds_of(&serde_json::json!({"access_token": "new-access", "accessToken": "old-access", "refresh_token": "new-refresh", "refreshToken": "old-refresh", "expires_at_ms": 200, "expiresAtMs": 100}));
+        assert_eq!(creds.access_token, "new-access");
+        assert_eq!(creds.refresh_token, "new-refresh");
+        assert_eq!(creds.expires_at_ms, Some(200));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn camelcase_secure_roundtrip_preserves_separate_tokens() {
+        let dir = std::env::temp_dir().join(format!("wb-secure-roundtrip-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        token_store_upsert_secure(&dir, "test", &serde_json::json!({"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh", "uid": "test-uid"})).unwrap();
+        let creds = creds_of(&token_record_secure(&dir, "test"));
+        assert_eq!(creds.access_token, "synthetic-access");
+        assert_eq!(creds.refresh_token, "synthetic-refresh");
+        token_store_upsert_secure(&dir, "test", &serde_json::json!({"access_token": "rotated-access", "accessToken": "stale-access"})).unwrap();
+        let creds = creds_of(&token_record_secure(&dir, "test"));
+        assert_eq!(creds.access_token, "rotated-access");
+        assert_eq!(creds.refresh_token, "synthetic-refresh");
+        let raw = crate::store::db(&dir).row_get("wb_tokens", "test").unwrap().unwrap();
+        assert_eq!(raw["access_token"], "");
+        assert_eq!(raw["refresh_token"], "");
+        assert!(raw.get("accessToken").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn serialized_enterprise_flag_survives_reload() {
+        let original = Creds { enterprise_flag: true, uid: "synthetic-enterprise".into(), ..Default::default() };
+        let saved = serde_json::to_value(&original).unwrap();
+        assert!(is_enterprise_account(&creds_of(&saved)));
+    }
+
+    #[test]
+    fn refresh_lock_stays_shared_while_waiters_exist() {
+        let first = refresh_lock_for("synthetic-lifecycle");
+        let waiter = refresh_lock_for("synthetic-lifecycle");
+        assert!(std::sync::Arc::ptr_eq(&first, &waiter));
+        drop(first);
+        assert!(std::sync::Arc::ptr_eq(&waiter, &refresh_lock_for("synthetic-lifecycle")));
+    }
 
     // ==================== 企业号判定 ====================
 

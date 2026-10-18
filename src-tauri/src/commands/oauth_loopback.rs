@@ -291,6 +291,18 @@ pub async fn oauth_start_loopback(
     Ok(())
 }
 
+/// 是否已有 OAuth 回环监听会话在进行中（供代理启动路径判断是否需补做直连豁免）。
+///
+/// 场景：用户在「代理未运行」时先发起 OAuth → `enable_oauth_bypass` 因系统代理未指向
+/// 本软件而跳过；随后启动代理并接管系统代理，登录页即落入 MITM 解密范围、卡在
+/// 「获取中」（2026-10-17 实测）。代理启动后据此补做豁免即可自愈。
+pub fn loopback_is_active() -> bool {
+    loopback_handle()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+}
+
 /// 停止本机回环监听器并还原代理豁免（弹窗关闭/组件卸载/登录完成时调用；未启动时幂等成功）
 #[tauri::command]
 pub async fn oauth_stop_loopback(state: State<'_, AppState>) -> Result<(), String> {

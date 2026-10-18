@@ -17,6 +17,8 @@ import { Spinner, StatCard, Badge } from '../../components/ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { useIsDark } from '../../lib/useIsDark';
+import { listen } from '@tauri-apps/api/event';
+import { creditsFeedback, creditsTotal, creditsWarning } from './creditsState';
 import type {
   ViewKey,
   CodeBuddyEnvCheck,
@@ -81,20 +83,31 @@ export default function BuddyOverview() {
   const [records, setRecords] = useState<WbCheckinRecord[]>([]);
   const [cliBridged, setCliBridged] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const requestGeneration = useRef(0);
+  const creditsRevision = useRef(0);
   const [openingClient, setOpeningClient] = useState(false);
 
-  const refresh = async () => {
+  const refresh = async (fresh = false) => {
+    const generation = ++requestGeneration.current;
+    const revision = creditsRevision.current;
     setRefreshing(true);
     try {
       const [e, accs, cr, recs] = await Promise.all([
         api.workbuddy.envCheck().catch(() => null),
         api.workbuddy.accountsList().catch(() => [] as WorkBuddyAccountView[]),
-        api.workbuddy.creditsFetch().catch(() => null),
+        api.workbuddy.creditsFetch(undefined, fresh).catch(() => null),
         api.workbuddy.checkinResults(30).catch(() => [] as WbCheckinRecord[]),
       ]);
+      if (generation !== requestGeneration.current) return;
+      if (fresh && revision === creditsRevision.current) {
+        if (cr) { const feedback = creditsFeedback(cr); pushToast(feedback.tone, feedback.message); }
+        else pushToast('warn', '积分刷新失败，保留上次数据');
+      }
       setEnv(e);
-      setAccounts(accs);
-      setCredits(cr);
+      if (revision === creditsRevision.current) {
+        setAccounts(accs);
+        if (cr) setCredits(cr);
+      }
       setRecords(recs);
       // CLI 桥状态（低频附加展示，失败静默）
       api.env
@@ -108,37 +121,32 @@ export default function BuddyOverview() {
     } catch (err) {
       pushToast('error', `WorkBuddy 概述刷新失败：${String(err)}`);
     } finally {
-      setRefreshing(false);
+      if (generation === requestGeneration.current) setRefreshing(false);
     }
   };
 
   useEffect(() => {
     void refresh();
+    return () => { requestGeneration.current += 1; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // stale-while-revalidate（2026-10-08）：后端缓存过期时先回旧值并转后台刷新
-  // （返回 refreshing=true），这里稍后重取一次即拿到新值；最多 4 次、间隔 1.5s 递增，
-  // 覆盖慢网络（全局代理）下的刷新耗时。拿到新值（refreshing 消失）后计数归零。
-  const creditsPollRef = useRef(0);
   useEffect(() => {
-    if (!credits?.refreshing) {
-      creditsPollRef.current = 0;
-      return;
-    }
-    if (creditsPollRef.current >= 4) return;
-    const timer = window.setTimeout(() => {
-      creditsPollRef.current += 1;
-      api.workbuddy
-        .creditsFetch()
-        .then(setCredits)
-        .catch(() => {});
-    }, 1500 * (creditsPollRef.current + 1));
-    return () => window.clearTimeout(timer);
-  }, [credits]);
+    let disposed = false;
+    const subscription = listen<WbCreditsResult>('wb-credits-updated', (event) => {
+      if (disposed) return;
+      const revision = ++creditsRevision.current;
+      const generation = requestGeneration.current;
+      setCredits(event.payload);
+      void api.workbuddy.accountsList().then((latest) => {
+        if (!disposed && generation === requestGeneration.current && revision === creditsRevision.current) setAccounts(latest);
+      }).catch(() => {});
+    });
+    return () => { disposed = true; void subscription.then((unlisten) => unlisten()).catch(() => {}); };
+  }, []);
 
   const total = accounts.length;
-  const totalBalance = credits?.accounts.reduce((s, a) => s + (a.balance ?? 0), 0) ?? null;
+  const totalBalance = creditsTotal(credits);
   const okAccounts = credits?.accounts.filter((a) => a.ok).length ?? 0;
   // 今日签到账号数（今日记录去重 user_id）
   const today = new Date().toLocaleDateString('sv-SE');
@@ -165,7 +173,7 @@ export default function BuddyOverview() {
     (n, acc) =>
       n +
       (acc.packages ?? []).filter(
-        (p) => p.expire_ts != null && p.expire_ts <= nowSec + 7 * 86400 && p.remaining > 0,
+        (p) => p.expire_ts != null && p.expire_ts > nowSec && p.expire_ts <= nowSec + 7 * 86400 && p.remaining != null && p.remaining > 0,
       ).length,
     0,
   );
@@ -175,7 +183,7 @@ export default function BuddyOverview() {
   const top = useMemo(
     () =>
       [...(credits?.accounts ?? [])]
-        .filter((a) => a.balance != null && a.balance > 0)
+        .filter((a) => a.ok && a.balance != null && Number.isFinite(a.balance) && a.balance > 0)
         .sort((a, b) => (b.balance ?? 0) - (a.balance ?? 0))
         .slice(0, 10)
         .map((a) => ({ name: a.name || a.user_id, credits: a.balance as number })),
@@ -248,11 +256,13 @@ export default function BuddyOverview() {
         title="Buddy · 概述"
         desc="WorkBuddy / CodeBuddy 运行总览 · 登录账号 / 套餐 / 告警提醒 · 签到趋势与积分榜"
         actions={
-          <button onClick={() => void refresh()} className="btn-outline" disabled={refreshing}>
+          <button onClick={() => void refresh(true)} className="btn-outline" disabled={refreshing}>
             <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} /> 刷新
           </button>
         }
       />
+
+      {credits && creditsWarning(credits) && <div role="status" className="mb-3 text-sm text-amber-600">{creditsWarning(credits)}</div>}
 
       {/* 顶部统计卡（对齐 Trae 概述：数值一眼掌握） */}
       <div className="grid grid-cols-2 gap-3 md:grid-cols-5">

@@ -250,6 +250,17 @@ impl Store {
         })
     }
 
+    pub fn row_get(&self, table: &str, pk: &str) -> Result<Option<serde_json::Value>, String> {
+        if !schema::ROW_TABLES.contains(&table) {
+            return Err(format!("非法表名: {table}"));
+        }
+        use rusqlite::OptionalExtension;
+        let raw: Option<String> = self.with_conn(|conn| {
+            conn.query_row(&format!("SELECT data FROM [{table}] WHERE pk=?1"), [pk], |row| row.get(0)).optional()
+        })?;
+        raw.map(|text| serde_json::from_str(&text).map_err(|error| error.to_string())).transpose()
+    }
+
     /// 单行 UPSERT（多写方 map 的增量更新路径，如 wb_tokens / account_cooldowns）
     pub fn row_upsert(&self, table: &str, pk: &str, data: &serde_json::Value) -> Result<(), String> {
         if !schema::ROW_TABLES.contains(&table) {

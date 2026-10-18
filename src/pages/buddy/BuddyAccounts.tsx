@@ -34,12 +34,15 @@ import { GroupSelect } from '../accounts/GroupSelect';
 import { GroupsModal, computePoolBadges } from '../accounts/GroupsModal';
 import { TagChips } from '../accounts/TagSelect';
 import { AccountTagsEditModal, TagsModal } from '../accounts/TagsModal';
+import { CreditsExpireBadge } from '../accounts/CreditsExpireBadge';
 import { listen } from '@tauri-apps/api/event';
 import { save } from '@tauri-apps/plugin-dialog';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
 import { copyText } from '../../lib/clipboard';
+import { creditsFeedback, creditsWarning } from './creditsState';
+import { SessionHealthBadge } from './SessionHealthBadge';
 import type {
   BuddyChatApp,
   GroupView,
@@ -108,10 +111,22 @@ export default function BuddyAccounts() {
   // 今日签到状态（user_id → 最新一条记录；success/already=已签，fail=失败，无=未签）
   const [checkinMap, setCheckinMap] = useState<Map<string, WbCheckinRecord>>(new Map());
   const [loading, setLoading] = useState(false);
+  const refreshGeneration = useRef(0);
+  const creditsRevision = useRef(0);
+  const [creditsNotice, setCreditsNotice] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
   const [scanPreview, setScanPreview] = useState<{ nickname: string; uid: string; exists: boolean; already_in_pool?: boolean } | null>(null);
   const [detailFor, setDetailFor] = useState<WorkBuddyAccountView | null>(null);
+  // 积分包明细弹窗：默认只列可用包，已用完包折叠（避免「共 N 个包」与看板口径不一致）
+  const [showUsedPacks, setShowUsedPacks] = useState(false);
+  // 可用包 = 剩余 > 0（与看板 KPI「积分包总数」/到期日历同口径）；剩余未知或已用尽归入已用完
+  const detailPacks = useMemo(() => {
+    const all = credits.get(detailFor?.id ?? '') ?? [];
+    const active = all.filter((p) => p.remaining != null && p.remaining > 0);
+    return { all, active, used: all.filter((p) => p.remaining == null || p.remaining <= 0) };
+  }, [credits, detailFor]);
   const [deleteFor, setDeleteFor] = useState<WorkBuddyAccountView | null>(null);
+  const [deleteManagedData, setDeleteManagedData] = useState(false);
   const [restoreFor, setRestoreFor] = useState<WorkBuddyAccountView | null>(null);
   const [copyFor, setCopyFor] = useState<WorkBuddyAccountView | null>(null);
   const [copyTarget, setCopyTarget] = useState('');
@@ -256,6 +271,8 @@ export default function BuddyAccounts() {
    * 挂载/切号事件回刷保持缓存语义，避免每次进页面都全量拉取。
    */
   const refresh = useCallback(async (opts?: { freshCredits?: boolean }) => {
+    const generation = ++refreshGeneration.current;
+    const revision = creditsRevision.current;
     // 手动刷新（按钮触发）需要明确的完成反馈：此前成功路径完全静默，
     // 用户只能靠列表内容是否变化判断，感知上等同「点了没反应」
     const manual = opts?.freshCredits ?? false;
@@ -263,7 +280,8 @@ export default function BuddyAccounts() {
     try {
       // 最小可见时长：本地命中时整轮可能 <100ms，加载态一闪而过等同无反馈
       const accs = await withMinDelay(api.workbuddy.accountsList(), 300);
-      setAccounts(accs);
+      if (generation !== refreshGeneration.current) return;
+      if (revision === creditsRevision.current) setAccounts(accs);
       // 会话备份状态徽标：逐账号轻量查询 chatdata_info（按当前会话域，经 ref 取最新值）；
       // 任一失败仅该账号不显示徽标（纯状态降级，不阻断列表）
       void loadChatMeta(accs, chatAppRef.current);
@@ -276,38 +294,25 @@ export default function BuddyAccounts() {
         .cliStatus()
         .then((s) => setCliActiveId(s.active_account_id))
         .catch(() => setCliActiveId(null));
-      // 积分查询（默认 ≥5min 缓存，失败不阻断列表展示；手动刷新时强制取新）
-      api.workbuddy
-        .creditsFetch(undefined, manual)
-        .then((r: WbCreditsResult) => {
-          const m = new Map<string, WbCreditPackage[]>();
-          for (const a of r.accounts) m.set(a.user_id, a.packages ?? []);
-          setCredits(m);
-          // 套餐回填发生在积分拉取链路（payment-type → edition_type，仅补空）；
-          // 手动刷新时积分已写回账号池，必须重取列表才能让余额/会员套餐列反映
-          // 新值——只按 edition 判空重取会让「刷新」看着没反应
-          if (manual || accs.some((a) => !a.edition_type)) {
-            void api.workbuddy
-              .accountsList()
-              .then((fresh) => {
-                setAccounts(fresh);
-                if (manual) {
-                  pushToast('success', `刷新完成：${fresh.length} 个账号，积分已更新`);
-                }
-              })
-              .catch(() => {
-                if (manual) pushToast('success', `刷新完成：${accs.length} 个账号`);
-              });
-          } else if (manual) {
-            pushToast('success', `刷新完成：${accs.length} 个账号`);
-          }
-        })
-        .catch(() => {
-          pushToast(
-            'warn',
-            manual ? '积分刷新失败（账号列表已更新）' : '积分缓存查询失败，积分包列为空',
-          );
-        });
+      try {
+        const result = await api.workbuddy.creditsFetch(undefined, manual);
+        if (generation !== refreshGeneration.current || revision !== creditsRevision.current) return;
+        const packages = new Map<string, WbCreditPackage[]>();
+        for (const account of result.accounts) packages.set(account.user_id, account.packages ?? []);
+        setCredits(packages);
+        setCreditsNotice(creditsWarning(result));
+        const latest = await api.workbuddy.accountsList();
+        if (generation !== refreshGeneration.current || revision !== creditsRevision.current) return;
+        setAccounts(latest);
+        if (manual) {
+          const feedback = creditsFeedback(result);
+          pushToast(feedback.tone, feedback.message);
+        }
+      } catch {
+        if (generation === refreshGeneration.current && revision === creditsRevision.current) {
+          pushToast('warn', manual ? '积分刷新失败，保留上次数据' : '积分查询失败，保留上次数据');
+        }
+      }
       // 今日签到状态（失败静默，不阻断列表）
       api.workbuddy
         .checkinResults(1)
@@ -328,14 +333,31 @@ export default function BuddyAccounts() {
     } catch (err) {
       pushToast('error', `读取账号失败：${String(err)}`);
     } finally {
-      setLoading(false);
+      if (generation === refreshGeneration.current) setLoading(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
     void refresh();
+    return () => { refreshGeneration.current += 1; };
   }, [refresh]);
+
+  useEffect(() => {
+    let disposed = false;
+    const subscription = listen<WbCreditsResult>('wb-credits-updated', (event) => {
+      if (disposed) return;
+      const revision = ++creditsRevision.current;
+      const result = event.payload;
+      setCredits(new Map(result.accounts.map((account) => [account.user_id, account.packages ?? []])));
+      setCreditsNotice(creditsWarning(result));
+      const generation = refreshGeneration.current;
+      void api.workbuddy.accountsList().then((latest) => {
+        if (!disposed && generation === refreshGeneration.current && revision === creditsRevision.current) setAccounts(latest);
+      }).catch(() => {});
+    });
+    return () => { disposed = true; void subscription.then((unlisten) => unlisten()).catch(() => {}); };
+  }, []);
 
   // 切换/保存完成自动刷新（审查修复 2026-09-15）：切换是后台长流程，switch-done /
   // save-login-done 事件迟到时列表的「当前 / 在线 / WB当前 / CB当前」徽标不会自行更新，
@@ -633,6 +655,7 @@ export default function BuddyAccounts() {
   };
 
   const handleDelete = (a: WorkBuddyAccountView) => {
+    setDeleteManagedData(false);
     setDeleteFor(a);
   };
 
@@ -640,7 +663,7 @@ export default function BuddyAccounts() {
     if (!deleteFor) return;
     setDeleteBusy(true);
     try {
-      await withMinDelay(api.workbuddy.accountRemove(deleteFor.id, false), 1000);
+      await withMinDelay(api.workbuddy.accountRemove(deleteFor.id, deleteManagedData), 1000);
       pushToast('info', '账号已删除');
       setDeleteFor(null);
       await refresh();
@@ -813,7 +836,7 @@ export default function BuddyAccounts() {
               onClick={() => void refresh({ freshCredits: true })}
               className="btn-outline"
               disabled={loading}
-              title="重新读取账号列表，并强制刷新积分与会员套餐（绕过 5 分钟缓存）"
+              title="重新读取账号列表，并强制刷新积分与会员套餐（绕过 10 分钟缓存）"
             >
               <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> 刷新
             </button>
@@ -891,6 +914,7 @@ export default function BuddyAccounts() {
 
       {/* 切换/保存进度面板（issue #44 遗留项，位置对齐 Trae/豆包页：PageHeader 之后） */}
       <SwitchProgressPanel />
+      {creditsNotice && <div role="status" className="my-3 text-sm text-amber-600">{creditsNotice}</div>}
 
       {/* 分组过滤 chips（对齐 Trae 账号管理） */}
       {accounts.length > 0 && (
@@ -941,7 +965,8 @@ export default function BuddyAccounts() {
                 <th className="px-4 py-2 text-left">会员套餐</th>
                 <th className="px-4 py-2 text-left">积分包</th>
                 <th className="px-4 py-2 text-right">可用积分</th>
-                <th className="px-4 py-2 text-left">token 到期</th>
+                <th className="px-4 py-2 text-left">积分到期</th>
+                <th className="px-4 py-2 text-left">登录态到期</th>
                 <th className="px-4 py-2 text-left">签到状态</th>
                 <th className="px-4 py-2 text-left">状态</th>
                 <th className="px-4 py-2 text-right">操作</th>
@@ -950,10 +975,13 @@ export default function BuddyAccounts() {
             <tbody>
               {filtered.map((a) => {
                 const pkgs = credits.get(a.id) ?? [];
+                // 积分包统计与看板 KPI / 到期日历同口径：只计剩余 > 0 的可用包，
+                // 已用完的包保留在明细弹窗里可查（原实现用 pkgs.length 把历史用尽包也算进去）
+                const activePkgs = pkgs.filter((p) => p.remaining != null && p.remaining > 0);
                 // 7 日内将过期（仍有剩余）的积分包 → 列表标记提示
                 const nowSec = Math.floor(Date.now() / 1000);
                 const soonestExpire = pkgs.reduce<number | null>((min, p) => {
-                  if (p.expire_ts == null || p.remaining <= 0 || p.expire_ts <= nowSec) return min;
+                  if (p.expire_ts == null || p.remaining == null || p.remaining <= 0 || p.expire_ts <= nowSec) return min;
                   if (p.expire_ts > nowSec + 7 * 86400) return min;
                   return min == null ? p.expire_ts : Math.min(min, p.expire_ts);
                 }, null);
@@ -1014,8 +1042,9 @@ export default function BuddyAccounts() {
                           <button
                             className="flex items-center gap-1 text-xs text-brand-600 hover:underline dark:text-brand-400"
                             onClick={() => setDetailFor(a)}
+                            title={`可用 ${activePkgs.length} 个包；共 ${pkgs.length} 个，已用完 ${pkgs.length - activePkgs.length} 个（点击查看明细）`}
                           >
-                            <Coins size={13} /> {pkgs.length} 个包
+                            <Coins size={13} /> {activePkgs.length} 个可用包
                           </button>
                           {soonestExpire != null && (
                             <Badge
@@ -1034,10 +1063,14 @@ export default function BuddyAccounts() {
                       {a.credits_balance != null ? a.credits_balance.toFixed(2) : '-'}
                     </td>
                     <td className="px-4 py-3 text-xs">
+                      <CreditsExpireBadge expireAt={a.credits_expire_at} />
+                    </td>
+                    <td className="px-4 py-3 text-xs">
                       <div className={tokenTone(a.access_token_expires_at)}>{fmtExpire(a.access_token_expires_at)}</div>
                       {a.refresh_token_expires_at && (
                         <div className="text-slate-400">RT {fmtExpire(a.refresh_token_expires_at)}</div>
                       )}
+                      <SessionHealthBadge health={a.session_health} />
                     </td>
                     <td className="px-4 py-3">
                       {(() => {
@@ -1283,7 +1316,12 @@ export default function BuddyAccounts() {
       >
         <div className="text-sm">
           确定删除账号「{deleteFor?.nickname || deleteFor?.id}」？
-          <div className="mt-1 text-xs text-slate-400">仅移出账号池，不删除登录态快照与凭证文件。</div>
+          <div className="mt-1 text-xs text-slate-400">移出账号池并清除助手保存的凭证、标签、网关配置与缓存；不会退出官方客户端。</div>
+          <label className="mt-3 flex items-center gap-2">
+            <input type="checkbox" checked={deleteManagedData} onChange={(event) => setDeleteManagedData(event.target.checked)} disabled={deleteBusy} />
+            同时删除助手托管的双端快照（含回滚副本）和会话备份
+          </label>
+          <div className="mt-1 text-xs text-slate-400">此选项不可撤销；不会删除官方客户端的聊天原件。</div>
         </div>
       </Modal>
 
@@ -1723,43 +1761,61 @@ export default function BuddyAccounts() {
         </div>
       </Modal>
 
-      {/* 积分包明细弹窗（F-56） */}
+      {/* 积分包明细弹窗（F-56）：统计口径 = 可用包（剩余 > 0），已用完包默认折叠 */}
       <Modal
         open={detailFor != null}
-        onClose={() => setDetailFor(null)}
+        onClose={() => { setDetailFor(null); setShowUsedPacks(false); }}
         size="lg"
         bodyClass="max-h-[70vh] overflow-y-auto"
-        title={`${detailFor?.nickname || detailFor?.id || ''} · 共 ${credits.get(detailFor?.id ?? '')?.length ?? 0} 个积分包`}
+        title={`${detailFor?.nickname || detailFor?.id || ''} · 可用 ${detailPacks.active.length} / 共 ${detailPacks.all.length} 个积分包`}
       >
-        {(credits.get(detailFor?.id ?? '') ?? []).length === 0 ? (
+        {detailPacks.all.length === 0 ? (
           <p className="py-6 text-center text-xs text-slate-400">
             暂无积分包明细：请先在「积分看板」页查询（需账号已录入凭证）
           </p>
         ) : (
           <div className="space-y-3">
-            {(credits.get(detailFor?.id ?? '') ?? []).map((p, i) => (
-              <div key={i} className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="truncate text-sm font-medium">{p.name}</span>
-                  <span className="shrink-0 tabular-nums text-sm">
-                    {(p.remaining ?? 0).toFixed(2)} / {(p.total ?? 0).toFixed(2)}
-                    <span className="ml-2 text-xs text-slate-400">已用 {(p.used ?? 0).toFixed(2)}</span>
-                  </span>
+            {(showUsedPacks ? [...detailPacks.active, ...detailPacks.used] : detailPacks.active).map((p, i) => {
+              const depleted = p.remaining == null || p.remaining <= 0;
+              return (
+                <div
+                  key={`${p.name}-${p.end_time ?? ''}-${i}`}
+                  className={depleted ? 'rounded-lg border border-slate-100 p-3 opacity-60 dark:border-zinc-800' : 'rounded-lg border border-slate-100 p-3 dark:border-zinc-800'}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="truncate text-sm font-medium">{p.name}</span>
+                    <span className="shrink-0 tabular-nums text-sm">
+                      {p.remaining?.toFixed(2) ?? '未知'} / {p.total?.toFixed(2) ?? '未知'}
+                      <span className="ml-2 text-xs text-slate-400">已用 {p.used?.toFixed(2) ?? '未知'}</span>
+                    </span>
+                  </div>
+                  <div className="mt-1.5 flex items-center gap-2">
+                    <span className={p.expire_soon ? 'text-xs text-rose-500' : 'text-xs text-slate-400'}>
+                      {p.end_time ? `到期 ${p.end_time.slice(0, 10).replace(/-/g, '/')}` : '到期时间未知'}
+                    </span>
+                    {p.expire_soon && <Badge tone="red">即将到期</Badge>}
+                    {depleted && <Badge tone="slate">已用完</Badge>}
+                  </div>
+                  <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-slate-200 dark:bg-zinc-800">
+                    <div
+                      className="h-full rounded-full bg-emerald-500"
+                      style={{ width: `${p.total != null && p.total > 0 && p.remaining != null ? Math.min(100, Math.round((p.remaining / p.total) * 100)) : 0}%` }}
+                    />
+                  </div>
                 </div>
-                <div className="mt-1.5 flex items-center gap-2">
-                  <span className={p.expire_soon ? 'text-xs text-rose-500' : 'text-xs text-slate-400'}>
-                    {p.end_time ? `到期 ${p.end_time.slice(0, 10).replace(/-/g, '/')}` : '到期时间未知'}
-                  </span>
-                  {p.expire_soon && <Badge tone="red">即将到期</Badge>}
-                </div>
-                <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-slate-200 dark:bg-zinc-800">
-                  <div
-                    className="h-full rounded-full bg-emerald-500"
-                    style={{ width: `${p.total > 0 ? Math.min(100, Math.round((p.remaining / p.total) * 100)) : 0}%` }}
-                  />
-                </div>
-              </div>
-            ))}
+              );
+            })}
+            {detailPacks.active.length === 0 && (
+              <p className="py-2 text-center text-xs text-slate-400">当前没有剩余积分 &gt; 0 的可用包。</p>
+            )}
+            {detailPacks.used.length > 0 && (
+              <button
+                className="w-full rounded-lg border border-dashed border-slate-200 py-2 text-xs text-slate-500 hover:bg-slate-50 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800/50"
+                onClick={() => setShowUsedPacks((v) => !v)}
+              >
+                {showUsedPacks ? `收起已用完的 ${detailPacks.used.length} 个包` : `显示已用完的 ${detailPacks.used.length} 个包`}
+              </button>
+            )}
           </div>
         )}
       </Modal>

@@ -180,7 +180,7 @@ ai-work-assistant/
 | WorkBuddy | `workbuddy_checkin_results(days?)` | 签到日志（wb_checkin_results 表 90 天滚动，默认展示 30 天；**纯追加**：同日同账号多轮并存，返回新→旧序；活动档期日历聚合 `daysFromWbRecords` 按账号取当日最终态——任一 success/already 即当日已领、仅全失败计 fail） |
 | WorkBuddy | `workbuddy_checkin_task_register(times[]) / _status / _unregister` | schtasks 每日双时段签到任务 AIWorkAssistant_WorkBuddyCheckin_<HHMM>（09:00/21:00） |
 | WorkBuddy | `workbuddy_renew_task_register(day) / _status / _unregister` | schtasks 每周凭证续期兜底任务 AIWorkAssistant_WorkBuddyRenew（周日 10:30，主 exe `--task-run wb-renew` → `run_renew_only` 惰性刷新） |
-| WorkBuddy | `workbuddy_credits_fetch(userId?, fresh?)` | Rust 直调 `tasks/wb_credits.rs`：积分三件套 + 旧接口回退 + 容量字段链解析 + ≥10min 缓存；成功回写账号池余额缓存；非缓存命中时追加每日快照（含 earned = 当日余额差分与签到 reward 归并，credits-dashboard-plan.md §2.2 方案 B）。**提速修订（2026-10-08）**：账号间并发取数（≤4 路；原串行 for 让「N 账号 × ≥3 次请求」在全局代理/跨境出口下线性放大，实测单请求 0.1s→2s+ 直接反映为切板块等待）+ 缓存过期时 **stale-while-revalidate**：非 `fresh` 调用先回旧值（`cached:true, refreshing:true`）并把刷新转后台线程（进程内在途去重），前端 `BuddyOverview` 按 `refreshing` 最多重取 4 次拿新值；`fresh=true`（手动刷新）与「无缓存」仍同步拉 |
+| WorkBuddy | `workbuddy_credits_fetch(userId?, fresh?)` | 官方 TotalCredits 优先，缺失按 Packages/CreditGroups 互斥解析；包 remaining/total/used 为 number 或 null，未知不当零/总容量。缓存 schema=2，绑定有序 (id, uid) 集合，≥10min；增删号使旧集合失效。全池及单账号查询有限并发（≤4）与 singleflight；非 fresh 的过期缓存先回 cached:true/refreshing:true，后台完成发 wb-credits-updated 事件，前端不再四次短轮询。fresh=true 强制取新；失败/旧值明确标记，拒绝未验证身份的 local quota 兜底。套餐补查后台并发节流，不阻塞余额；只有全池完整、非缓存、全部成功且余额非负的结果才写每日快照 |
 | WorkBuddy | `workbuddy_credits_history_list()` | WB 每日积分快照时序读取（wb_credits_history 表，365 天，含 earned；看板「Buddy 获得积分」方案 B 数据源） |
 | WorkBuddy | `workbuddy_settings_get / workbuddy_settings_set(patch)` | data/workbuddy_settings.json：auto_checkin（启动补签）/ keepalive_days / lazy_refresh_hours / growth_* 开关 |
 | WorkBuddy | `workbuddy_cli_status / _bridge_set(userId) / _rotate_run / _rotate_logs(limit?)` | CLI 切号桥（F-06/F-59，批次3）：桥接状态（含 environment_override 警告）/ 写 `~/.codebuddy/settings.json` env 直桥 / 手动触发五重防护轮换 / 轮换日志（cap 50）；后台轮换线程 `start_cli_rotate_thread()` 按 settings.cli_* 配置独立运行（`workbuddy_cli.rs` 决策纯函数 `decide_target` 13 单测） |
@@ -194,7 +194,7 @@ ai-work-assistant/
 | WorkBuddy | `workbuddy_activity_info(userId?, refresh?)` | 活动信息三端点聚合（F-51，批次4）：公开 GET `/v2/activity/banner` + billing POST `get-payment-type`/`get-dosage-notify`；宽容解析逐项容错（errors[] 明示），缓存 10min（data/workbuddy_activity_cache.json） |
 | WorkBuddy | `workbuddy_ui_click_capture()` / `workbuddy_ui_click_checkin()` | UI 坐标点击签到兜底（F-18，批次4）：ctypes user32 驱动鼠标（零新依赖）；仅手动触发、默认关闭（settings.ui_click_enabled）；取点 3 秒倒计时记录坐标，执行单次单击不循环 |
 | WB 配置 | `wb_route_config_get()` / `wb_route_config_set(config)` / `wb_template_map_get()` / `wb_template_map_set(map)` | 四段模型路由与审核模板映射两个手工配置文件的程序化读写：读 data/ 新路径回退旧根；set 结构校验与读取方反序列化严格对齐（aliases/rules/suffixes 为 object，模板表为 {templates:[{from,to}]} 形态），写 data/ 新路径并逐出读缓存（网关热路径即时生效） |
-| Buddy 双应用 | `open_workbuddy_app()` / `open_codebuddy_app()` / `codebuddy_env_check()` | 启动 WorkBuddy / CodeBuddy 桌面客户端（app_locate 探测，未装返回明确错误，不注入代理）；CodeBuddy 环境探测 `{installed,running,exe,version,uid,nickname}`（CodeBuddy CN 桌面与 WorkBuddy 共享 auth 文件 `%LOCALAPPDATA%\CodeBuddyExtension\...\workbuddy-desktop.info`，uid 同源 → 账号页「CodeBuddy在线」徽标）；`-TargetApp CodeBuddy`（authfile 布局）切换/保存快照落 profiles_codebuddy |
+| Buddy 双应用 | `open_workbuddy_app()` / `open_codebuddy_app()` / `codebuddy_env_check()` | 启动双端客户端，不注入代理。环境探测 {installed,running,exe,version,uid,nickname}；CodeBuddy 当前 UID 来自自身 globalStorage/storage.json 的 genie.userId，不以共享 WorkBuddy auth 判断。target_app=CodeBuddy 的快照落 profiles_codebuddy，独立校验自身身份 |
 | Qoder | `qoder_env_check()` / `qoder_open_ide()` / `qoder_open_work()` | Qoder IDE 环境探测 / 启动 IDE / 启动 Qoder Work（app_locate 四级探测，`target_app=Qoder`） |
 | Qoder | `qoder_oauth_login()` / `qoder_oauth_cancel()` | PKCE 设备流登录（R-10 抓包固化）：nonce+verifier 生成 → 系统浏览器开 `qoder.cn/device/selectAccounts?challenge=...` → 轮询 `GET /api/v1/deviceToken/poll`（pending=404，≤180s/1s）→ **响应 nonce 回验**（防会话混淆）→ 自动入池落库；事件 qoder-oauth-progress / qoder-oauth-done |
 | Qoder | `qoder_settings_get()` / `qoder_settings_set(patch)` | kv("qoder_settings")：auto_checkin（启动补签）/ checkin_hhmm / credits_sync_hhmm / credits_sync_enabled / lazy_refresh_hours |
@@ -211,6 +211,22 @@ ai-work-assistant/
 | Qoder | `qoder_groups_list / create / update / remove` | 分组管理（kv("qoder_groups")，结构与 Trae/Buddy 一致；create 重名校验；删除时组内账号回落未分组） |
 | Qoder | `qoder_accounts_export(includeCredentials?) / _import(payload)` | 账号库导入导出（kind 标记 `aiwork-qoder-pool`；凭证是否随行由用户勾选，含凭证导出前端强确认；分组定义随载荷导出，导入按 id 幂等合并 + 幽灵 group_id 回落未分组） |
 | Qoder | `qoder_env_reset_items()` / `qoder_env_reset(items)` | Qoder 环境残留清理清单 + 程序化清理（执行前关闭 Qoder IDE 与 Work 客户端——本体进程同名 "Qoder CN.exe" 一并覆盖；9 项含 QoderWork 客户端 `%APPDATA%\com.qodercn.app.stable` 的 Local State + Network\Cookies；单项失败不中断） |
+
+### Buddy 身份、凭证与清理补充（2026-10-18）
+
+- 工具凭证优先 snake_case，AT/RT 精确枚举，保存时删除 camelCase 别名、DB 敏感字段留空占位，仅 vault 持密文。单账号安全读取，不为列表徽标解密整池。
+- 任务有效凭证只接受池内账号；存储 UID 缺失从池补齐、冲突拒绝；本机 auth 必须与目标 UID 正匹配才参与新鲜度比较。网关/CLI/官方用量仅用身份匹配的工具副本；显式指定账号不改查其他账号。OAuth 保留 UID、昵称、edition、domain 与企业标识。
+- 手动/任务/网关续期和删除共享账号刷新锁及跨进程锁；锁表 Weak 引用不移除仍被持有/等待的锁。写入前检查池成员，删除与 token 表写入串行；持久化失败返回错误，不提示续期成功。
+- `workbuddy_account_remove(userId, deleteSnapshot?)` 幂等；总是清工具凭证/vault、标签、白名单、匹配 CLI token/active 标记及当前积分/用量/活动缓存。deleteSnapshot=true 还清双端托管快照与聊天备份的主槽、.bak、.bak2 和匹配 current_account 标记；路径限定在托管目录，失败汇总返回可重试。前端显式勾选，默认不清快照；不删除官方客户端登录/聊天原件、历史签到/审计、独立导出或邮件备份。
+- CodeBuddy authfile 快照 schemaVersion=2：UID 来自自身 storage.json 的 genie.userId，必需 state.vscdb 与有效 UID，不复制共享 WorkBuddy auth。恢复校验必选文件及 meta/storage 身份一致；冲突或身份缺失的旧快照要求重新保存，不能自动修复。WorkBuddy 仍为自身 authfile schemaVersion=1。
+- 详见 `docs/buddy-audit-2026-10-18.md` 的修复状态与未覆盖边界；未真实多账号联调，不能宣称全链路实机验收。
+
+### Buddy 会话恢复补充（2026-10-18）
+
+- `tasks/wb_session.rs` 统一所有续期入口的账号锁、持久退避及健康状态；refresh 仅 401/明确失效码判重登，429/408/5xx/未知 4xx 不误标。`wb_session:<id>` 存 SQLite KV，不含令牌，删除账号同步清理。
+- `wb-renew` 应用内每 6 小时检查，AT 或已知 RT 临期 24h 才续期；`lazy_hours=0` 仅刷新到期项。暂态失败交调度器重试，摘要区分真实续期、离线无需续期与需重登。成功保存后才记续期成功。
+- 凭证双源按身份和到期时间比较整对 AT/RT，成功轮换记录最多 16 代旧指纹，拒绝已知旧来源覆盖；新桌面登录态仍可参与恢复。重登标记阻止后续成长步骤，重新导入成功清理旧状态。列表 `session_health` 时间戳为毫秒，不暴露内部指纹。
+- 事故证据、限制与验收见 `docs/buddy-session-incident-2026-10-18.md`；服务端撤销仍需官方登录恢复，维护不保证账号永久有效。
 
 ### 5.1 Trae 账号发现与双 uid 体系（F-08，trae_apps.rs；双应用合并适配 2026-10-14）
 
@@ -318,7 +334,7 @@ ai-work-assistant/
 
 - **进程内直调**：`switcher::run_action(RunArgs, &ProgressSink)`——原 powershell 子进程管道已下线，NDJSON 行 `{"stage","status","message","time"}` 语义与 `*-done {success,raw}` 由 TauriSink/CliSink 一步到位，前端契约不变。
 - **全局互斥**：并发 run_action 直接拒绝（「已有切换/备份操作进行中」），命令层预检（JWT/会话/守卫 uid）在前。
-- **入参**：`action: Switch/SaveCurrentLogin/BackupCurrent/RestoreOnly/ResetMachineId/ResetDeviceIds/KeepAlive`；`user_id`（Reset*/KeepAlive 可空，经 ensure_uid_safe 白名单）；`target_app: Trae|Doubao|WorkBuddy|CodeBuddy|Qoder|QoderWork`；`proxy_port>0` 注入 `--proxy-server`（C1）；`include_indexeddb`（C4：备份纳入 `Default/IndexedDB`）；`expected_current_uid`（防误覆盖守卫）。CodeBuddy 为 authfile 布局：ProcNames 双形态 `CodeBuddy/CodeBuddy CN`、ProfilesDir=profiles_codebuddy、`~/.codebuddy` 无 account-snapshot 时确认步 skip+warn。
+- **入参**：`action: Switch/SaveCurrentLogin/BackupCurrent/RestoreOnly/ResetMachineId/ResetDeviceIds/KeepAlive`；`user_id`（Reset*/KeepAlive 可空，经 ensure_uid_safe 白名单）；`target_app: Trae|Doubao|WorkBuddy|CodeBuddy|Qoder|QoderWork`；`proxy_port>0` 注入 `--proxy-server`（C1）；`include_indexeddb`（C4：备份纳入 `Default/IndexedDB`）；`expected_current_uid`（防误覆盖守卫）。CodeBuddy 为 authfile 布局：ProcNames 双形态 `CodeBuddy/CodeBuddy CN`、ProfilesDir=profiles_codebuddy、确认以自身 storage UID 为准，缺身份时 Timeout+warn，不再假成功。
 - **CLI 任务模式**：`--task-run doubao-keepalive`（schtasks 直调主 exe；启动器 `task_doubao_renew.cmd` 启动期原地迁移，内容不含 trae-switch-bridge.ps1 即跳过）。
 - **精准备份**：仅复制 9 类核心登录文件（storage.json / state.vscdb / machineid / aha / Network 等），非全量镜像。
 - **Switch 流程**：预检查目标快照 → 关闭目标应用 → 保存当前到 last + 当前账号槽位 → 恢复目标 → 启动。
@@ -425,7 +441,7 @@ ai-work-assistant/
   - **生图双端点（F-63）**：`/v1/images/generations` + `/v1/images/edits`（仅 JSON 变体，image=base64/data URL；OpenAI multipart 不接受）；上游不支持明示 501 不静默；模型需目录声明 `supports_image=true`。
   - **工具代执行（F-64，`wb_toolexec.rs`）**：`/v1/responses` 声明 `web_search` 且 `api_pool.json.wb_tool_exec`（默认开）→ 代理注入 web_search/open_url function + 本地代执行（DDG lite + 页面抓取）→ 回喂循环上限 3 轮；历史轮以 `web_search_call` 输出项返回。**仅代理注入的两工具会被代执行**，客户端真实 function 照常透传。
   - **后台任务降级（F-65③）**：`api_pool.json.wb_bg_downgrade`（默认关）——max_tokens≤128 且全文≤512 字符 → 目录最低倍率模型；`/v1/chat/completions` 收到 `anthropic-version` 头 → 400 明示改走 `/v1/messages`。
-  - **本地 quota 兜底（F-21，`wb_common.rs`）**：credits 云端全链失败 → 扫 `~/.workbuddy/*.port` + 候选/有界端口段 → GET `/api/v1/quota` 按 remaining 特征确认（source=`local_quota`）。
+  - **本地 quota 余额兜底已移除（2026-10-18）**：本机 quota 无法证明目标账号身份，云端失败必须返回未知/失败，不得把当前客户端余额归给被查询账号。
   - **DSH provider 目录动态替换（F-37，`wb_catalog.rs`）**：`parse_upstream_catalog` 宽容解析（三容器形态/字段链探测/产出 0 条不落盘）+ `fetch_and_replace`（GET `{chatBase}/console/enterprises/personal/models`）；网关启动自动一次（失败保持静态兜底）+ `api_wb_catalog_sync` 手动命令；`/v1/models` WB 条目透传 `supports_image`/`supported_efforts`。
   - **CC Switch 协同（F-43，`commands/ccswitch.rs`）**：不自建切换器——upsert 固定 id `aiwork-gateway-<claude|codex>` 进 `~/.cc-switch/cc-switch.db` providers 表（claude=扁平 env，base 不带 /v1；codex=auth+config.toml，wire_api=responses）；写前整库备份至 `~/.cc-switch/backups/`、**只动自有条目**、Key 不入日志；CC Switch 运行中写入后需重启其生效。
 
@@ -445,7 +461,8 @@ ai-work-assistant/
 - 仅 Windows（代理证书安装 + MachineGuid 重置只在 Windows 验证）。
 - **PowerShell 运行时依赖已移除**：切换/保存/备份/恢复/保活全链路由 `switcher` 模块进程内直调（仅 Windows，sysinfo 0.33 锁定版——0.38+ 需 rustc 1.88 超出项目 MSRV 1.85）。
 - **环境检测零子进程（2026-10-07）**：版本号直读 PE 版本资源（`pe_version.rs`，按 mtime+size 缓存，读不到才回退 powershell）、运行态走 `switcher::proc::any_running`（sysinfo 快照 + 2s TTL）、`app_locate` 兜底两级（注册表/进程）带 3s TTL——切换板块时概览页与顶栏会重复探测，缓存即为此设计。**注意：关闭/强杀轮询（`commands/process.rs`、`switcher::proc::list_procs`）需实时快照，勿接入上述缓存。**
-- **Buddy 积分 SWR 语义（2026-10-08）**：`workbuddy_credits_fetch` 在非 `fresh` 且缓存过期时返回旧值 + `refreshing:true`，刷新转入后台线程（同刻仅一轮，日志 `[wb-credits] 后台刷新完成…`）；`stale:true` 仍**专指** F-59「刷新失败回退」，两者勿混用；前端按 `refreshing` 决定是否重取（`BuddyOverview`）。
+- **Buddy 积分 SWR 语义（2026-10-18）**：非 fresh 且有效成员集合的缓存过期时返回旧值 + refreshing:true，后台取新完成发 wb-credits-updated；stale:true 专指刷新失败回退，前端持续提示历史值。账号页/概览监听事件更新，不用短轮询；请求代次与完成事件修订号共同拒绝旧响应（含迟到的 accountsList），手动加载态覆盖积分查询，按实际成功/失败/缓存状态反馈。概览无任何成功的有限非负余额时显示未知而非 0；积分榜排除查询失败的旧值。
+- **Buddy 联调入口**：`node scripts/buddy-ui-smoke.mjs` 使用独立 Vite 缓存及无头 Edge、合成账号和 Tauri mockIPC，仅允许回环网络；需外部可用的 Playwright（可用 `BUDDY_PLAYWRIGHT_MODULE` 指定包目录），不自动安装。真实只读测试须精确筛选 `buddy_live_readonly_` 并显式设置 `AIWORK_BUDDY_LIVE_READONLY=1`、`AIWORK_BUDDY_LIVE_DATA_DIR`；仅最多前三号、只读 SQLite/保险库和官方积分/用量查询，禁止续期/写回/切号/邮件，不得运行全体 ignored 探针。详见 `docs/buddy-audit-2026-10-18.md`。
 - `profiles_dir` 路径为 `data_dir.join("data").join("profiles")`，注意 `data/` 子目录。
 - LLM API 上游必须设置 `NO_PROXY=*` 避免系统代理循环。
 - 日志文件首行可能有 BOM 前缀（PowerShell 5.1 `-Encoding UTF8`），`split_time` 已处理。

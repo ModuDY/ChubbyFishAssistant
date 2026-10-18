@@ -244,6 +244,8 @@ fn oauth_flow(app: &AppHandle, state: &AppState) -> Result<(String, String), Str
     let mut nickname = String::new();
     let mut phone_masked = String::new();
     let mut edition = String::new();
+    let mut enterprise_id = String::new();
+    let mut enterprise_flag = false;
     let mut req = agent
         .get(&format!("{BASE}/v2/plugin/login/account?state={state_id}"))
         .set("User-Agent", CLIENT_UA)
@@ -263,6 +265,9 @@ fn oauth_flow(app: &AppHandle, state: &AppState) -> Result<(String, String), Str
             .map(|p| mask_phone(&p))
             .unwrap_or_default();
         edition = as_str(fs_utils::dig(&body, &["editionType", "edition_type"])).unwrap_or_default();
+        let identity = crate::tasks::wb_common::creds_of(&body);
+        enterprise_id = identity.enterprise_id;
+        enterprise_flag = identity.enterprise_flag;
     }
     if uid.is_empty() {
         uid = jwt_claims(&token)
@@ -307,7 +312,7 @@ fn oauth_flow(app: &AppHandle, state: &AppState) -> Result<(String, String), Str
                 uid: uid.clone(),
                 nickname: nickname.clone(),
                 phone_masked,
-                edition_type: edition,
+                edition_type: edition.clone(),
                 access_token_expires_at: exp_s,
                 auth_saved_at: Some(now_s),
                 ..Default::default()
@@ -318,6 +323,12 @@ fn oauth_flow(app: &AppHandle, state: &AppState) -> Result<(String, String), Str
         target_id
     };
     let creds = serde_json::json!({
+        "uid": uid,
+        "nickname": nickname,
+        "edition": edition,
+        "enterprise_id": enterprise_id,
+        "enterprise_flag": enterprise_flag,
+        "domain": "www.codebuddy.cn",
         "access_token": token,
         "refresh_token": if refresh_token.is_empty() { None } else { Some(refresh_token) },
         "expires_at_ms": exp_s.map(|s| s * 1000),

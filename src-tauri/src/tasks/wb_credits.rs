@@ -17,6 +17,7 @@ use super::http_agent;
 use super::wb_common;
 
 const CACHE_TTL_SECS: f64 = 10.0 * 60.0; // ≥10min 缓存（频控红线，原 5min）
+const CACHE_SCHEMA: u64 = 2;
 
 /// 单轮刷新的账号并发上限：账号之间无依赖，原串行 for 让「N 账号 × ≥3 次请求」在慢网络
 /// （全局代理 / 跨境出口）下线性放大；同账号内部仍保持 summary → 包明细的先后顺序。
@@ -29,6 +30,8 @@ const MAX_FETCH_WORKERS: usize = 4;
 /// 刻意不打 `stale`——该字段是 F-59「刷新失败回退」语义，本处刷新只是转后台、并未失败。
 pub fn stale_reply(state: &AppState, user_id: Option<&str>) -> Option<Value> {
     let cache: Value = crate::store::db(&state.data_dir).kv_get("workbuddy_credits_cache");
+    let members = pool_members(state);
+    if !cache_matches_pool(&cache, &members) || user_id.is_some_and(|id| !members.iter().any(|member| member.0 == id)) { return None; }
     let fetched_ts = cache.get("fetched_ts").and_then(Value::as_f64).unwrap_or(0.0);
     if fetched_ts <= 0.0 || now_secs() - fetched_ts < CACHE_TTL_SECS {
         return None;
@@ -54,12 +57,13 @@ fn now_secs() -> f64 {
 /// 宽容数值：bool 排除；数字/数字字符串均可（对齐 python _num）。
 fn num_of(v: Option<&Value>) -> Option<f64> {
     let v = v?;
-    match v {
+    let number = match v {
         Value::Bool(_) => None,
         Value::Number(n) => n.as_f64(),
         Value::String(s) => s.trim().parse::<f64>().ok(),
         _ => None,
-    }
+    };
+    number.filter(|number| number.is_finite())
 }
 
 /// 到期字段宽容归一 → Unix 秒（解析失败 None）。
@@ -146,6 +150,7 @@ fn total_of(pkg: &Value) -> Option<f64> {
 fn remaining_of(pkg: &Value, total: Option<f64>) -> Option<f64> {
     for k in [
         "CycleCapacityRemainPrecise",
+        "CycleCapacityRemain",
         "CycleRemainCapacity",
         "RemainingCapacity",
         "remaining",
@@ -156,7 +161,7 @@ fn remaining_of(pkg: &Value, total: Option<f64>) -> Option<f64> {
             return Some(v);
         }
     }
-    let used = num_of(fs_utils::dig(pkg, &["UsedCapacity", "used", "Used"]));
+    let used = num_of(fs_utils::dig(pkg, &["CycleUsedCapacity", "UsedCapacity", "used", "Used"]));
     if let (Some(used), Some(total)) = (used, total) {
         return Some((total - used).max(0.0));
     }
@@ -188,6 +193,7 @@ fn walk_capable_dicts<'a>(v: &'a Value, depth: usize, out: &mut Vec<&'a Value>) 
         Value::Object(map) => {
             if CAPACITY_KEYS.iter().any(|k| map.contains_key(*k)) {
                 out.push(v);
+                return;
             }
             for child in map.values() {
                 walk_capable_dicts(child, depth + 1, out);
@@ -255,9 +261,9 @@ fn packages_from(body: &Value) -> Vec<Value> {
         out.push(json!({
             "name": name,
             "code": code,
-            "remaining": remaining.unwrap_or(0.0),
-            "total": total.unwrap_or(0.0),
-            "used": used.unwrap_or(0.0),
+            "remaining": remaining,
+            "total": total,
+            "used": used.or_else(|| Some((total? - remaining?).max(0.0))),
             "end_time": end_ts.map(fmt_ts),
             "expire_ts": end_ts,
         }));
@@ -265,29 +271,21 @@ fn packages_from(body: &Value) -> Vec<Value> {
     out
 }
 
-/// summary 响应 → 余额。旧结构：顶层 RemainingCapacity/Balance 等字段；
-/// 新结构（2026-09 实测）：data.Packages[] 各包 CycleRemainCapacity 求和。
+/// summary 响应 → 余额。官方总余额字段 TotalCredits（字符串数字）最优先——
+/// 2026-10 实测：data.CreditGroups（四大桶汇总）与 data.Packages（同笔积分明细）
+/// 并存，全树求和会把两个视角重复计入（2600 → 5200）。旧结构回退：
+/// 顶层 RemainingCapacity/Balance 等字段；再退 data.Packages[] 各包求和。
 fn balance_from_summary(body: &Value) -> Option<f64> {
     if let Some(t) = num_of(fs_utils::dig(
         body,
-        &["RemainingCapacity", "remaining", "TotalRemaining", "Balance", "balance"],
+        &["TotalCredits", "RemainingCapacity", "remaining", "TotalRemaining", "Balance", "balance"],
     )) {
         return Some(t);
     }
-    let mut found = vec![];
-    walk_capable_dicts(body, 0, &mut found);
-    let mut s = 0.0;
-    let mut has = false;
-    for item in found {
-        if let Some(v) = num_of(fs_utils::dig(item, &["CycleRemainCapacity", "RemainingCapacity", "remaining"])) {
-            s += v;
-            has = true;
-        }
-    }
-    if has {
-        return Some(s);
-    }
-    num_of(fs_utils::dig(body, &["CycleCapacitySizePrecise", "CycleTotalCapacity", "CapacitySize"]))
+    let sum_root = fs_utils::dig(body, &["Packages", "packages"])
+        .or_else(|| fs_utils::dig(body, &["CreditGroups"]))
+        .unwrap_or(body);
+    packages_balance(&packages_from(sum_root))
 }
 
 /// summary 响应 → PackageCode 列表（去重，保序）。2026-09 起 paid/free 接口要求
@@ -386,8 +384,13 @@ fn fetch_round(
         }
     }
 
-    // summary 自带包：仅补 paid/free 未覆盖的 PackageCode（无到期信息）
-    for p in packages_from(&body) {
+    // summary 自带包：仅补 paid/free 未覆盖的 PackageCode（无到期信息）。
+    // 限定 data.Packages 子树——CreditGroups 是同笔积分的汇总桶视角（平台奖励=
+    // 各奖励包之和），全树扫描会重复计入；旧结构无 Packages 键时回退全树。
+    let pkgs_root = fs_utils::dig(&body, &["Packages", "packages"])
+        .or_else(|| fs_utils::dig(&body, &["CreditGroups"]))
+        .unwrap_or(&body);
+    for p in packages_from(pkgs_root) {
         let dup = p
             .get("code")
             .and_then(Value::as_str)
@@ -414,15 +417,14 @@ fn fetch_enterprise_balance(
     agent: &ureq::Agent,
     headers: &[(String, String)],
     domain: &str,
-) -> Option<f64> {
+) -> (Option<f64>, u16) {
     let base = wb_common::region_billing_base(domain);
     let url = format!("{base}/v2/billing/meter/get-enterprise-user-usage");
     let (status, body) = wb_common::post_json(agent, &url, headers, &json!({}));
     if status != 200 {
-        return None;
+        return (None, status);
     }
-    let b = body.filter(|b| b.is_object())?;
-    enterprise_remaining(&b)
+    (body.filter(|body| body.is_object()).as_ref().and_then(enterprise_remaining), status)
 }
 
 /// 企业额度口径换算（纯函数，便于单测）：
@@ -442,6 +444,8 @@ fn enterprise_remaining(b: &Value) -> Option<f64> {
 /// 一次取数：summary（余额+包）→ paid/free 带 PackageCodes 回查到期 →
 /// 全 401 刷新一次仅重试失败分支 → 旧接口回退。
 /// 主域名整体网络不可达时切备用域名重试一轮（§2.2 域名双探测，仅一次、不循环）。
+/// 刷新被服务端判失效（401）时跳过旧接口回退：同一死凭证打旧接口必然同样 401，
+/// 省一次无效请求与 TLS 握手（死账号 ~40s 超时的放大源之一）。
 /// 返回 (packages, balance, source, new_creds)。
 fn fetch_credits_once(
     state: &AppState,
@@ -449,14 +453,23 @@ fn fetch_credits_once(
     aid: &str,
     creds: &wb_common::Creds,
 ) -> (Vec<Value>, Option<f64>, &'static str, Option<wb_common::Creds>) {
+    if super::wb_session::recovery_block(&state.data_dir, aid, creds).is_some() {
+        return (vec![], None, "fetch_failed", None);
+    }
     let headers = wb_common::build_auth_headers(creds, true);
     // 企业号额度不在「个人资源包」体系内：get-user-resource* 对企业号恒返回空
     // Accounts（额度其实是有的，只是口径不同），必须走企业专用接口
     if wb_common::is_enterprise_account(creds) {
         // 企业口径：credit 是「本周期已用」、limitNum 是「分配给本账号的额度」，
         // 剩余 = limitNum - credit（与个人 CapacityRemain 的「剩余」语义相反）
-        let bal = fetch_enterprise_balance(agent, &headers, &creds.domain);
-        return (vec![], bal, "enterprise", None);
+        let (balance, status) = fetch_enterprise_balance(agent, &headers, &creds.domain);
+        if status == 401 {
+            if let (Some(new), _) = wb_common::refresh_token_once_locked(state, agent, aid, creds) {
+                let (balance, _) = fetch_enterprise_balance(agent, &wb_common::build_auth_headers(&new, true), &new.domain);
+                return (vec![], balance, "enterprise", Some(new));
+            }
+        }
+        return (vec![], balance, "enterprise", None);
     }
     let (summary_url, paid_url, free_url, old_url) = billing_urls(&creds.domain);
     let (mut pkgs, mut balance, mut saw_auth, net_down) =
@@ -475,43 +488,89 @@ fn fetch_credits_once(
         saw_auth = r.2;
     }
     let mut new_creds = None;
+    let mut auth_dead = false;
     if saw_auth && pkgs.is_empty() && balance.is_none() {
         // H-1：加锁刷新 + 二次检查（他人已刷新落库直接复用）+ 内部落库
         //（原 refresh_token_once + 调用方 save，两步分离存在并发覆盖丢 token 面）
-        if let (Some(nc), _) = wb_common::refresh_token_once_locked(state, agent, aid, creds) {
+        let (refreshed, fail) = wb_common::refresh_token_once_locked(state, agent, aid, creds);
+        if let Some(nc) = refreshed {
             let headers2 = wb_common::build_auth_headers(&nc, true);
             let (p2, b2, _saw2, _nd2) = fetch_round(agent, &headers2, (&summary_url, &paid_url, &free_url));
             pkgs = p2;
             balance = b2;
             new_creds = Some(nc);
+        } else if matches!(fail, Some(wb_common::RefreshFail::Auth)) {
+            auth_dead = true;
         }
     }
     if !pkgs.is_empty() || balance.is_some() {
         return (pkgs, balance, "cloud", new_creds);
     }
+    if auth_dead {
+        // 会话已被服务端判失效：旧接口用同一死凭证必然同样 401，跳过回退
+        return (vec![], None, "fetch_failed", new_creds);
+    }
     // 旧接口回退（F-20）
+    let headers = new_creds.as_ref().map(|creds| wb_common::build_auth_headers(creds, true)).unwrap_or(headers);
     let (status, body) = wb_common::post_json(agent, &old_url, &headers, &old_body());
     if status == 200 {
         if let Some(b) = body.filter(|b| b.is_object()) {
             let pkgs = packages_from(&b);
             if !pkgs.is_empty() {
-                let bal: f64 = pkgs
-                    .iter()
-                    .filter_map(|p| p.get("remaining").and_then(Value::as_f64))
-                    .sum();
-                return (pkgs, Some(bal), "legacy", new_creds);
+                let balance = packages_balance(&pkgs);
+                return (pkgs, balance, "legacy", new_creds);
             }
         }
-    }
-    // 本地 quota 端口发现兜底（T5.8/F-21）：云端全链失败 → 探测本机桌面服务
-    if let Some(local) = wb_common::local_quota_balance(agent) {
-        return (vec![], Some(local), "local_quota", new_creds);
     }
     (vec![], None, "fetch_failed", new_creds)
 }
 
+fn pool_members(state: &AppState) -> Vec<(String, String)> {
+    let pool = crate::store::docs::wb_pool_load(&crate::store::db(&state.data_dir));
+    let mut members: Vec<_> = pool.get("accounts").and_then(Value::as_array).into_iter().flatten()
+        .filter_map(|account| Some((account.get("id")?.as_str()?.to_string(), account.get("uid").and_then(Value::as_str).unwrap_or("").to_string())))
+        .collect();
+    members.sort();
+    members
+}
+
+fn cache_matches_pool(cache: &Value, members: &[(String, String)]) -> bool {
+    if cache.get("schema").and_then(Value::as_u64) != Some(CACHE_SCHEMA) { return false; }
+    if let Some(cached_members) = cache.get("members") {
+        return *cached_members == json!(members);
+    }
+    let mut cached_ids: Vec<_> = cache.get("accounts").and_then(Value::as_array).into_iter().flatten()
+        .filter_map(|account| account.get("user_id").and_then(Value::as_str)).collect();
+    cached_ids.sort();
+    cached_ids == members.iter().map(|member| member.0.as_str()).collect::<Vec<_>>()
+}
+
+fn current_cached_accounts(cache: &Value, members: &[(String, String)], user_id: Option<&str>) -> Value {
+    json!(cache.get("accounts").and_then(Value::as_array).into_iter().flatten()
+        .filter(|account| account.get("user_id").and_then(Value::as_str).is_some_and(|id| {
+            members.iter().any(|member| member.0 == id) && user_id.map_or(true, |requested| requested == id)
+        })).cloned().collect::<Vec<_>>())
+}
+
+pub(crate) fn current_cache(state: &AppState) -> Option<Value> {
+    let cache: Value = crate::store::db(&state.data_dir).kv_get("workbuddy_credits_cache");
+    let fetched = cache.get("fetched_ts").and_then(Value::as_f64)?;
+    (cache_matches_pool(&cache, &pool_members(state)) && now_secs() - fetched < CACHE_TTL_SECS).then_some(cache)
+}
+
+fn packages_balance(packages: &[Value]) -> Option<f64> {
+    if packages.is_empty() { return None; }
+    packages.iter().map(|package| package.get("remaining")?.as_f64()).sum()
+}
+
 /// 单账号取数 → 输出行（字段契约与 python fetch_account 一致）。
 fn fetch_account(state: &AppState, agent: &ureq::Agent, acct: &Value) -> Value {
+    let id = acct.get("id").and_then(Value::as_str).unwrap_or("");
+    with_credit_flight(&state.data_dir, &format!("account:{id}"), || Ok(fetch_account_inner(state, agent, acct)))
+        .unwrap_or_else(|error| json!({"user_id": id, "ok": false, "balance": null, "packages": [], "message": error}))
+}
+
+fn fetch_account_inner(state: &AppState, agent: &ureq::Agent, acct: &Value) -> Value {
     let aid = acct.get("id").and_then(Value::as_str).unwrap_or("").to_string();
     let uid = acct.get("uid").and_then(Value::as_str).unwrap_or("");
     // python: nickname or uid[:8] or id
@@ -534,7 +593,8 @@ fn fetch_account(state: &AppState, agent: &ureq::Agent, acct: &Value) -> Value {
     }
     let (pkgs, balance, source, _new_creds) = fetch_credits_once(state, agent, &aid, &creds);
     // new_creds 已由 refresh_token_once_locked 内部落库（H-1），此处无须再 save
-    if pkgs.is_empty() && balance.is_none() {
+    let balance = balance.or_else(|| packages_balance(&pkgs));
+    if balance.is_none() {
         return json!({
             "user_id": aid, "name": name, "ok": false,
             "message": "积分查询失败（接口/网络）", "balance": Value::Null,
@@ -542,11 +602,6 @@ fn fetch_account(state: &AppState, agent: &ureq::Agent, acct: &Value) -> Value {
         });
     }
     let mut pkgs = pkgs;
-    let balance = balance.unwrap_or_else(|| {
-        pkgs.iter()
-            .filter_map(|p| p.get("remaining").and_then(Value::as_f64))
-            .sum()
-    });
     // 按到期升序（最先到期排最前，F-56）；无到期时间排最后
     pkgs.sort_by(|a, b| {
         let ta = a.get("expire_ts").and_then(Value::as_i64);
@@ -558,15 +613,25 @@ fn fetch_account(state: &AppState, agent: &ureq::Agent, acct: &Value) -> Value {
             (None, None) => std::cmp::Ordering::Equal,
         }
     });
-    let soon_cut = now_secs() as i64 + 7 * 86400;
-    for p in pkgs.iter_mut() {
-        let exp = p.get("expire_ts").and_then(Value::as_i64);
-        p["expire_soon"] = json!(exp.map(|e| e < soon_cut).unwrap_or(false));
-    }
+    mark_expire_soon(&mut pkgs, now_secs() as i64);
     json!({
         "user_id": aid, "name": name, "ok": true, "balance": balance,
         "packages": pkgs, "source": source, "fetched_at": fs_utils::now_ts(),
     })
+}
+
+/// 标注「即将到期」：只对仍有剩余且尚未过期的包成立。已用完/已过期的历史包
+/// 标红只会制造噪音（曾把一排 0/100 的用尽包全部标成「即将到期」）。
+fn mark_expire_soon(pkgs: &mut [Value], now: i64) {
+    let soon_cut = now + 7 * 86400;
+    for p in pkgs.iter_mut() {
+        let exp = p.get("expire_ts").and_then(Value::as_i64);
+        let has_left = p
+            .get("remaining")
+            .and_then(Value::as_f64)
+            .is_some_and(|remaining| remaining > 0.0);
+        p["expire_soon"] = json!(has_left && exp.is_some_and(|e| e > now && e < soon_cut));
+    }
 }
 
 fn filter_accounts(v: Value, uid: &str, key: &str) -> Value {
@@ -577,7 +642,7 @@ fn filter_accounts(v: Value, uid: &str, key: &str) -> Value {
 
 /// 并行执行（≤workers 并发），结果与逐项耗时按**原序**回填；抽成泛型便于单测锁定
 /// 「保序 + 确实并发」两条契约（f panic 就地捕获 → 槽位缺失返回 None，由调用方占位保序）。
-fn parallel_ordered<T, R, F>(items: &[T], workers: usize, f: F) -> (Vec<Option<R>>, Vec<u128>)
+pub(crate) fn parallel_ordered<T, R, F>(items: &[T], workers: usize, f: F) -> (Vec<Option<R>>, Vec<u128>)
 where
     T: Sync,
     R: Send,
@@ -661,11 +726,63 @@ fn fetch_accounts_parallel(
 /// 积分查询主入口（对齐 python main）：缓存 → 全池/单账号取数 → stale-on-error →
 /// 回写缓存。返回值即原 python stdout 末行 JSON（credits.rs 消费契约）。
 pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Result<Value, String> {
+    let scope = format!("{}:fresh={fresh}", user_id.map(|id| format!("single:{id}")).unwrap_or_else(|| "pool".into()));
+    with_credit_flight(&state.data_dir, &scope, || fetch_credits_inner(state, user_id, fresh))
+}
+
+fn with_credit_flight(data_dir: &std::path::Path, scope: &str, fetch: impl FnOnce() -> Result<Value, String>) -> Result<Value, String> {
+    static FLIGHTS: std::sync::Mutex<Option<std::collections::HashMap<(std::path::PathBuf, String), std::sync::Weak<CreditFlight>>>> = std::sync::Mutex::new(None);
+    let key = (data_dir.to_path_buf(), scope.to_string());
+    let flight = {
+        let mut flights = FLIGHTS.lock().unwrap_or_else(|error| error.into_inner());
+        let flights = flights.get_or_insert_with(Default::default);
+        flights.retain(|_, flight| flight.strong_count() > 0);
+        if let Some(flight) = flights.get(&key).and_then(std::sync::Weak::upgrade) { flight }
+        else {
+            let flight = std::sync::Arc::new(CreditFlight::default());
+            flights.insert(key, std::sync::Arc::downgrade(&flight));
+            flight
+        }
+    };
+    let mut status = flight.status.lock().unwrap_or_else(|error| error.into_inner());
+    if status.0 {
+        while status.0 {
+            status = flight.done.wait(status).unwrap_or_else(|error| error.into_inner());
+        }
+        return status.1.clone();
+    }
+    status.0 = true;
+    drop(status);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(fetch))
+        .unwrap_or_else(|_| Err("积分查询异常，请重试".into()));
+    let mut status = flight.status.lock().unwrap_or_else(|error| error.into_inner());
+    status.1 = outcome.clone();
+    status.0 = false;
+    flight.done.notify_all();
+    outcome
+}
+
+struct CreditFlight {
+    status: std::sync::Mutex<(bool, Result<Value, String>)>,
+    done: std::sync::Condvar,
+}
+
+impl Default for CreditFlight {
+    fn default() -> Self {
+        Self { status: std::sync::Mutex::new((false, Err("尚未查询".into()))), done: std::sync::Condvar::new() }
+    }
+}
+
+fn fetch_credits_inner(state: &AppState, user_id: Option<&str>, fresh: bool) -> Result<Value, String> {
     let agent = http_agent(30);
     let store = crate::store::db(&state.data_dir);
     let cache: Value = store.kv_get("workbuddy_credits_cache");
     let fetched_ts = cache.get("fetched_ts").and_then(Value::as_f64).unwrap_or(0.0);
-    let cache_ok = fetched_ts > 0.0;
+    let members = pool_members(state);
+    let cache_ok = fetched_ts > 0.0 && cache_matches_pool(&cache, &members);
+    if user_id.is_some_and(|id| !members.iter().any(|member| member.0 == id)) {
+        return Err("指定账号不存在，请刷新账号列表".into());
+    }
 
     if !fresh && cache_ok && now_secs() - fetched_ts < CACHE_TTL_SECS {
         let cached_accounts = cache.get("accounts").cloned().unwrap_or(json!([]));
@@ -687,7 +804,12 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
     }
 
     let t_all = std::time::Instant::now();
-    let (results, durations) = fetch_accounts_parallel(state, &agent, &accounts);
+    let (mut results, durations) = fetch_accounts_parallel(state, &agent, &accounts);
+    let _pool_guard = state.wb_pool_lock.lock().unwrap_or_else(|error| error.into_inner());
+    let current_members = pool_members(state);
+    results.retain(|result| result.get("user_id").and_then(Value::as_str).is_some_and(|id| {
+        members.iter().any(|member| member.0 == id && current_members.contains(member))
+    }));
     if !accounts.is_empty() {
         fs_utils::app_log(
             &state.data_dir,
@@ -713,11 +835,7 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
             .iter()
             .all(|r| r.get("ok").and_then(Value::as_bool) != Some(true));
     if all_failed && cache_ok {
-        let cached_accounts = cache.get("accounts").cloned().unwrap_or(json!([]));
-        let filtered = match user_id {
-            Some(uid) => filter_accounts(cached_accounts, uid, "user_id"),
-            None => cached_accounts,
-        };
+        let filtered = current_cached_accounts(&cache, &current_members, user_id);
         if filtered.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
             return Ok(json!({"ok": true, "cached": true, "stale": true, "accounts": filtered}));
         }
@@ -730,6 +848,7 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
         .iter()
         .filter(|r| r.get("ok").and_then(Value::as_bool) == Some(true))
         .filter_map(|r| r.get("balance").and_then(Value::as_f64))
+        .filter(|balance| *balance >= 0.0)
         .sum();
     let out = json!({
         "ok": true, "cached": false, "accounts": results, "total_balance": total_balance,
@@ -738,11 +857,13 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
     // 单账号过滤路径（user_id=Some）不回写——结果只是池级缓存的子集（目标账号
     // 不存在时为空集），回写会在 TTL 内把池级缓存污染成残缺/空列表，
     // 之后不带 uid 的池级查询会命中并返回空账号
-    if user_id.is_none() && (any_ok || results.is_empty()) {
+    if user_id.is_none() && members == current_members && (any_ok || results.is_empty()) {
         let _ = store.kv_set(
             "workbuddy_credits_cache",
             &json!({
                 "fetched_ts": now_secs(),
+                "schema": CACHE_SCHEMA,
+                "members": members,
                 "fetched_at": fs_utils::now_ts(),
                 "accounts": out.get("accounts").cloned().unwrap_or(json!([])),
             }),
@@ -774,6 +895,26 @@ mod wb_credits_tests {
         // 布尔/空串拒绝
         assert_eq!(to_ts(Some(&json!(true))), None);
         assert_eq!(to_ts(Some(&json!(""))), None);
+    }
+
+    #[test]
+    fn expire_soon_only_for_usable_and_not_expired() {
+        let now = 1_790_000_000i64;
+        let mut pkgs = vec![
+            json!({"remaining": 10.0, "expire_ts": now + 3600}),
+            json!({"remaining": 10.0, "expire_ts": now - 3600}),
+            json!({"remaining": 10.0, "expire_ts": now + 30 * 86400}),
+            json!({"remaining": 0.0, "expire_ts": now + 3600}),
+            json!({"remaining": null, "expire_ts": now + 3600}),
+            json!({"remaining": 10.0, "expire_ts": null}),
+        ];
+        mark_expire_soon(&mut pkgs, now);
+        let got: Vec<bool> = pkgs
+            .iter()
+            .map(|p| p["expire_soon"].as_bool().unwrap_or(false))
+            .collect();
+        // 仅「有剩余 + 未过期 + 7 天内」标红
+        assert_eq!(got, vec![true, false, false, false, false, false]);
     }
 
     #[test]
@@ -846,6 +987,67 @@ mod wb_credits_tests {
     }
 
     #[test]
+    fn remaining_aliases_and_unknown_never_become_zero_or_total() {
+        let packages = packages_from(&json!({"Packages": [{"CycleTotalCapacity": 100, "CycleCapacityRemain": 37}]}));
+        assert_eq!(packages[0]["remaining"], 37.0);
+        assert_eq!(packages[0]["used"], 63.0);
+        assert_eq!(packages_balance(&packages), Some(37.0));
+        let unknown = packages_from(&json!({"CapacitySize": 100}));
+        assert!(unknown[0]["remaining"].is_null());
+        assert_eq!(packages_balance(&unknown), None);
+        assert_eq!(balance_from_summary(&json!({"CapacitySize": 100})), None);
+        assert_eq!(balance_from_summary(&json!({"data": {"Packages": [{"CycleCapacityRemain": 37}]}})), Some(37.0));
+        assert_eq!(remaining_of(&json!({"CycleCapacitySize": 100, "CycleUsedCapacity": 22}), Some(100.0)), Some(78.0));
+        assert_eq!(num_of(Some(&json!("NaN"))), None);
+    }
+
+    #[test]
+    fn cache_identity_and_parser_revision_must_match() {
+        let members = vec![("a".into(), "uid-a".into())];
+        let cache = json!({"schema": CACHE_SCHEMA, "members": members, "accounts": [{"user_id": "a"}]});
+        assert!(cache_matches_pool(&cache, &members));
+        assert!(!cache_matches_pool(&cache, &[]));
+        assert!(!cache_matches_pool(&cache, &[("a".into(), "uid-b".into())]));
+        assert!(!cache_matches_pool(&json!({"accounts": [{"user_id": "a"}]}), &members));
+        assert_eq!(current_cached_accounts(&cache, &[], None), json!([]));
+    }
+
+    #[test]
+    fn overlapping_queries_share_one_fetch_and_panic_does_not_stick() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let barrier = std::sync::Barrier::new(8);
+        let directory = std::path::Path::new("synthetic-flight-only-no-io");
+        std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for _ in 0..8 {
+                workers.push(scope.spawn(|| {
+                    barrier.wait();
+                    with_credit_flight(directory, "shared", || {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        Ok(json!({"balance": 37}))
+                    }).unwrap()
+                }));
+            }
+            for worker in workers { assert_eq!(worker.join().unwrap()["balance"], 37); }
+        });
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(with_credit_flight(directory, "panic", || panic!("synthetic fetch panic")).is_err());
+        assert_eq!(with_credit_flight(directory, "panic", || Ok(json!(42))).unwrap(), 42);
+    }
+
+    #[test]
+    fn deleted_account_is_not_reintroduced_by_cached_results() {
+        let state = temp_state("deleted_cache");
+        let db = crate::store::db(&state.data_dir);
+        crate::store::docs::wb_pool_save(&db, &json!({"accounts": []})).unwrap();
+        db.kv_set("workbuddy_credits_cache", &json!({"schema": CACHE_SCHEMA, "fetched_ts": now_secs(), "accounts": [{"user_id": "gone", "balance": 99}]})).unwrap();
+        assert!(fetch_credits(&state, Some("gone"), false).is_err());
+        assert_eq!(fetch_credits(&state, None, false).unwrap()["accounts"], json!([]));
+        let _ = std::fs::remove_dir_all(&state.data_dir);
+    }
+
+    #[test]
     fn balance_from_summary_prefers_top_level() {
         assert_eq!(
             balance_from_summary(&json!({"RemainingCapacity": 88.0})),
@@ -856,6 +1058,78 @@ mod wb_credits_tests {
             {"CycleRemainCapacity": 10.0}, {"CycleRemainCapacity": 32.0}
         ]}});
         assert_eq!(balance_from_summary(&body), Some(42.0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires explicit read-only live-account opt-in"]
+    fn buddy_live_readonly_credits() {
+        let accounts = super::super::buddy_live_support::accounts().expect("只读账号准备失败");
+        let agent = http_agent(15);
+        let mut succeeded = 0;
+        for account in accounts {
+            let started = std::time::Instant::now();
+            let headers = wb_common::build_auth_headers(&account.creds, true);
+            assert!(!headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("x-refresh-token")));
+            let (packages, balance, auth, network) = if wb_common::is_enterprise_account(&account.creds) {
+                let (balance, status) = fetch_enterprise_balance(&agent, &headers, &account.creds.domain);
+                (vec![], balance, status == 401, status == 0)
+            } else {
+                let (summary, paid, free, _) = billing_urls(&account.creds.domain);
+                fetch_round(&agent, &headers, (&summary, &paid, &free))
+            };
+            let package_sum = packages_balance(&packages);
+            let unknown = packages.iter().filter(|package| package["remaining"].is_null()).count();
+            println!("BUDDY_LIVE account#{} credits balance={balance:?} cached={:?} packages={} package_sum={package_sum:?} unknown={unknown} auth_required={auth} network_down={network} elapsed_ms={}",
+                account.ordinal, account.cached_balance, packages.len(), started.elapsed().as_millis());
+            if balance.is_some() { succeeded += 1; }
+        }
+        assert!(succeeded > 0, "真实积分无成功响应；未执行续期或任何写入");
+    }
+
+    /// 2026-10-17 探针实测结构精简版：CreditGroups（四大桶汇总 2600）与
+    /// Packages（同笔积分明细 2600）双视角并存，TotalCredits=2600。
+    fn summary_dual_view_body() -> Value {
+        json!({"code": 0, "data": {
+            "CreditGroups": [
+                {"Kind": "plan_base", "Name": "套餐基础积分", "CycleRemainCapacity": "500", "CycleTotalCapacity": "500"},
+                {"Kind": "benefit", "Name": "平台奖励积分", "CycleRemainCapacity": "2100", "CycleTotalCapacity": "2100"}
+            ],
+            "Packages": [
+                {"PackageCode": "TCACA_code_007", "CycleRemainCapacity": "600", "CycleTotalCapacity": "600"},
+                {"PackageCode": "TCACA_code_008", "CycleRemainCapacity": "500", "CycleTotalCapacity": "500"},
+                {"PackageCode": "TCACA_code_030", "CycleRemainCapacity": "1500", "CycleTotalCapacity": "1500"}
+            ],
+            "TotalCredits": "2600"
+        }})
+    }
+
+    /// 回归：双视角结构下余额必须 = TotalCredits(2600)，缺失时兜底求和也只能
+    /// 计 Packages 明细——CreditGroups 汇总桶重复计入曾把 2600 算成 5200。
+    #[test]
+    fn balance_never_double_counts_credit_groups() {
+        assert_eq!(balance_from_summary(&summary_dual_view_body()), Some(2600.0));
+        let mut b = summary_dual_view_body();
+        b["data"].as_object_mut().unwrap().remove("TotalCredits");
+        assert_eq!(balance_from_summary(&b), Some(2600.0));
+    }
+
+    /// 回归：summary 包收集限定 data.Packages 子树；全树扫描会连带
+    /// CreditGroups 桶（5 项）导致展示与求和重复。
+    #[test]
+    fn summary_packages_scoped_to_packages_array() {
+        let body = summary_dual_view_body();
+        let root = fs_utils::path(&body, &["data", "Packages"]).unwrap();
+        let pkgs = packages_from(root);
+        assert_eq!(pkgs.len(), 3);
+        assert!(pkgs.iter().all(|p| p.get("code").and_then(Value::as_str).is_some()));
+        let sum: f64 = pkgs
+            .iter()
+            .filter_map(|p| p.get("remaining").and_then(Value::as_f64))
+            .sum();
+        assert_eq!(sum, 2600.0);
+        // 旧的全树路径会多出 2 个 CreditGroups 桶（本用例固定差异，防回归）
+        assert_eq!(packages_from(&body).len(), 5);
     }
 
     #[test]
@@ -925,12 +1199,13 @@ mod wb_credits_tests {
     fn 缓存过期才先回旧值() {
         let st = temp_state("stale_reply");
         let store = crate::store::db(&st.data_dir);
+        crate::store::docs::wb_pool_save(&store, &json!({"accounts": [{"id": "u1", "uid": "uid1"}]})).unwrap();
         // 无缓存 → None（交调用方同步拉）
         assert!(stale_reply(&st, None).is_none());
         // TTL 内 → None（照常命中缓存，无需转后台）
         let _ = store.kv_set(
             "workbuddy_credits_cache",
-            &json!({"fetched_ts": now_secs() - 60.0, "accounts": [{"user_id": "u1", "balance": 1.0}]}),
+            &json!({"schema": CACHE_SCHEMA, "fetched_ts": now_secs() - 60.0, "accounts": [{"user_id": "u1", "balance": 1.0}]}),
         );
         assert!(stale_reply(&st, None).is_none());
         // 过期 → 先回旧值 + refreshing 标记；不打 stale
@@ -939,6 +1214,7 @@ mod wb_credits_tests {
             "workbuddy_credits_cache",
             &json!({
                 "fetched_ts": now_secs() - CACHE_TTL_SECS - 1.0,
+                "schema": CACHE_SCHEMA,
                 "accounts": [{"user_id": "u1", "balance": 1.0}],
             }),
         );
@@ -955,13 +1231,7 @@ mod wb_credits_tests {
                 .len(),
             1
         );
-        assert_eq!(
-            stale_reply(&st, Some("nope")).unwrap()["accounts"]
-                .as_array()
-                .unwrap()
-                .len(),
-            0
-        );
+        assert!(stale_reply(&st, Some("nope")).is_none());
         // 账号明细为空的缓存视为无缓存 → None（无数据可展示，只能同步拉）
         let _ = store.kv_set(
             "workbuddy_credits_cache",

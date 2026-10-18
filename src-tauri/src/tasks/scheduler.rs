@@ -64,7 +64,7 @@ const TASKS: &[SchedTask] = &[
     // 成长三开关驱动（旅行/盲盒/任务），全关时空轮无副作用
     SchedTask { key: "wb-growth", name: "WorkBuddy 每日成长", hhmm: "09:00", kind: "fix" },
     // F-09 兜底续期：lazy 24h（到期前 24h 内才真正刷新），每天跑一次是安全超集
-    SchedTask { key: "wb-renew", name: "WorkBuddy token 兜底续期", hhmm: "10:30", kind: "fix" },
+    SchedTask { key: "wb-renew", name: "WorkBuddy token 兜底续期", hhmm: "10:30", kind: "refresh" },
     SchedTask { key: "doubao-keepalive", name: "豆包会话每日续期", hhmm: "09:20", kind: "fix" },
     SchedTask { key: "doubao-quota", name: "豆包会员额度每日巡检", hhmm: "09:30", kind: "fix" },
     // F-80 Qoder 每日签到：默认 10:15 单次覆盖「0 点签到」与「10:00 登录奖励」双活动
@@ -276,6 +276,10 @@ fn tick(app: &AppHandle, st: &AppState) {
                     );
                 } else {
                     mark_run(st, t.key, &today, &summary);
+                    if v.get("ok").and_then(Value::as_bool) == Some(false) {
+                        write_entry(st, t.key, json!({"last_run_date": today, "last_run_ts": chrono::Utc::now().timestamp_millis(),
+                            "last_ok": false, "last_summary": summary}));
+                    }
                     fs_utils::app_log(&st.data_dir, &format!("[调度器] {}（{}）：{}", t.name, trigger, summary));
                     // 看板数据同步成功 → 通知前端重读缓存（issue #61 前端联动：
                     // Dashboard listen 后按 platform 匹配静默 refresh(false)，零额外网络）
@@ -498,7 +502,7 @@ fn run_task(
         // Trae JWT 定时续期（issue #27）：与 `--task-run trae-renew` 同款（lazy 48h 惰性门）
         "trae-renew" => crate::commands::accounts::renew_due_accounts_impl(st),
         // WorkBuddy token 兜底续期：与 `--task-run wb-renew` 同款（lazy 24h）
-        "wb-renew" => Ok(super::wb_checkin::run_renew_only(st, 24)),
+        "wb-renew" => super::wb_checkin::run_renew_only(st, 24),
         // F-80 Qoder 每日签到：与 `--task-run qoder-checkin` 同款；抢轮次锁与 UI 路径互斥
         "qoder-checkin" => {
             // 抢不到轮次锁（UI 路径正在签到）= 幂等跳过而非失败：返 Err 会被调度器记
@@ -747,6 +751,9 @@ fn write_entry(st: &AppState, key: &str, entry: Value) {
 
 /// 结果 JSON → 单行摘要（签到轮次取 ok/already/failed 计数，其余截断展示）
 fn summarize(v: &Value) -> String {
+    if v.get("mode").and_then(Value::as_str) == Some("renew") {
+        return format!("已续期 {}，无需续期 {}（仅到期判断），需重登 {}", v["refreshed"], v["fresh"], v["auth_required"]);
+    }
     if v.is_object() {
         let get = |k: &str| v.get(k).and_then(Value::as_i64);
         if let (Some(o), Some(a), Some(f)) = (get("ok"), get("already"), get("failed")) {
@@ -807,6 +814,17 @@ mod tests {
 
     fn renew_task() -> &'static SchedTask {
         TASKS.iter().find(|t| t.key == "trae-renew").unwrap()
+    }
+
+    #[test]
+    fn session_buddy_maintenance_runs_every_six_hours_and_keeps_summary_counts() {
+        let state = temp_state("buddy-maintenance");
+        let task = TASKS.iter().find(|task| task.key == "wb-renew").unwrap();
+        assert!(matches!(sched_plan(&state, task), SchedPlan::EveryHours(6)));
+        let summary = summarize(&json!({"mode":"renew", "refreshed":2, "fresh":1, "auth_required":3}));
+        assert!(summary.contains("已续期 2"));
+        assert!(summary.contains("需重登 3"));
+        assert!(summary.contains("仅到期判断"));
     }
 
     fn seed_settings(st: &AppState, enabled: bool, hhmm: &str) {

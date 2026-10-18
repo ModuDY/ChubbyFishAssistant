@@ -238,6 +238,22 @@ pub async fn do_start(
                     &format!("已设置系统代理 -> {proxy_addr}（TRAE 鉴权流量将汇入本代理）"),
                 );
                 fs_utils::app_log(&state.data_dir, &format!("已设置系统代理 -> {proxy_addr}"));
+                // 补做 OAuth 直连豁免：若用户「先发起 OAuth、后启动代理」，发起时系统代理尚未
+                // 指向本软件，enable_oauth_bypass 会被跳过；此刻代理已接管系统代理，若不补做，
+                // 仍开着的登录页会被 MITM 解密、卡在「获取中」。幂等，会话结束由 stop_loopback 还原。
+                if crate::commands::oauth_loopback::loopback_is_active() {
+                    match crate::device_proxy::bypass::enable_oauth_bypass(&state.data_dir) {
+                        Ok(true) => fs_utils::app_log(
+                            &state.data_dir,
+                            "[OAuth] 代理启动后补做直连豁免（检测到进行中的登录会话）",
+                        ),
+                        Ok(false) => {}
+                        Err(e) => fs_utils::app_log(
+                            &state.data_dir,
+                            &format!("[OAuth] 代理启动后补做直连豁免失败: {e}"),
+                        ),
+                    }
+                }
             }
             Err(e) => {
                 let _ = app.emit("proxy-log", &format!("[warn] 设置系统代理失败: {e}"));
@@ -388,9 +404,36 @@ fn apply_proxy(enable: bool, server: &str, override_: &str) -> Result<(), String
     Ok(())
 }
 
+/// 本软件接管系统代理时需写入的基础白名单（localhost 绕过代理、直连 127.0.0.1:7864 API 服务）
+const DEFAULT_PROXY_OVERRIDE: &str = "127.0.0.1;localhost;<local>";
+
+/// 合并系统代理白名单：保留 `existing` 全部条目，仅追加 `defaults` 中尚不存在的
+/// （忽略大小写去重、跳过空项）。
+///
+/// 存在的意义：`set_win_proxy` 若直接覆盖写，会抹掉「OAuth 直连豁免」此前追加的
+/// `www.trae.cn` 等条目 → 登录页重新落入 MITM 解密范围 → 页面卡在「获取中」
+/// （2026-10-17 实测：先发起 OAuth、后启动代理时踩到）。合并写保证豁免条目存活。
+fn merge_proxy_override(existing: &str, defaults: &str) -> String {
+    let mut merged: Vec<String> = existing
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    for d in defaults.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        if !merged.iter().any(|m| m.eq_ignore_ascii_case(d)) {
+            merged.push(d.to_string());
+        }
+    }
+    merged.join(";")
+}
+
 #[cfg(target_os = "windows")]
 pub(crate) fn set_win_proxy(addr: &str) -> Result<(), String> {
-    apply_proxy(true, addr, "127.0.0.1;localhost;<local>")
+    let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    // 保留当前白名单（含 OAuth 豁免条目与用户自定义），仅追加基础条目——见 merge_proxy_override
+    let existing = reg_query_value(key, "ProxyOverride").unwrap_or_default();
+    apply_proxy(true, addr, &merge_proxy_override(&existing, DEFAULT_PROXY_OVERRIDE))
 }
 
 #[cfg(target_os = "windows")]
@@ -568,4 +611,45 @@ fn clear_win_proxy() -> Result<(), String> {
 /// 应用退出路径使用：标记「主动停止」，让看门狗静默（退出清理由 RunEvent::Exit 统一完成）
 pub(crate) fn mark_intentional_stop() {
     PROXY_INTENTIONAL_STOP.store(true, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 空白名单 → 写入基础三条
+    #[test]
+    fn merge_proxy_override_from_empty() {
+        assert_eq!(merge_proxy_override("", DEFAULT_PROXY_OVERRIDE), "127.0.0.1;localhost;<local>");
+    }
+
+    /// 关键回归：已含 OAuth 豁免条目时，代理接管系统代理不得抹掉它
+    /// （2026-10-17 实测缺陷：先发起 OAuth、后启动代理 → www.trae.cn 被覆盖 → 登录页卡「获取中」）
+    #[test]
+    fn merge_proxy_override_preserves_oauth_exemptions() {
+        let existing = "127.0.0.1;localhost;<local>;www.trae.cn;api.trae.cn;api.trae.com.cn";
+        let merged = merge_proxy_override(existing, DEFAULT_PROXY_OVERRIDE);
+        for e in ["www.trae.cn", "api.trae.cn", "api.trae.com.cn"] {
+            assert!(merged.split(';').any(|s| s == e), "豁免条目被抹掉: {e}（实际={merged}）");
+        }
+        // 基础条目仍在，且不重复
+        assert!(merged.contains("localhost"));
+        assert_eq!(merged.matches("127.0.0.1").count(), 1, "重复写入: {merged}");
+    }
+
+    /// 用户自定义白名单同样保留
+    #[test]
+    fn merge_proxy_override_preserves_user_entries() {
+        let merged = merge_proxy_override("*.internal.corp;10.0.0.0/8", DEFAULT_PROXY_OVERRIDE);
+        assert!(merged.contains("*.internal.corp"));
+        assert!(merged.contains("10.0.0.0/8"));
+        assert!(merged.contains("<local>"));
+    }
+
+    /// 大小写不敏感去重，避免同一域名两种写法各写一遍
+    #[test]
+    fn merge_proxy_override_case_insensitive_dedup() {
+        let merged = merge_proxy_override("LOCALHOST;127.0.0.1", DEFAULT_PROXY_OVERRIDE);
+        assert_eq!(merged.matches("LOCALHOST").count(), 1);
+    }
 }

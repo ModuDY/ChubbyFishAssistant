@@ -869,6 +869,22 @@ pub(crate) fn load_pool_file(data_dir: &std::path::Path) -> ApiPoolFile {
     load_pool_file_with_legacy_migration(crate::store::db(data_dir).kv_get_raw("api_pool"))
 }
 
+/// 从 Buddy 池入池白名单（wb_enabled_uids）摘除某账号 id：WB 账号删除时调用，
+/// 防止账号已出池而白名单仍留幽灵条目（启动日志 whitelist 计数虚高、配置与账号池
+/// 不一致）。持 POOL_CFG_LOCK 罩住 api_pool 整文档读-改-写（与 pool_set 同锁，
+/// 防并发覆盖）；无该条目则为 no-op 不落盘。返回是否发生变更。
+pub(crate) fn wb_whitelist_remove(data_dir: &std::path::Path, id: &str) -> Result<bool, String> {
+    let _cfg = POOL_CFG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pf = load_pool_file(data_dir);
+    let before = pf.wb_enabled_uids.len();
+    pf.wb_enabled_uids.retain(|u| u != id);
+    if pf.wb_enabled_uids.len() == before {
+        return Ok(false);
+    }
+    crate::store::db(data_dir).kv_set("api_pool", &pf)?;
+    Ok(true)
+}
+
 #[tauri::command]
 pub fn pool_list(state: State<'_, AppState>) -> ApiPoolFile {
     load_pool_file(&state.data_dir)

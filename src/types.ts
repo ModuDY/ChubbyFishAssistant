@@ -1126,6 +1126,14 @@ export interface UpdateDownloaded {
 
 // ---- WorkBuddy 账号池（批次1；对应 Rust workbuddy.rs WorkBuddyAccountView）----
 export interface WorkBuddyAccountView {
+  session_health?: {
+    status: 'unverified' | 'healthy' | 'expiring' | 'transient' | 'auth_required';
+    last_refresh_at: number | null;
+    last_attempt_at: number | null;
+    next_retry_at: number | null;
+    http_status: number | null;
+    message: string;
+  };
   id: string;
   uid: string;
   nickname: string;
@@ -1140,6 +1148,8 @@ export interface WorkBuddyAccountView {
   note: string;
   credits_balance: number | null;
   credits_fetched_at: string | null;
+  /** 最早积分包到期时间（Unix 秒；剩余>0 且未过期包取 min）；null = 无到期信息或全部长期有效 */
+  credits_expire_at: number | null;
   /** 共享标签 tag id 列表（老后端缺省 undefined） */
   tags?: string[];
   /** 在线 = 本机 auth 文件当前生效账号 */
@@ -1375,9 +1385,9 @@ export interface WbUsageFallback {
 /** 积分包（tasks/wb_credits.rs 宽容解析输出） */
 export interface WbCreditPackage {
   name: string;
-  remaining: number;
-  total: number;
-  used: number;
+  remaining: number | null;
+  total: number | null;
+  used: number | null;
   end_time: string | null;
   expire_ts: number | null;
   expire_soon?: boolean;

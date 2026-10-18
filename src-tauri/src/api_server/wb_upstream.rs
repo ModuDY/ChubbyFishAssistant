@@ -12,7 +12,6 @@
 use std::io::{BufRead, BufReader, Read};
 use std::time::Duration;
 
-use crate::fs_utils;
 use crate::tasks::wb_common;
 
 /// 对话上游 base（按区域）
@@ -24,7 +23,6 @@ pub const WB_UA: &str = "CLI/2.63.2 CodeBuddy/2.63.2";
 /// CLI 客户端版本（与 WB_UA 版本一致；X-IDE-Version 指纹头用，issue #48）
 pub const WB_CLI_VERSION: &str = "2.63.2";
 /// 刷新端点（红线：唯一允许携带 X-Refresh-Token 的地方）
-pub const WB_REFRESH_URL: &str = "https://www.codebuddy.cn/v2/plugin/auth/token/refresh";
 /// 首字超时（F-34）：上游建连后 10s 内未产出任何字节 → 故障转移
 pub const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -428,6 +426,7 @@ pub fn lines_with_first_byte_hedged<T>(
 /// classify_error 误判 SessionDead → disabled 踢出轮转）；对方刷新落库后，下轮
 /// 请求经持锁双检/stale 对比直接复用新凭证。
 pub const ERR_PEER_REFRESHING: &str = "他方进程正在刷新该账号，本轮跳过";
+pub const ERR_REFRESH_TRANSIENT: &str = "WB_REFRESH_TRANSIENT: ";
 
 /// 网关侧刷新（T2.6）：读 token store → POST refresh → 原子回写工具侧副本。
 /// 与 commands::workbuddy::workbuddy_refresh_token 同一端点/红线；此处面向
@@ -446,133 +445,16 @@ pub fn refresh_access_token(
     account_id: &str,
     stale_access: Option<&str>,
 ) -> Result<String, String> {
-    // C1 ①：进程内每账号刷新锁串行化；②跨进程命名互斥体（GUI/CLI 双进程）
-    let lock = wb_common::refresh_lock_for(account_id);
-    let _refresh_guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(_cross) = wb_common::cross_refresh_lock(data_dir, account_id) else {
-        // 他方进程刷新中：返回忙态哨兵错误（调用方换号不禁用），不与真实刷新失败混同
-        return Err(ERR_PEER_REFRESHING.to_string());
-    };
-    // SQLite 化（P4）：死引用修复——原读写 data_dir **根**路径的 workbuddy_token_store.json
-    // （正牌在 data/ 子目录，此分叉使网关 401 刷新永远读写错位文件），现统一走 store wb_tokens 表
-    // C2（审查）：表锁与 tasks 侧统一为 WB_TOKEN_STORE_LOCK（原独立 TOKEN_STORE_LOCK
-    // 废除——两把锁互不相干时同账号读-改-写互相覆盖丢更新）
-    let (store_access, refresh) = {
-        let _guard =
-            wb_common::WB_TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // 凭证收敛（P0-1）：secure 回填（DB 占位 + vault 明文内存态）
-        let store: serde_json::Value =
-            crate::tasks::wb_common::token_store_load_secure(data_dir);
-        let rec = store
-            .get("tokens")
-            .and_then(|t| t.get(account_id))
-            .cloned()
-            .unwrap_or_default();
-        let access = rec
-            .get("access_token")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let refresh = rec
-            .get("refresh_token")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .ok_or("该账号无 refreshToken（不可刷新，需重新登录）")?
-            .to_string();
-        (access, refresh)
-    };
-    // C1 持锁二次检查：他人已刷新落库（store access ≠ 调用方失效凭证）→ 直接复用
-    if let Some(stale) = stale_access {
-        if !store_access.is_empty() && store_access != stale {
-            return Ok(store_access);
-        }
+    let mut creds = wb_common::stored_creds(data_dir, account_id);
+    if let Some(stale) = stale_access { creds.access_token = stale.to_string(); }
+    let agent = crate::tasks::http_agent(30);
+    match crate::tasks::wb_session::refresh(
+        data_dir, account_id, &creds, crate::tasks::wb_session::RefreshMode::Recover, &agent,
+    ) {
+        Ok((new, _)) => Ok(new.access_token),
+        Err(error) if !error.permanent() => Err(format!("{ERR_REFRESH_TRANSIENT}{}", error.message())),
+        Err(error) => Err(error.message()),
     }
-
-    // 红线：X-Refresh-Token 仅出现在 refresh 端点
-    let resp = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .build()
-        .post(WB_REFRESH_URL)
-        .set("Authorization", "Bearer")
-        .set("User-Agent", wb_common::WB_DESKTOP_UA)
-        .set("X-Refresh-Token", &refresh)
-        .set("X-Auth-Refresh-Source", "workbuddy")
-        .set("Content-Type", "application/json")
-        .send_string("{}");
-    let body: serde_json::Value = match resp {
-        Ok(r) => r.into_json().unwrap_or_default(),
-        Err(ureq::Error::Status(code, _)) => {
-            return Err(format!("刷新失败（HTTP {code}）：refresh token 可能已失效，需重新登录"))
-        }
-        Err(e) => return Err(format!("刷新请求失败: {e}")),
-    };
-    let dig_str = |v: &serde_json::Value, keys: &[&str]| -> Option<String> {
-        keys.iter().find_map(|k| v.get(k).and_then(|x| x.as_str())).map(str::to_string)
-    };
-    let new_access = dig_str(&body, &["accessToken", "data", "accessToken"])
-        .or_else(|| {
-            body.get("data")
-                .map(|d| dig_str(d, &["accessToken"]))
-                .unwrap_or(None)
-        })
-        .ok_or("刷新响应中无 accessToken")?;
-    let new_refresh = dig_str(&body, &["refreshToken"]).or_else(|| {
-        body.get("data")
-            .map(|d| dig_str(d, &["refreshToken"]))
-            .unwrap_or(None)
-    });
-    let expires_in = body
-        .pointer("/expiresIn")
-        .or_else(|| body.pointer("/data/expiresIn"))
-        .and_then(|v| v.as_i64());
-    let refresh_expires_in = body
-        .pointer("/refreshExpiresIn")
-        .or_else(|| body.pointer("/data/refreshExpiresIn"))
-        .and_then(|v| v.as_i64());
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-
-    // 原子回写工具侧副本（F-10 双源谁新用谁：expiresAtMs 更晚者胜出）：
-    // 锁内重读最新 store 再合并写回（网络段已释放表锁），并发刷新不丢他账号更新
-    {
-        let _guard =
-            wb_common::WB_TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let mut r = {
-            // 凭证收敛（P0-1）：secure 回填（vault 明文内存态参与 merge）
-            let store: serde_json::Value =
-                crate::tasks::wb_common::token_store_load_secure(data_dir);
-            store
-                .get("tokens")
-                .and_then(|t| t.get(account_id))
-                .cloned()
-                .unwrap_or(serde_json::json!({}))
-        };
-        if let Some(rm) = r.as_object_mut() {
-            rm.insert("access_token".into(), serde_json::json!(new_access));
-            if let Some(nr) = &new_refresh {
-                if !nr.is_empty() {
-                    rm.insert("refresh_token".into(), serde_json::json!(nr));
-                }
-            }
-            if let Some(s) = expires_in {
-                rm.insert("expires_at_ms".into(), serde_json::json!(now_ms + s * 1000));
-            }
-            if let Some(s) = refresh_expires_in {
-                rm.insert("refresh_expires_at_ms".into(), serde_json::json!(now_ms + s * 1000));
-            }
-            rm.insert("updated_at".into(), serde_json::json!(fs_utils::now_iso()));
-        }
-        // 凭证收敛（P0-1）：secure upsert（敏感字段进 vault、DB 占位；失败仅日志——
-        // 401 刷新是网关后台路径，报错无 UI 可达，且下一次刷新会重试收敛）
-        if let Err(e) = crate::tasks::wb_common::token_store_upsert_secure(data_dir, account_id, &r)
-        {
-            fs_utils::app_log(data_dir, &format!("wb 网关刷新回写失败（已落占位）: {e}"));
-        }
-    }
-    Ok(new_access)
 }
 
 #[cfg(test)]

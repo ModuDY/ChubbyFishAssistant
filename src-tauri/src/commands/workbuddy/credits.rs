@@ -16,7 +16,6 @@ use super::common::{as_str, auth_file_path_of, load_pool, save_pool};
 
 #[tauri::command(async)]
 pub fn workbuddy_credits_fetch(app: AppHandle, state: State<AppState>, user_id: Option<String>, fresh: Option<bool>) -> Result<serde_json::Value, String> {
-    let _ = &app; // 预留：wb-credits-updated 事件随批次2趋势图启用
     // Rust 直调 tasks::wb_credits（原 python workbuddy_credits.py 移植）；
     // 失败以 Err 返回，成功恒为 {"ok":true,"cached":bool,"accounts":[...]}（消费契约见 tasks/wb_credits.rs 模块注释）
     let fresh = fresh.unwrap_or(false);
@@ -26,7 +25,7 @@ pub fn workbuddy_credits_fetch(app: AppHandle, state: State<AppState>, user_id: 
     // 与「无缓存」仍走同步路径，语义与耗时保持原样。
     if !fresh {
         if let Some(reply) = crate::tasks::wb_credits::stale_reply(&state, uid) {
-            spawn_background_refresh(&state);
+            spawn_background_refresh(&state, app);
             return Ok(reply);
         }
     }
@@ -44,9 +43,9 @@ fn credits_refresh_now(
     // 回写账号池余额缓存（列表/概述展示）
     write_back_pool_balances(state, &parsed);
     // 会员套餐回填（仅 edition_type 为空的账号，见 backfill_edition_from_payment_type）
-    backfill_edition_from_payment_type(state);
+    if parsed.get("cached") != Some(&serde_json::json!(true)) { spawn_edition_backfill(state); }
     // 每日余额快照（F-27 数据源）：非缓存命中时追加，按日去重，cap 365 天
-    if parsed.get("cached") != Some(&serde_json::json!(true)) {
+    if uid.is_none() && parsed.get("cached") != Some(&serde_json::json!(true)) {
         append_credits_snapshot(state, &parsed);
     }
     Ok(parsed)
@@ -57,7 +56,7 @@ fn credits_refresh_now(
 /// 另加最小间隔节流（issue #84，2026-10-10）：缓存 10min 过期后若页面 30s 轮询一次，
 /// 每次都会重新触发后台全量取数；节流窗口内直接跳过（调用方已回旧值，无感知），
 /// 待窗口过后下一次调用再真正刷新。上次刷新未完成时不记账（避免把在途轮误当已完成）。
-fn spawn_background_refresh(state: &State<AppState>) {
+fn spawn_background_refresh(state: &State<AppState>, app: AppHandle) {
     static LAST_BG_REFRESH: std::sync::Mutex<Option<std::time::Instant>> =
         std::sync::Mutex::new(None);
     const BG_REFRESH_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
@@ -96,6 +95,9 @@ fn spawn_background_refresh(state: &State<AppState>) {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             credits_refresh_now(&st, None, true)
         }));
+        if let Ok(Ok(parsed)) = &outcome {
+            crate::events::emit_logged(&app, "wb-credits-updated", parsed.clone(), None);
+        }
         match outcome {
             Ok(Ok(_)) => fs_utils::app_log(
                 &st.data_dir,
@@ -126,6 +128,7 @@ fn spawn_background_refresh(state: &State<AppState>) {
 /// 持 wb_pool_lock 罩住整段读-改-写：命令线程/后台刷新线程/调度器三方并发时
 /// 不持锁的整文档写回会用旧副本抹掉彼此改动（lost-update）
 fn write_back_pool_balances(state: &AppState, parsed: &Value) {
+    if parsed.get("cached").and_then(Value::as_bool) == Some(true) { return; }
     if let Some(accounts) = parsed.get("accounts").and_then(|v| v.as_array()) {
         let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut pool = load_pool(state);
@@ -177,9 +180,7 @@ fn earliest_pack_expire(acc: &Value, now_ts: i64) -> Option<i64> {
 /// 此前快照仅在「打开积分页且非缓存命中」时写入，应用内调度器到点自动建快照，
 /// 差分序列不再因未打开页面而断档。
 pub(crate) fn wb_credits_snapshot_task(state: &AppState) -> Result<Value, String> {
-    let parsed = crate::tasks::wb_credits::fetch_credits(state, None, true)?;
-    write_back_pool_balances(state, &parsed);
-    append_credits_snapshot(state, &parsed);
+    let parsed = credits_refresh_now(state, None, true)?;
     fs_utils::app_log(
         &state.data_dir,
         "workbuddy: 每日积分余额快照已写入（应用内调度器 wb-credits-snapshot）",
@@ -212,42 +213,18 @@ fn payment_type_to_edition(pt: &str) -> String {
 ///   （窗口内删除的账号自动跳过、OAuth 已填套餐的账号不被覆盖）。
 fn backfill_edition_from_payment_type(state: &AppState) -> usize {
     // Phase 1（锁外）：收集 + 网络
-    let need: Vec<String> = load_pool(state)
-        .accounts
-        .iter()
-        .filter(|a| a.edition_type.is_empty())
-        .map(|a| a.id.clone())
-        .collect();
-    if need.is_empty() {
-        return 0;
-    }
-    let store: Value = crate::tasks::wb_common::load_token_store(state);
-    let tokens = store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
+    let need: Vec<_> = load_pool(state).accounts.into_iter().filter(|account| account.edition_type.is_empty()).collect();
+    if need.is_empty() { return 0; }
     let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(10)).build();
-    let mut results: Vec<(String, String)> = Vec::new(); // (id, edition)
-    for id in need {
-        let Some(rec) = tokens.get(&id) else { continue };
-        let Some(token) = as_str(fs_utils::dig(rec, &["access_token"])).filter(|t| !t.is_empty()) else {
-            continue;
-        };
-        let domain = as_str(fs_utils::dig(rec, &["domain"])).unwrap_or_default();
-        let base = if domain.contains("workbuddy.ai") {
-            "https://www.workbuddy.ai"
-        } else {
-            "https://www.workbuddy.cn"
-        };
-        let Ok(v) = billing_post_json(&agent, &format!("{base}/v2/billing/meter/get-payment-type"), &token) else {
-            continue;
-        };
-        // 注意：dig 是候选键语义（自动穿透 data 信封），候选里不能再写 "data"——
-        // 否则 "data" 抢先命中整个信封对象，as_str 恒为 None（曾致套餐回填全静默失败）
-        let Some(pt) = as_str(fs_utils::dig(&v, &["paymentType", "payment_type"]))
-            .filter(|s| !s.is_empty() && *s != "unknown")
-        else {
-            continue;
-        };
-        results.push((id, payment_type_to_edition(&pt)));
-    }
+    let (results, _) = crate::tasks::wb_credits::parallel_ordered(&need, 4, |account| {
+        let creds = crate::tasks::wb_common::effective_creds(state, &account.id, &account.uid);
+        if creds.access_token.is_empty() { return None; }
+        let base = crate::tasks::wb_common::region_billing_base(&creds.domain);
+        let value = billing_post_json(&agent, &format!("{base}/v2/billing/meter/get-payment-type"), &creds.access_token).ok()?;
+        let payment = as_str(fs_utils::dig(&value, &["paymentType", "payment_type"])).filter(|payment| !payment.is_empty() && payment != "unknown")?;
+        Some((account.id.clone(), payment_type_to_edition(&payment)))
+    });
+    let results: Vec<_> = results.into_iter().flatten().flatten().collect();
     if results.is_empty() {
         return 0;
     }
@@ -270,6 +247,19 @@ fn backfill_edition_from_payment_type(state: &AppState) -> usize {
         fs_utils::app_log(&state.data_dir, "workbuddy: 会员套餐已回填（payment-type → edition_type，仅补空）");
     }
     filled
+}
+
+fn spawn_edition_backfill(state: &AppState) {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let mut last = LAST.lock().unwrap_or_else(|error| error.into_inner());
+    if last.is_some_and(|time| time.elapsed().as_secs() < 600) || RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) { return; }
+    *last = Some(std::time::Instant::now());
+    let state = state.clone();
+    std::thread::spawn(move || {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| backfill_edition_from_payment_type(&state)));
+        RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
 }
 
 /// 手动触发套餐回填（前端在列表存在空套餐账号时调用），返回本次回填的账号数。
@@ -313,6 +303,16 @@ fn snapshot_fingerprint(snapshot: &Value) -> Option<Vec<String>> {
 /// 加号后 earned 虚增 2217.83/3059.06），且 fallback 侧消耗被 .max(0.0) 钳成 0；
 /// 此时 earned 只取签到 reward。对齐 Qoder 侧账号数不一致即不采信差分的既有口径。
 fn append_credits_snapshot(state: &AppState, parsed: &Value) {
+    let Some(rows) = parsed.get("accounts").and_then(Value::as_array) else { return };
+    if parsed.get("cached").and_then(Value::as_bool) == Some(true)
+        || rows.is_empty()
+        || rows.iter().any(|row| row.get("ok").and_then(Value::as_bool) == Some(false)
+            || row.get("balance").and_then(Value::as_f64).is_none_or(|balance| balance < 0.0)) {
+        return;
+    }
+    let pool_ids: std::collections::HashSet<_> = load_pool(state).accounts.into_iter().map(|account| account.id).collect();
+    let row_ids: std::collections::HashSet<_> = rows.iter().filter_map(|row| row.get("user_id").and_then(Value::as_str).map(str::to_string)).collect();
+    if pool_ids != row_ids { return; }
     let store = crate::store::db(&state.data_dir);
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let accounts: Vec<Value> = parsed
@@ -659,8 +659,15 @@ fn sessions_kv_lock() -> &'static std::sync::Mutex<()> {
 /// 读-改-写经 SESSIONS_KV_LOCK 串行化（审查 P1）。
 /// `full_refresh`（G6）：仅全量路径更新全局 `fetched_at`——单账号刷新也覆盖会让
 /// 「上次全量刷新时间」显示为最近一次单账号刷新时刻，失真
+fn stored_billing_target(state: &AppState, acct_id: &str) -> Option<(String, String, String)> {
+    let creds = crate::tasks::wb_common::stored_creds(&state.data_dir, acct_id);
+    (!creds.access_token.is_empty()).then(|| (acct_id.to_string(), creds.access_token, creds.domain))
+}
+
 fn save_account_session_rows(state: &AppState, acct_id: &str, name: &str, rows: &[WbSessionRow], full_refresh: bool) {
     const KEY: &str = "workbuddy_usage_sessions_cache";
+    let _pool_guard = state.wb_pool_lock.lock().unwrap_or_else(|error| error.into_inner());
+    if !load_pool(state).accounts.iter().any(|account| account.id == acct_id) { return; }
     let _guard = sessions_kv_lock().lock().unwrap_or_else(|e| e.into_inner());
     let db = crate::store::db(&state.data_dir);
     let mut cache: Value = db.kv_get(KEY);
@@ -698,18 +705,11 @@ pub(crate) fn workbuddy_usage_official_impl(
 
     // 选号：user_id → auth 文件当前账号 → 首个有 token store 凭证的账号
     //（审查 P1：选号解析提到缓存命中判断之前——缓存按账号区分，命中须同账号）
-    let store: serde_json::Value = crate::tasks::wb_common::load_token_store(&state);
-    let tokens = store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
-    let pick = |id: &str| -> Option<(String, String, String)> {
-        let rec = tokens.get(id)?;
-        let token = as_str(fs_utils::dig(&rec, &["access_token"]))?;
-        if token.is_empty() {
-            return None;
-        }
-        let domain = as_str(fs_utils::dig(&rec, &["domain"])).unwrap_or_default();
-        Some((id.to_string(), token, domain))
-    };
+    let pick = |id: &str| stored_billing_target(&state, id);
     let pool = load_pool(&state);
+    if user_id.as_deref().is_some_and(|id| !pool.accounts.iter().any(|account| account.id == id) || pick(id).is_none()) {
+        return Err("指定账号不存在或没有可用凭证，不会改查其他账号".into());
+    }
     let chosen = user_id
         .as_deref()
         .and_then(|uid| pick(uid))
@@ -719,7 +719,6 @@ pub(crate) fn workbuddy_usage_official_impl(
             pool.accounts.iter().find(|a| a.uid == fuid).map(|a| a.id.clone()).and_then(|id| pick(&id))
         })
         .or_else(|| pool.accounts.iter().find_map(|a| pick(&a.id)))
-        .or_else(|| tokens.keys().find_map(|k| pick(k)))
         .ok_or("无可用账号凭证（请先在账号管理导入/扫码入池并续期）")?;
     let (acct_id, token, domain) = chosen;
 
@@ -760,7 +759,13 @@ pub(crate) fn workbuddy_usage_official_impl(
         Ok(p) => p,
         Err(e) => return fail(&e),
     };
-    let _ = crate::store::db(&state.data_dir).kv_set(cache_path, &payload);
+    {
+        let _pool_guard = state.wb_pool_lock.lock().unwrap_or_else(|error| error.into_inner());
+        if !load_pool(state).accounts.iter().any(|account| account.id == acct_id) {
+            return Err("账号已移除，丢弃在途用量结果".into());
+        }
+        crate::store::db(&state.data_dir).kv_set(cache_path, &payload)?;
+    }
     // 行级明细落盘（issue #82 Buddy 会话明细 Tab；31 天窗口全量替换该账号桶）
     let acct_name = pool
         .accounts
@@ -993,9 +998,11 @@ pub(crate) fn workbuddy_usage_official_all_impl(
     force: bool,
 ) -> Result<serde_json::Value, String> {
     let cache_path = "workbuddy_usage_official_all_cache"; // kv 键（SQLite 化 P2）
+    let mut members: Vec<_> = load_pool(state).accounts.into_iter().map(|account| (account.id, account.uid)).collect();
+    members.sort();
     let cached_val: Option<Value> = {
         let c: Value = crate::store::db(&state.data_dir).kv_get(cache_path);
-        (c.get("status").is_some()).then_some(c)
+        (c.get("status").is_some() && c.get("members") == Some(&serde_json::json!(members))).then_some(c)
     };
     if !force {
         if let Some(cached) = &cached_val {
@@ -1027,30 +1034,13 @@ pub(crate) fn workbuddy_usage_official_all_impl(
     };
 
     // 枚举有凭证账号：账号池优先，token store 补充（按 id 去重）
-    let store: Value = crate::tasks::wb_common::load_token_store(state);
-    let tokens = store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
-    let pick = |id: &str| -> Option<(String, String, String)> {
-        let rec = tokens.get(id)?;
-        let token = as_str(fs_utils::dig(&rec, &["access_token"]))?;
-        if token.is_empty() {
-            return None;
-        }
-        let domain = as_str(fs_utils::dig(&rec, &["domain"])).unwrap_or_default();
-        Some((id.to_string(), token, domain))
-    };
+    let pick = |id: &str| stored_billing_target(&state, id);
     let pool = load_pool(state);
     let mut list: Vec<(String, String, String)> = Vec::new();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for a in &pool.accounts {
         if let Some(t) = pick(&a.id) {
             if seen_ids.insert(a.id.clone()) {
-                list.push(t);
-            }
-        }
-    }
-    for id in tokens.keys() {
-        if let Some(t) = pick(id) {
-            if seen_ids.insert(id.clone()) {
                 list.push(t);
             }
         }
@@ -1134,6 +1124,7 @@ pub(crate) fn workbuddy_usage_official_all_impl(
     let payload = serde_json::json!({
         "status": "complete",
         "source": "official_all",
+        "members": members,
         "accounts_total": list.len(),
         "accounts_ok": ok,
         "range_start": start.format("%Y-%m-%d").to_string(),
@@ -1148,7 +1139,11 @@ pub(crate) fn workbuddy_usage_official_all_impl(
         "daily": daily_out,
         "models": models_out,
     });
-    let _ = crate::store::db(&state.data_dir).kv_set(cache_path, &payload);
+    let _pool_guard = state.wb_pool_lock.lock().unwrap_or_else(|error| error.into_inner());
+    let mut current_members: Vec<_> = load_pool(state).accounts.into_iter().map(|account| (account.id, account.uid)).collect();
+    current_members.sort();
+    if current_members != members { return Err("账号集合已变化，请重新查询官方用量".into()); }
+    crate::store::db(&state.data_dir).kv_set(cache_path, &payload)?;
     fs_utils::app_log(
         &state.data_dir,
         &format!("workbuddy: 全账号官方用量聚合（{ok}/{} 账号，{} 行）", list.len(), req_total),
@@ -1362,18 +1357,11 @@ pub fn workbuddy_activity_info(
 
     // 选号逻辑与 workbuddy_usage_official 一致（复用同一降级链）
     //（审查 P1：选号解析提到缓存命中判断之前——缓存按账号区分，命中须同账号）
-    let store: serde_json::Value = crate::tasks::wb_common::load_token_store(&state);
-    let tokens = store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
-    let pick = |id: &str| -> Option<(String, String, String)> {
-        let rec = tokens.get(id)?;
-        let token = as_str(fs_utils::dig(&rec, &["access_token"]))?;
-        if token.is_empty() {
-            return None;
-        }
-        let domain = as_str(fs_utils::dig(&rec, &["domain"])).unwrap_or_default();
-        Some((id.to_string(), token, domain))
-    };
+    let pick = |id: &str| stored_billing_target(&state, id);
     let pool = load_pool(&state);
+    if user_id.as_deref().is_some_and(|id| !pool.accounts.iter().any(|account| account.id == id) || pick(id).is_none()) {
+        return Err("指定账号不存在或没有可用凭证，不会改查其他账号".into());
+    }
     let chosen = user_id
         .as_deref()
         .and_then(|uid| pick(uid))
@@ -1382,8 +1370,7 @@ pub fn workbuddy_activity_info(
             let fuid = as_str(fs_utils::dig(&raw, &["uid"]))?;
             pool.accounts.iter().find(|a| a.uid == fuid).map(|a| a.id.clone()).and_then(|id| pick(&id))
         })
-        .or_else(|| pool.accounts.iter().find_map(|a| pick(&a.id)))
-        .or_else(|| tokens.keys().find_map(|k| pick(k)));
+        .or_else(|| pool.accounts.iter().find_map(|a| pick(&a.id)));
     let resolved_acct = chosen.as_ref().map(|(id, _, _)| id.clone());
 
     // 缓存命中条件（审查 P1）：10min 内 + 缓存 account_id 与本次解析账号一致
@@ -1453,7 +1440,11 @@ pub fn workbuddy_activity_info(
         "errors": errors,
         "fetched_at_ms": chrono::Utc::now().timestamp_millis(),
     });
-    let _ = crate::store::db(&state.data_dir).kv_set(cache_path, &payload);
+    let _pool_guard = state.wb_pool_lock.lock().unwrap_or_else(|error| error.into_inner());
+    if !load_pool(&state).accounts.iter().any(|account| account.id == acct_id) {
+        return Err("账号已移除，丢弃在途活动结果".into());
+    }
+    crate::store::db(&state.data_dir).kv_set(cache_path, &payload)?;
     Ok(payload)
 }
 
@@ -1503,7 +1494,63 @@ fn billing_post_json(agent: &ureq::Agent, url: &str, token: &str) -> Result<Valu
 
 #[cfg(test)]
 mod credits_tests {
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires explicit read-only live-account opt-in"]
+    fn buddy_live_readonly_usage() {
+        let accounts = crate::tasks::buddy_live_support::accounts().expect("只读账号准备失败");
+        let mut succeeded = 0;
+        for account in accounts {
+            let started = std::time::Instant::now();
+            match super::usage_official_fetch("synthetic-readonly-probe", &account.creds.access_token, &account.creds.domain) {
+                Ok((payload, _)) => {
+                    println!("BUDDY_LIVE account#{} usage requests={} today={} week={} month={} elapsed_ms={}",
+                        account.ordinal, payload["request_count_total"], payload["summary"]["usage_today"],
+                        payload["summary"]["usage_7days"], payload["summary"]["usage_this_month"], started.elapsed().as_millis());
+                    succeeded += 1;
+                }
+                Err(_) => println!("BUDDY_LIVE account#{} usage failed; credentials not refreshed; elapsed_ms={}", account.ordinal, started.elapsed().as_millis()),
+            }
+        }
+        assert!(succeeded > 0, "真实用量无成功响应；未执行续期或任何写入");
+    }
+
     use super::*;
+
+    #[test]
+    fn daily_snapshot_rejects_partial_unknown_unlimited_and_stale_balances() {
+        let directory = std::env::temp_dir().join(format!("wb-snapshot-audit-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        std::fs::create_dir_all(directory.join("data")).unwrap();
+        let state = AppState {
+            data_dir: directory.clone(),
+            jwt_refresh_lock: Default::default(),
+            qoder_pool_lock: Default::default(),
+            wb_pool_lock: Default::default(),
+            doubao_pool_lock: Default::default(),
+            group_defs_lock: Default::default(),
+        };
+        let db = crate::store::db(&directory);
+        crate::store::docs::wb_pool_save(&db, &serde_json::json!({"accounts": [{"id": "a"}, {"id": "b"}]})).unwrap();
+        for payload in [
+            serde_json::json!({"accounts": [{"user_id": "a", "ok": true, "balance": 37}]}),
+            serde_json::json!({"cached": true, "accounts": [{"user_id": "a", "balance": 37}, {"user_id": "b", "balance": 10}]}),
+            serde_json::json!({"accounts": [{"user_id": "a", "ok": true, "balance": 37}, {"user_id": "b", "ok": false, "balance": null}]}),
+            serde_json::json!({"accounts": [{"user_id": "a", "ok": true, "balance": 37}, {"user_id": "b", "ok": true, "balance": -1}]}),
+        ] {
+            append_credits_snapshot(&state, &payload);
+        }
+        assert!(crate::store::docs::wb_credits_history_load(&db)["snapshots"].as_array().unwrap().is_empty());
+        append_credits_snapshot(&state, &serde_json::json!({"accounts": [{"user_id": "a", "ok": true, "balance": 37}, {"user_id": "b", "ok": true, "balance": 10}]}));
+        assert_eq!(crate::store::docs::wb_credits_history_load(&db)["snapshots"][0]["total_balance"], 47.0);
+        save_account_session_rows(&state, "a", "A", &[], false);
+        assert!(db.kv_get::<Value>("workbuddy_usage_sessions_cache")["accounts"].get("a").is_some());
+        crate::store::docs::wb_pool_save(&db, &serde_json::json!({"accounts": []})).unwrap();
+        db.kv_set("workbuddy_usage_sessions_cache", &serde_json::json!({})).unwrap();
+        save_account_session_rows(&state, "a", "A", &[], false);
+        assert!(db.kv_get::<Value>("workbuddy_usage_sessions_cache").get("accounts").is_none());
+        assert!(stored_billing_target(&state, "a").is_none());
+        let _ = std::fs::remove_dir_all(directory);
+    }
 
     #[test]
     fn parse_reward_plus_extracts_amounts() {

@@ -468,9 +468,7 @@ fn sync_pool_expiry(state: &AppState, aid: &str, creds: &Creds) {
                 if let Some(exp) = creds.expires_at_ms {
                     a["access_token_expires_at"] = json!(exp.div_euclid(1000));
                 }
-                if let Some(rexp) = creds.refresh_expires_at_ms {
-                    a["refresh_token_expires_at"] = json!(rexp.div_euclid(1000));
-                }
+                a["refresh_token_expires_at"] = json!(creds.refresh_expires_at_ms.map(|expiry| expiry.div_euclid(1000)));
                 a["needs_relogin"] = json!(false);
                 a["relogin_reason"] = json!("");
                 changed = true;
@@ -582,6 +580,9 @@ fn process_account(
         return ev;
     }
     let (creds, refreshed, note) = wb_common::ensure_fresh(state, agent, acct, opts.lazy_hours);
+    if !matches!(note, "fresh" | "refreshed" | "no_credential") {
+        return json!({ "user_id": aid, "name": base_ev["name"], "status": "fail", "message": renewal_note_message(state, &aid, note) });
+    }
     if creds.access_token.is_empty() {
         return json!({ "user_id": aid, "name": base_ev["name"], "status": "fail", "message": format!("无可用凭证（{note}）") });
     }
@@ -634,11 +635,8 @@ fn process_account(
             }
             None => {
                 // 凭证失效才标记重登录；网络故障/响应异常/他方进程刷新中不误标（审查 P1-4 + H-1）
-                if fail_reason == Some(wb_common::RefreshFail::Auth) {
-                    wb_common::mark_needs_relogin(state, &aid, &format!("签到 refresh 失败: {message}"));
-                }
                 kind = "fail".into();
-                message = "登录态失效且刷新失败，需重新登录".into();
+                message = failure_message(state, &aid, fail_reason);
                 reward = None;
             }
         }
@@ -781,11 +779,15 @@ fn with_retry<F>(state: &AppState, agent: &ureq::Agent, acct_id: &str, creds: &C
 where
     F: Fn(&[(String, String)]) -> (String, String),
 {
-    let headers = wb_common::build_auth_headers(creds, false);
+    let current = wb_common::effective_creds(state, acct_id, &creds.uid);
+    if let Some(error) = super::wb_session::recovery_block(&state.data_dir, acct_id, &current) {
+        return ("stop".into(), error.message());
+    }
+    let headers = wb_common::build_auth_headers(&current, false);
     let (kind, msg) = f(&headers);
     if kind == "auth" {
         // H-1：加锁刷新 + 二次检查 + 内部落库（原 refresh_token_once_ex + 手工 save）
-        let (new, fail_reason) = wb_common::refresh_token_once_locked(state, agent, acct_id, creds);
+        let (new, fail_reason) = wb_common::refresh_token_once_locked(state, agent, acct_id, &current);
         if let Some(new) = new {
             sync_pool_expiry(state, acct_id, &new);
             let h2 = wb_common::build_auth_headers(&new, false);
@@ -794,17 +796,34 @@ where
             // 归一为 fail 并回写 needs_relogin（避免 auth 泄漏到上层结果）
             if kind2 == "auth" {
                 wb_common::mark_needs_relogin(state, acct_id, "刷新后仍 401");
-                return ("fail".into(), "登录态失效（刷新后仍 401），需重新登录".into());
+                return ("stop".into(), "登录态失效（刷新后仍 401），需重新登录".into());
             }
             return (kind2, msg2);
         }
         // 凭证失效才标记重登录；网络故障/响应异常/他方进程刷新中不误标（下次调度自然重试）
-        if fail_reason == Some(wb_common::RefreshFail::Auth) {
-            wb_common::mark_needs_relogin(state, acct_id, &format!("refresh 失败: {msg}"));
-        }
-        return ("fail".into(), "登录态失效且刷新失败".into());
+        return ("stop".into(), failure_message(state, acct_id, fail_reason));
     }
     (kind, msg)
+}
+
+fn failure_message(state: &AppState, account_id: &str, failure: Option<wb_common::RefreshFail>) -> String {
+    let stored = super::wb_session::health(&state.data_dir, account_id);
+    if !stored.message.is_empty() { return stored.message; }
+    super::wb_session::RefreshError::new(failure.unwrap_or(wb_common::RefreshFail::Network)).message()
+}
+
+fn renewal_note_message(state: &AppState, account_id: &str, note: &str) -> String {
+    if note == "auth_required" { return "需重新登录，已停止自动恢复".into(); }
+    failure_message(state, account_id, Some(match note {
+        "refresh_busy" => wb_common::RefreshFail::Busy,
+        "refresh_cooldown" => wb_common::RefreshFail::Cooldown,
+        "persist_failed" => wb_common::RefreshFail::Persistence,
+        _ => wb_common::RefreshFail::Network,
+    }))
+}
+
+fn growth_stopped(base: &Value, message: String) -> Value {
+    json!({"type": "growth", "user_id": base["user_id"], "name": base["name"], "status": "fail", "message": message})
 }
 
 /// Buddy 旅行：status → arrived 则 claim → config → depart（各步独立容错）
@@ -1482,6 +1501,9 @@ fn process_account_growth(state: &AppState, agent: &ureq::Agent, acct: &Value, f
     ]);
     let base_ev = json!({"type": "growth", "user_id": aid, "name": name});
     let (creds, _refreshed, note) = wb_common::ensure_fresh(state, agent, acct, 24);
+    if !matches!(note, "fresh" | "refreshed" | "no_credential") {
+        return growth_stopped(&base_ev, renewal_note_message(state, &aid, note));
+    }
     if creds.access_token.is_empty() {
         return json!({ "type": "growth", "user_id": aid, "name": base_ev["name"], "status": "fail", "message": format!("无可用凭证（{note}）") });
     }
@@ -1499,10 +1521,12 @@ fn process_account_growth(state: &AppState, agent: &ureq::Agent, acct: &Value, f
     let mut result = Map::new();
     if flags.travel {
         let (kind, msg) = with_retry(state, agent, &aid, &creds, |h| growth_travel(agent, h, &urls));
+        if kind == "stop" { return growth_stopped(&base_ev, msg); }
         result.insert("travel".into(), json!(if kind == "fail" { "fail" } else { msg.as_str() }));
     }
     if flags.lottery {
         let (kind, msg) = with_retry(state, agent, &aid, &creds, |h| growth_lottery(agent, h, &urls));
+        if kind == "stop" { return growth_stopped(&base_ev, msg); }
         result.insert("lottery".into(), json!(if kind == "fail" { "fail" } else { msg.as_str() }));
     }
     if flags.tasks {
@@ -1511,8 +1535,10 @@ fn process_account_growth(state: &AppState, agent: &ureq::Agent, acct: &Value, f
         let (k1, m1) = with_retry(state, agent, &aid, &creds, |h| {
             growth_report(agent, h, &urls, &creds.uid)
         });
+        if k1 == "stop" { return growth_stopped(&base_ev, m1); }
         result.insert("report".into(), json!(if k1 == "fail" { "fail" } else { m1.as_str() }));
         let (k2, m2) = with_retry(state, agent, &aid, &creds, |h| growth_redeem(agent, h, &urls));
+        if k2 == "stop" { return growth_stopped(&base_ev, m2); }
         result.insert("redeem".into(), json!(if k2 == "fail" { "fail" } else { m2.as_str() }));
         // 判据事件补齐：先拉任务列表，按任务类型构造对应指纹的事件链上报；
         // 上报与计分异步，等待片刻再交给下面的 accept/claim 步骤
@@ -1523,26 +1549,25 @@ fn process_account_growth(state: &AppState, agent: &ureq::Agent, acct: &Value, f
                 Err((_, msg)) => ("fail".into(), msg),
             }
         });
+        if k3 == "stop" { return growth_stopped(&base_ev, m3); }
         result.insert("actions".into(), json!(if k3 == "fail" { "fail" } else { m3.as_str() }));
         std::thread::sleep(std::time::Duration::from_millis(1500));
         let (kind, msg) = with_retry(state, agent, &aid, &creds, |h| growth_tasks(agent, h, &urls));
+        if kind == "stop" { return growth_stopped(&base_ev, msg); }
         result.insert("tasks".into(), json!(if kind == "fail" { "fail" } else { msg.as_str() }));
     }
     // 能量/连签（不带刷新重试，纯展示）
-    let headers = wb_common::build_auth_headers(&creds, false);
+    let current = wb_common::effective_creds(state, &aid, &creds.uid);
+    let headers = wb_common::build_auth_headers(&current, false);
     for (k, v) in growth_info(agent, &headers, &urls) {
         result.insert(k.to_string(), json!(v));
     }
 
-    let enabled = ["travel", "lottery", "report", "redeem", "actions", "tasks"]
-        .iter()
-        .filter(|k| result.contains_key(**k))
-        .count();
     let fails = ["travel", "lottery", "report", "redeem", "actions", "tasks"]
         .iter()
         .filter(|k| result.get(**k).and_then(Value::as_str) == Some("fail"))
         .count();
-    let status = if fails > 0 && fails == enabled { "fail" } else { "ok" };
+    let status = if fails > 0 { "fail" } else { "ok" };
     let mut ev = json!({ "type": "growth", "user_id": aid, "name": base_ev["name"], "status": status });
     for (k, v) in result {
         ev[k.as_str()] = v;
@@ -1578,9 +1603,9 @@ pub fn run_growth_round(state: &AppState, flags: &GrowthOpts, uids: &[String], e
 
 // ── token 每周兜底续期（F-09，schtasks / --task-run wb-renew）──────────────
 
-/// 每周兜底：对全部账号执行惰性刷新（lazy_hours 传 0 = 每天无条件刷新全部，F-55）。
+/// 检查 AT/RT 临期；lazy_hours=0 仅刷新到期项。
 /// 返回末行 JSON 摘要（零 token 输出）。
-pub fn run_renew_only(state: &AppState, lazy_hours: i64) -> Value {
+pub fn run_renew_only(state: &AppState, lazy_hours: i64) -> Result<Value, String> {
     let agent = http_agent(30);
     let pool: Value = crate::store::docs::wb_pool_load(&crate::store::db(&state.data_dir));
     let accounts: Vec<Value> = pool
@@ -1604,12 +1629,65 @@ pub fn run_renew_only(state: &AppState, lazy_hours: i64) -> Value {
         }
         items.push(item);
     }
-    json!({"mode": "renew", "finished_at": fs_utils::now_ts(), "accounts": items})
+    renewal_outcome(items)
+}
+
+fn renewal_outcome(items: Vec<Value>) -> Result<Value, String> {
+    let count = |notes: &[&str]| items.iter().filter(|item| notes.contains(&item["note"].as_str().unwrap_or_default())).count();
+    let refreshed = count(&["refreshed"]);
+    let fresh = count(&["fresh"]);
+    let auth_required = count(&["auth_required", "expired_needs_relogin", "no_credential"]);
+    let retryable = items.len().saturating_sub(refreshed + fresh + auth_required);
+    if retryable > 0 {
+        return Err(format!("WB 续期：已续期 {refreshed}，无需续期 {fresh}，需重登 {auth_required}，暂时失败 {retryable}（稍后自动重试）"));
+    }
+    Ok(json!({"mode": "renew", "ok": auth_required == 0, "finished_at": fs_utils::now_ts(),
+        "refreshed": refreshed, "fresh": fresh, "auth_required": auth_required, "retryable": retryable, "accounts": items}))
 }
 
 #[cfg(test)]
 mod wb_checkin_tests {
     use super::*;
+
+    #[test]
+    fn session_renewal_temporary_failures_remain_retryable() {
+        for note in ["refresh_failed", "refresh_cooldown", "refresh_busy", "persist_failed"] {
+            assert!(renewal_outcome(vec![json!({"note":"fresh"}), json!({"note":note})]).is_err());
+        }
+    }
+
+    #[test]
+    fn session_renewal_permanent_failure_completes_without_claiming_success() {
+        let result = renewal_outcome(vec![json!({"note":"refreshed"}), json!({"note":"fresh"}), json!({"note":"auth_required"})]).unwrap();
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["refreshed"], 1);
+        assert_eq!(result["fresh"], 1);
+        assert_eq!(result["auth_required"], 1);
+        assert_eq!(result["retryable"], 0);
+        assert_eq!(renewal_outcome(vec![]).unwrap()["ok"], true);
+    }
+
+    #[test]
+    fn session_growth_stops_before_business_step_when_recovery_is_blocked() {
+        let directory = std::env::temp_dir().join(format!("wb-growth-stop-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        let store = crate::store::db(&directory);
+        store.row_upsert("wb_accounts", "synthetic", &json!({"id":"synthetic", "uid":"synthetic-uid", "needs_relogin":true})).unwrap();
+        let state = AppState {
+            data_dir: directory,
+            jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            doubao_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            group_defs_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+        };
+        let creds = Creds {uid:"synthetic-uid".into(), access_token:"synthetic-access".into(), refresh_token:"synthetic-refresh".into(), ..Default::default()};
+        wb_common::token_store_upsert_secure(&state.data_dir, "synthetic", &serde_json::to_value(&creds).unwrap()).unwrap();
+        let result = process_account_growth(&state, &http_agent(1), &json!({"id":"synthetic", "uid":"synthetic-uid"}), &GrowthOpts {travel:true, lottery:true, tasks:true});
+        assert_eq!(result["status"], "fail");
+        assert!(result["message"].as_str().unwrap().contains("需重新登录"));
+        assert!(result.get("travel").is_none());
+        assert!(result.get("tasks").is_none());
+    }
 
     /// 空 uid 的事件不可计分：桌面/Web 两套指纹的 userId 都取自 creds.uid，
     /// 缺失时上报无法归属到账号（此前照发并被计入成功，结果行谎报「已上报」）

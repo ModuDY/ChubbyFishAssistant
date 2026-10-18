@@ -11,7 +11,7 @@ use crate::state::AppState;
 use crate::workbuddy_cli;
 
 use super::common::{
-    account_id_of, as_str, cli_settings_path, load_pool, load_settings, restore_cli_settings,
+    account_id_of, cli_settings_path, load_pool, load_settings, restore_cli_settings,
 };
 
 /// 保存 CLI 轮换状态（SQLite 化 P4：kv `wb_cli_rotate_state`，accounts.rs 删除账号时复用）
@@ -46,24 +46,39 @@ fn append_cli_log(_state: &AppState, st: &mut CliRotateState, mut entry: serde_j
     }
 }
 
-/// CLI 当前账号 = settings.json env token 的稳定池 id（wb-<sha256 前 12 位>）。
-fn cli_current_account_id() -> Option<String> {
+fn cli_current_account_id(state: &AppState) -> Option<String> {
     let raw = fs_utils::read_json::<serde_json::Value>(&cli_settings_path());
-    workbuddy_cli::settings_env_token(&raw).map(|t| account_id_of(&t))
+    let token = workbuddy_cli::settings_env_token(&raw)?;
+    load_pool(state).accounts.into_iter().find(|account| {
+        cli_token_of(state, &account.id).as_deref() == Some(token.as_str()) || account.id == account_id_of(&token)
+    }).map(|account| account.id)
 }
 
 /// 从 token store 取账号 access_token（CLI 桥唯一凭证来源；auth 文件只读态不入桥）。
 fn cli_token_of(state: &AppState, account_id: &str) -> Option<String> {
-    let store: serde_json::Value = crate::tasks::wb_common::load_token_store(state);
-    let rec = store.get("tokens").and_then(|t| t.get(account_id)).cloned().unwrap_or_default();
-    as_str(fs_utils::dig(&rec, &["access_token"])).filter(|t| !t.is_empty())
+    let creds = crate::tasks::wb_common::stored_creds(&state.data_dir, account_id);
+    (!creds.access_token.is_empty()).then_some(creds.access_token)
+}
+
+fn remove_matching_cli_token(settings: &mut serde_json::Value, token: &str) -> bool {
+    if token.is_empty() || workbuddy_cli::settings_env_token(settings).as_deref() != Some(token) { return false; }
+    settings.get_mut("env").and_then(serde_json::Value::as_object_mut)
+        .and_then(|environment| environment.remove(workbuddy_cli::AUTH_ENV_KEY)).is_some()
+}
+
+pub(super) fn clear_deleted_cli_token(record: &serde_json::Value) -> Result<(), String> {
+    let creds = crate::tasks::wb_common::creds_of(record);
+    if creds.access_token.is_empty() { return Ok(()); }
+    let path = cli_settings_path();
+    let mut settings: serde_json::Value = fs_utils::read_json(&path);
+    if remove_matching_cli_token(&mut settings, &creds.access_token) { fs_utils::write_json(&path, &settings)?; }
+    Ok(())
 }
 
 /// 轮换候选：积分缓存（credits_fetch 回写）+ 账号池凭证 → CliCandidate。
 /// 缓存缺失/无凭证 → invalid 候选（供日志与防横跳参照，不作为目标）。
 fn cli_candidates(state: &AppState) -> Vec<workbuddy_cli::CliCandidate> {
-    let cache: serde_json::Value =
-        crate::store::db(&state.data_dir).kv_get("workbuddy_credits_cache");
+    let cache = crate::tasks::wb_credits::current_cache(state).unwrap_or_default();
     let cache_accounts = cache.get("accounts").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let pool = load_pool(state);
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -73,7 +88,7 @@ fn cli_candidates(state: &AppState) -> Vec<workbuddy_cli::CliCandidate> {
         .iter()
         .map(|a| {
             let display = if a.nickname.is_empty() { a.id.clone() } else { a.nickname.clone() };
-            if !has_store(&a.id) {
+            if a.needs_relogin || !has_store(&a.id) {
                 return workbuddy_cli::CliCandidate {
                     account_id: a.id.clone(),
                     display_name: display,
@@ -113,13 +128,16 @@ fn cli_candidates(state: &AppState) -> Vec<workbuddy_cli::CliCandidate> {
                     }
                 }
             }
+            let remaining = acc.get("balance").and_then(serde_json::Value::as_f64)
+                .map(|balance| if balance < 0.0 { f64::MAX } else { balance }).unwrap_or(total);
+            let valid = acc.get("ok").and_then(serde_json::Value::as_bool) == Some(true) && remaining > 0.0;
             workbuddy_cli::CliCandidate {
                 account_id: a.id.clone(),
                 display_name: display,
                 soonest_expire_at_ms: soonest,
-                total_remaining: total,
-                valid: total > 0.0,
-                error: if total > 0.0 { None } else { Some("无剩余积分（或已全部过期）".into()) },
+                total_remaining: remaining,
+                valid,
+                error: (!valid).then(|| "积分不可用，请刷新积分".into()),
             }
         })
         .collect()
@@ -143,7 +161,7 @@ fn cli_status_value(state: &AppState) -> serde_json::Value {
     let s = load_settings(state);
     let settings_raw = fs_utils::read_json::<serde_json::Value>(&cli_settings_path());
     let token_present = workbuddy_cli::settings_env_token(&settings_raw).is_some();
-    let current_id = cli_current_account_id();
+    let current_id = cli_current_account_id(state);
     let pool = load_pool(state);
     let active_name = current_id
         .as_ref()
@@ -251,7 +269,7 @@ pub fn workbuddy_cli_rotate_logs(state: State<AppState>, limit: Option<usize>) -
 fn cli_rotate_cycle(state: &AppState) -> serde_json::Value {
     let (cooldown_ms, gap_ms, urgency_ms, guard_ms, _interval, min_remaining) = cli_rotate_config(state);
     let candidates = cli_candidates(state);
-    let current = cli_current_account_id();
+    let current = cli_current_account_id(state);
     let st0 = load_cli_rotate_state(state);
     let now_ms = chrono::Utc::now().timestamp_millis();
 
@@ -372,4 +390,20 @@ pub fn start_cli_rotate_thread() {
             let _ = cli_rotate_cycle(&state);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_only_removes_the_matching_cli_credential() {
+        let mut settings = serde_json::json!({"env": {"CODEBUDDY_AUTH_TOKEN": "Bearer synthetic-access", "OTHER": "keep"}, "theme": "dark"});
+        assert!(!remove_matching_cli_token(&mut settings, "other-access"));
+        assert!(!remove_matching_cli_token(&mut settings, ""));
+        assert!(remove_matching_cli_token(&mut settings, "synthetic-access"));
+        assert_eq!(settings["env"]["OTHER"], "keep");
+        assert_eq!(settings["theme"], "dark");
+        assert!(workbuddy_cli::settings_env_token(&settings).is_none());
+    }
 }

@@ -105,6 +105,7 @@ fn auth_file_uid_value(j: &serde_json::Value) -> Option<String> {
 
 /// 备份（PS Backup-AuthFileProfile 965-1060 对译）
 pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Result<(), String> {
+    if sess.prof.app_name == "CodeBuddy" { return backup_codebuddy(sess, slot, sink); }
     let auth_file = &sess.auth_file;
     // 关闭客户端后先等 auth 文件静默（残留进程可能延迟回写旧登录，实测 3 秒后才落盘）
     wait_auth_file_quiet(&auth_file, sink);
@@ -190,49 +191,6 @@ pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> R
         }
     }
 
-    // L3（仅 CodeBuddy）：vscdb 登录真源快照。CodeBuddy CN 桌面端登录态在
-    // %APPDATA%\CodeBuddy CN\User\globalStorage（state.vscdb 的 secret://…
-    // planning-genie.new.accessTokencn，实测确认），仅备份共享 auth 文件对它无效
-    //（root cause：切 CodeBuddy "还是最初的登录账号"）。含 backup 库与扩展存储目录
-    //（防 VS Code 启动从 backup/扩展缓存恢复旧登录）。客户端已由 stop_app 关闭，
-    // vscdb 无锁可整文件复制。
-    if sess.prof.app_name == "CodeBuddy" {
-        if let Some(gs_dir) = &sess.prof.cb_global_storage_dir {
-            if gs_dir.join("state.vscdb").exists() {
-                let dest_vscdb = dest.join("vscdb");
-                std::fs::create_dir_all(&dest_vscdb).map_err(|e| e.to_string())?;
-                // 审查修复：-wal/-shm 边车必须随主库一起快照——SQLite WAL 模式下
-                // 最新登录写入可能尚未 checkpoint 进主库，漏拷会丢失；恢复侧也依赖
-                // 它们正确回放。
-                for f in [
-                    "state.vscdb",
-                    "state.vscdb-wal",
-                    "state.vscdb-shm",
-                    "state.vscdb.backup",
-                    "storage.json",
-                ] {
-                    let src_f = gs_dir.join(f);
-                    if src_f.exists() {
-                        let _ = std::fs::copy(&src_f, dest_vscdb.join(f));
-                        copied += 1;
-                    }
-                }
-                let cop_dir = gs_dir.join("tencent-cloud.coding-copilot");
-                if cop_dir.exists() {
-                    let cop_dst = dest_vscdb.join("tencent-cloud.coding-copilot");
-                    let _ = std::fs::remove_dir_all(&cop_dst);
-                    if copy::copy_snapshot_item(&cop_dir, &cop_dst) {
-                        copied += 1;
-                    }
-                }
-                sink.step(
-                    "backup",
-                    StepStatus::Ok,
-                    "L3 vscdb 登录态已备份（CodeBuddy CN globalStorage）",
-                );
-            }
-        }
-    }
 
     // 元数据（app 记录实际目标应用：WorkBuddy 与 CodeBuddy 共用 authfile 管线，
     // 以档案名区分）。统一无 BOM 写入——修复 PS 两布局 BOM 不一致（authfile 版
@@ -261,6 +219,33 @@ pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> R
     Ok(())
 }
 
+fn backup_codebuddy(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Result<(), String> {
+    let source = sess.prof.cb_global_storage_dir.as_ref().ok_or("CodeBuddy 登录目录未找到")?;
+    if !source.join("state.vscdb").is_file() { return Err("CodeBuddy 登录库不存在，请先登录".into()); }
+    let storage: serde_json::Value = crate::fs_utils::read_json(&source.join("storage.json"));
+    let uid = storage.get("genie.userId").and_then(serde_json::Value::as_str).filter(|uid| !uid.is_empty())
+        .ok_or("无法确认 CodeBuddy 当前身份，未覆盖原快照")?;
+    let expected = crate::store::db(&sess.data_dir).row_get("wb_accounts", slot)?.and_then(|account| account.get("uid").and_then(serde_json::Value::as_str).map(str::to_string));
+    if expected.as_deref().is_some_and(|expected| !expected.is_empty() && expected != uid) {
+        return Err("CodeBuddy 当前身份与预期不符，未覆盖原快照".into());
+    }
+    let destination = sess.prof.profiles_dir.join(slot);
+    copy::rotate_bak(&destination, slot, sink);
+    let target = destination.join("vscdb");
+    std::fs::create_dir_all(&target).map_err(|error| error.to_string())?;
+    for name in ["state.vscdb", "state.vscdb-wal", "state.vscdb-shm", "state.vscdb.backup", "storage.json"] {
+        let file = source.join(name);
+        if file.exists() { std::fs::copy(&file, target.join(name)).map_err(|error| format!("CodeBuddy 快照 {name} 复制失败: {error}"))?; }
+    }
+    let extension = source.join("tencent-cloud.coding-copilot");
+    if extension.exists() && !copy::copy_snapshot_item(&extension, &target.join("tencent-cloud.coding-copilot")) {
+        return Err("CodeBuddy 扩展登录态复制失败".into());
+    }
+    crate::fs_utils::write_json(&destination.join("meta.json"), &json!({"schemaVersion": 2, "layout": "authfile", "app": "CodeBuddy", "uid": uid, "savedAt": crate::fs_utils::now_ts()}))?;
+    sink.step("backup", StepStatus::Ok, "CodeBuddy 独立登录态已备份（不读取 WorkBuddy auth）");
+    Ok(())
+}
+
 /// 恢复（PS Restore-AuthFileProfile 1062-1145 对译）
 pub fn restore_authfile(
     sess: &Session,
@@ -271,7 +256,14 @@ pub fn restore_authfile(
     let auth_file = &sess.auth_file;
     let (src, _slot_label) = copy::resolve_slot(sess, slot, sink)?;
     let auth_src = src.join("auth").join(WB_AUTH_FILE_NAME);
-    if !auth_src.exists() {
+    if sess.prof.app_name == "CodeBuddy" {
+        let storage: serde_json::Value = crate::fs_utils::read_json(&src.join("vscdb").join("storage.json"));
+        let meta: serde_json::Value = crate::fs_utils::read_json(&src.join("meta.json"));
+        let uid = storage.get("genie.userId").and_then(serde_json::Value::as_str).filter(|uid| !uid.is_empty());
+        if !src.join("vscdb").join("state.vscdb").is_file() || uid.is_none() || uid != meta.get("uid").and_then(serde_json::Value::as_str) {
+            return Err("CodeBuddy 快照缺失独立登录态或身份不一致，请在对应客户端重新保存登录态".into());
+        }
+    } else if !auth_src.exists() {
         sink.step(
             "restore",
             StepStatus::Error,
@@ -363,7 +355,7 @@ pub fn restore_authfile(
                 ] {
                     let src_f = slot_vscdb.join(f);
                     if src_f.exists() {
-                        let _ = std::fs::copy(&src_f, gs_dir.join(f));
+                        std::fs::copy(&src_f, gs_dir.join(f)).map_err(|error| format!("CodeBuddy 登录态 {f} 恢复失败: {error}"))?;
                         restored += 1;
                     }
                 }
@@ -925,12 +917,12 @@ fn confirm_ok(sess: &Session, slot: &str, expect_uid: &str, sink: &dyn ProgressS
         return VerifyResult::Ok;
     }
     let Some(gs) = sess.prof.cb_global_storage_dir.as_ref() else {
-        sink.step("verify", StepStatus::Ok, "登录身份已确认为目标账号");
-        return VerifyResult::Ok;
+        sink.step("verify", StepStatus::Warn, "无法定位 CodeBuddy 登录目录，身份尚未确认");
+        return VerifyResult::Timeout;
     };
     if !sess.prof.profiles_dir.join(slot).join("vscdb").join("storage.json").exists() {
-        sink.step("verify", StepStatus::Ok, "登录身份已确认为目标账号");
-        return VerifyResult::Ok;
+        sink.step("verify", StepStatus::Warn, "CodeBuddy 快照缺失身份信息，请重新保存登录态");
+        return VerifyResult::Timeout;
     }
     let live_file = gs.join("storage.json");
     for _ in 0..3 {
@@ -955,8 +947,8 @@ fn confirm_ok(sess: &Session, slot: &str, expect_uid: &str, sink: &dyn ProgressS
             return VerifyResult::Reverted;
         }
     }
-    sink.step("verify", StepStatus::Ok, "登录身份已确认为目标账号");
-    VerifyResult::Ok
+    sink.step("verify", StepStatus::Warn, "CodeBuddy 尚未返回可核实身份，请打开客户端确认");
+    VerifyResult::Timeout
 }
 
 #[cfg(test)]
@@ -1027,6 +1019,29 @@ mod tests {
             assert_eq!(auth_file_uid(&p).as_deref(), want, "case {content}");
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn codebuddy_snapshot_uses_own_identity_without_shared_auth() {
+        let _guard = test_io_lock();
+        let mut sess = session(TargetApp::CodeBuddy, "cb-identity");
+        let source = sess.data_dir.join("synthetic-codebuddy");
+        std::fs::create_dir_all(&source).unwrap();
+        sess.prof.cb_global_storage_dir = Some(source.clone());
+        std::fs::write(source.join("state.vscdb"), "synthetic-db").unwrap();
+        crate::fs_utils::write_json(&source.join("storage.json"), &json!({"genie.userId": "codebuddy-b"})).unwrap();
+        backup_authfile(&sess, "100", &QuietSink).unwrap();
+        let slot = sess.prof.profiles_dir.join("100");
+        let meta: serde_json::Value = crate::fs_utils::read_json(&slot.join("meta.json"));
+        assert_eq!(meta["uid"], "codebuddy-b");
+        assert!(!slot.join("auth").exists());
+        std::fs::create_dir_all(&sess.auth_dir).unwrap();
+        std::fs::write(&sess.auth_file, r#"{"account":{"uid":"workbuddy-a"}}"#).unwrap();
+        restore_authfile(&sess, "100", &QuietSink).unwrap();
+        assert_eq!(auth_file_uid(&sess.auth_file).as_deref(), Some("workbuddy-a"));
+        crate::fs_utils::write_json(&slot.join("meta.json"), &json!({"uid": "workbuddy-a"})).unwrap();
+        assert!(restore_authfile(&sess, "100", &QuietSink).is_err());
+        let _ = std::fs::remove_dir_all(&sess.data_dir);
     }
 
     #[test]

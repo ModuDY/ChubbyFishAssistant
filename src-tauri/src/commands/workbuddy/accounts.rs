@@ -3,7 +3,7 @@
 //! 函数逻辑零改动，仅将跨子模块引用项提升为 `pub(super)`。
 
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 use crate::fs_utils;
 use crate::state::AppState;
@@ -12,7 +12,7 @@ use super::cli::{load_cli_rotate_state, save_cli_rotate_state};
 use super::common::{
     account_id_of, as_str, as_ts_seconds, auth_file_path_of, dig_plain_string,
     extract_access_token, is_running, load_pool, save_pool, snapshot_json_path, upsert_token_store,
-    wb_data_dir, wb_renew_locks, WorkBuddyAccount, WbPool,
+    wb_data_dir, WorkBuddyAccount, WbPool,
 };
 
 // ── 数据结构 ────────────────────────────────────────────────────────────────
@@ -29,10 +29,14 @@ pub struct WorkBuddyAccountView {
     pub auth_saved_at: Option<i64>,
     pub needs_relogin: bool,
     pub relogin_reason: String,
+    pub session_health: serde_json::Value,
     pub group_id: String,
     pub note: String,
     pub credits_balance: Option<f64>,
     pub credits_fetched_at: Option<String>,
+    /// 最早积分包到期时间（Unix 秒；剩余>0 且未过期包取 min）；
+    /// None = 无到期信息或全部包长期有效
+    pub credits_expire_at: Option<i64>,
     /// 在线 = 本机 auth 文件当前生效账号（F-54 双态）
     pub is_current: bool,
     /// 有工具侧凭证副本或 auth 文件匹配
@@ -153,7 +157,7 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
             pool.accounts.iter().find(|a| a.uid == uid).map(|a| a.id.clone())
         })
         .or(cur_cb.clone());
-    let store: serde_json::Value = crate::tasks::wb_common::load_token_store(state);
+    let store = crate::store::docs::wb_token_store_load(&crate::store::db(&state.data_dir));
     let store_tokens = store.get("tokens").cloned().unwrap_or(serde_json::Value::Null);
     let tag_map = crate::store::docs::account_tags_map(&crate::store::db(&state.data_dir));
 
@@ -164,6 +168,17 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
             let has_cred = store_tokens.get(&a.id).is_some()
                 || auth_uid.as_deref() == Some(a.uid.as_str());
             let has_snapshot = snap_path.join(&a.id).is_dir();
+            // 需重登（登录态已失效）账号不再展示历史余额/到期：该值已无法刷新，
+            // 作为实时值展示会误导（用户实测「积分不对」即此陈旧值被冻结展示）。
+            // 仅在视图层置空，池内存储值不动，重登成功后由积分刷新链路回填恢复。
+            let session_health = crate::tasks::wb_session::health_view(&state.data_dir, &a.id, a.needs_relogin,
+                a.access_token_expires_at, a.refresh_token_expires_at);
+            let needs_relogin = a.needs_relogin || session_health["status"] == "auth_required";
+            let (credits_balance, credits_expire_at) = if needs_relogin {
+                (None, None)
+            } else {
+                (a.credits_balance, a.credits_expire_at)
+            };
             WorkBuddyAccountView {
                 id: a.id.clone(),
                 uid: a.uid.clone(),
@@ -173,12 +188,16 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
                 access_token_expires_at: a.access_token_expires_at,
                 refresh_token_expires_at: a.refresh_token_expires_at,
                 auth_saved_at: a.auth_saved_at,
-                needs_relogin: a.needs_relogin,
-                relogin_reason: a.relogin_reason.clone(),
+                needs_relogin,
+                relogin_reason: if a.relogin_reason.is_empty() && needs_relogin {
+                    session_health["message"].as_str().unwrap_or("需重新登录").into()
+                } else { a.relogin_reason.clone() },
+                session_health,
                 group_id: a.group_id.clone(),
                 note: a.note.clone(),
-                credits_balance: a.credits_balance,
+                credits_balance,
                 credits_fetched_at: a.credits_fetched_at.clone(),
+                credits_expire_at,
                 is_current: auth_uid.is_some() && auth_uid == Some(a.uid.clone()),
                 has_credential: has_cred,
                 has_snapshot: has_snapshot,
@@ -211,39 +230,65 @@ pub fn workbuddy_account_save(state: State<AppState>, user_id: String, name: Opt
     save_pool(&state, &pool)
 }
 
-#[tauri::command]
-pub fn workbuddy_account_remove(state: State<AppState>, user_id: String, delete_snapshot: Option<bool>) -> Result<(), String> {
+#[tauri::command(async)]
+pub fn workbuddy_account_remove(app: AppHandle, state: State<AppState>, user_id: String, delete_snapshot: Option<bool>) -> Result<(), String> {
     // 审查 P1：id 将作为 profiles_workbuddy/<id> 目录名参与 remove_dir_all，
     // 先过字符集白名单，杜绝 `..`/绝对路径注入导致的目录逃逸删除
     fs_utils::ensure_uid_safe(&user_id)?;
-    // 池读-改-写互斥（wb_pool_lock）：仅罩住池段，后续快照/CLI 状态清理不涉池
-    let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
-    let mut pool = load_pool(&state);
-    let before = pool.accounts.len();
-    pool.accounts.retain(|a| a.id != user_id);
-    if pool.accounts.len() == before {
-        return Err(format!("账号不存在: {user_id}"));
-    }
-    save_pool(&state, &pool)?;
+    let lock = crate::tasks::wb_common::refresh_lock_for(&user_id);
+    let _refresh_guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+    let _cross = crate::tasks::wb_common::cross_refresh_lock(&state.data_dir, &user_id)
+        .ok_or("账号正在其他进程续期，未执行删除，请稍后重试")?;
+    let _pool_guard = state.wb_pool_lock.lock().unwrap_or_else(|error| error.into_inner());
+    // 池外孤儿判定：token store 有记录即可清理（池删除接口是孤儿凭证的唯一出口）
+    let old_creds = crate::tasks::wb_common::token_record_secure(&state.data_dir, &user_id);
+    // 池读-改-写互斥（wb_pool_lock）：仅罩住池段即释放——后续凭证/快照/CLI 清理
+    // 不涉池，避免池锁与其他写点锁嵌套成环
+    let removed = {
+        let _table = crate::tasks::wb_common::WB_TOKEN_STORE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let mut pool = load_pool(&state);
+        let before = pool.accounts.len();
+        pool.accounts.retain(|a| a.id != user_id);
+        if pool.accounts.len() == before {
+            false
+        } else {
+            save_pool(&state, &pool)?;
+            true
+        }
+    };
+    let mut cleanup_errors = Vec::new();
+    if let Err(error) = super::cli::clear_deleted_cli_token(&old_creds) { cleanup_errors.push(format!("CLI 凭证: {error}")); }
     // 共享标签绑定清理（审查修复，同 Qoder/Trae 删除路径；成员变化同时影响
     // org 展开索引——账号 group_id 与 account_tags 双维度）
     if let Err(e) = crate::store::docs::account_tags_remove_account(&crate::store::db(&state.data_dir), &user_id) {
+        cleanup_errors.push(format!("标签绑定: {e}"));
         fs_utils::app_log(&state.data_dir, &format!("workbuddy 账号 {user_id} 标签绑定清理失败: {e}"));
     }
     crate::api_server::org_index::invalidate(&state.data_dir);
-    // P3-L：回收该账号的每账号刷新锁表项（对齐 qoder account_remove；
-    // 并发持有者的 Arc 由引用计数自然释放，语义不变）
-    crate::tasks::wb_common::refresh_lock_remove(&user_id);
+    // 凭证清理（对齐 qoder account_remove I14）：同步清理 wb_tokens 记录 + vault
+    // 加密凭证，防悬空凭证残留；清理失败上抛（池移除已生效，仍需热重载剔除）
+    {
+        if let Err(e) = crate::tasks::wb_common::remove_token(&state, &user_id) {
+            fs_utils::app_log(&state.data_dir, &format!("workbuddy 账号 {user_id} 凭证清理失败: {e}"));
+            let msg = if removed {
+                format!("账号已从池中移除，但凭证清理失败：{e}（再次删除可重试）")
+            } else {
+                format!("孤儿凭证清理失败：{e}")
+            };
+            cleanup_errors.push(msg);
+        }
+    }
+    // 入池白名单摘除幽灵条目（账号已出池而 wb_enabled_uids 仍留其 id 会导致启动
+    // 日志 whitelist 计数虚高、配置与账号池不一致；无条目时 no-op）
+    if let Err(e) = crate::commands::api_server::wb_whitelist_remove(&state.data_dir, &user_id) {
+        cleanup_errors.push(format!("网关白名单: {e}"));
+        fs_utils::app_log(&state.data_dir, &format!("workbuddy 账号 {user_id} 入池白名单摘除失败: {e}"));
+    }
     if delete_snapshot.unwrap_or(false) {
         // F2-2：双端快照槽对称清理——只清 WorkBuddy 会留下 CodeBuddy 孤儿槽，
         // 且账号列表徽标虽随池删除消失，孤儿目录持续占用磁盘。
-        let slot = state.data_dir.join("data").join("profiles_workbuddy").join(&user_id);
-        if slot.is_dir() {
-            let _ = std::fs::remove_dir_all(&slot);
-        }
-        let slot_cb = state.data_dir.join("data").join("profiles_codebuddy").join(&user_id);
-        if slot_cb.is_dir() {
-            let _ = std::fs::remove_dir_all(&slot_cb);
+        if let Err(error) = clean_managed_account_files(&state.data_dir, &user_id) {
+            cleanup_errors.push(error);
         }
     }
     // 被删账号是 CodeBuddy CLI 当前号 → 清理轮换状态残留（active_account_id），
@@ -251,9 +296,48 @@ pub fn workbuddy_account_remove(state: State<AppState>, user_id: String, delete_
     let mut st = load_cli_rotate_state(&state);
     if st.active_account_id.as_deref() == Some(user_id.as_str()) {
         st.active_account_id = None;
-        let _ = save_cli_rotate_state(&state, &st);
+        if let Err(error) = save_cli_rotate_state(&state, &st) { cleanup_errors.push(format!("CLI 状态: {error}")); }
     }
-    Ok(())
+    let db = crate::store::db(&state.data_dir);
+    for key in ["workbuddy_credits_cache", "workbuddy_usage_official_cache", "workbuddy_usage_official_all_cache", "workbuddy_usage_sessions_cache", "workbuddy_activity_cache"] {
+        if let Err(error) = db.kv_set(key, &serde_json::json!({})) { cleanup_errors.push(format!("缓存 {key}: {error}")); }
+    }
+    drop(_pool_guard);
+    // 账号成员变更联动网关池热重载（删除的账号即时退出调度；服务未运行时 no-op）
+    let rt = app.state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
+    crate::commands::api_server::reload_pools_if_running(&state, rt.inner());
+    if cleanup_errors.is_empty() { Ok(()) } else { Err(format!("账号已移除，部分清理失败（可再次删除重试）：{}", cleanup_errors.join("；"))) }
+}
+
+fn clean_managed_account_files(data_dir: &std::path::Path, id: &str) -> Result<(), String> {
+    fs_utils::ensure_uid_safe(id)?;
+    if !data_dir.join("data").exists() { return Ok(()); }
+    let data_root = data_dir.join("data").canonicalize().map_err(|error| error.to_string())?;
+    let mut errors = Vec::new();
+    for root in ["profiles_workbuddy", "profiles_codebuddy", "workbuddy_chats", "codebuddy_chats"] {
+        let folder = data_root.join(root);
+        if !folder.exists() { continue; }
+        let resolved = match folder.canonicalize() {
+            Ok(resolved) => resolved,
+            Err(error) => { errors.push(format!("{root}: {error}")); continue; }
+        };
+        if !resolved.starts_with(&data_root) || resolved == data_root { errors.push(format!("{root} 路径超出助手数据目录，拒绝清理")); continue; }
+        if read_current_account_marker(&resolved).as_deref() == Some(id) {
+            if let Err(error) = std::fs::remove_file(resolved.join("current_account.txt")) { errors.push(format!("{root} 当前账号标记: {error}")); }
+        }
+        for suffix in ["", ".bak", ".bak2"] {
+            let path = resolved.join(format!("{id}{suffix}"));
+            if path.exists() {
+                let target = match path.canonicalize() {
+                    Ok(target) => target,
+                    Err(error) => { errors.push(format!("{root}/{id}{suffix}: {error}")); continue; }
+                };
+                if !target.starts_with(&resolved) || target == resolved { errors.push(format!("{root}/{id}{suffix} 路径超出托管目录，拒绝清理")); continue; }
+                if let Err(error) = std::fs::remove_dir_all(&path) { errors.push(format!("{root}/{id}{suffix}: {error}")); }
+            }
+        }
+    }
+    if errors.is_empty() { Ok(()) } else { Err(errors.join("；")) }
 }
 
 /// 扫描本机 auth 文件（F-04 导入预览；不写盘）
@@ -404,6 +488,7 @@ fn merge_auth_entry(pool: &mut WbPool, m: AuthMerge) -> String {
         a.refresh_token_expires_at = m.refresh_token_expires_at;
         a.auth_saved_at = Some(chrono::Utc::now().timestamp());
         a.needs_relogin = false;
+        a.relogin_reason.clear();
         a.id.clone()
     } else {
         let id = m.id.clone();
@@ -458,7 +543,7 @@ pub fn workbuddy_account_import_auth(state: State<AppState>, name: Option<String
                     &raw,
                     &["expiresAtMs", "expires_at_ms", "expiresAt", "expires_in_ms", "accessTokenExpiresAtMs"],
                 )),
-                refresh_token_expires_at: as_ts_seconds(fs_utils::dig(&raw, &["refreshExpiresAt", "refresh_expires_at"])),
+                refresh_token_expires_at: as_ts_seconds(fs_utils::dig(&raw, &["refreshExpiresAtMs", "refreshExpiresAt", "refresh_expires_at"])),
             },
         );
         save_pool(&state, &pool)?;
@@ -476,6 +561,9 @@ pub fn workbuddy_account_import_auth(state: State<AppState>, name: Option<String
             &["expiresAtMs", "expires_at_ms", "expiresAt", "expires_in_ms", "accessTokenExpiresAtMs"],
         ))
         .map(|s| s * 1000),
+        "refresh_expires_at_ms": as_ts_seconds(fs_utils::dig(
+            &raw, &["refreshExpiresAtMs", "refreshExpiresAt", "refresh_expires_at"],
+        )).map(|s| s * 1000),
         "uid": uid,
         "domain": as_str(fs_utils::dig(&raw, &["domain"])),
     });
@@ -573,143 +661,26 @@ pub fn workbuddy_refresh_token(
     user_id: String,
     force: Option<bool>,
 ) -> Result<String, String> {
-    // 每账号续期互斥（审查 P1）：并发触发同一账号续期时后到者直接拒绝，
-    // 避免双请求交错回写 token store / 账号池造成凭证覆盖竞态
-    let acct_lock = {
-        let mut table = wb_renew_locks()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        table
-            .entry(user_id.clone())
-            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-    };
-    let _renew_guard = acct_lock
-        .try_lock()
-        .map_err(|_| "该账号正在续期中，请等待当前续期完成后再试".to_string())?;
-
-    // 只读快照取账号（clone）：网络续期期间不持池副本（原实现持有旧副本跨 30s
-    // 网络，写回会整体抹掉窗口内的导入/删除/其他回写——lost-update）
-    let acct = {
-        let pool = load_pool(&state);
-        pool.accounts
-            .iter()
-            .find(|a| a.id == user_id)
-            .ok_or_else(|| format!("账号不存在: {user_id}"))?
-            .clone()
-    };
-
-    // 惰性续期门（force=false 时生效）：判定抽为纯函数 lazy_renew_skippable。
-    // expires_at 缺失时放行（无法判定就续一次，顺带拿到准确的 expiresIn）。
-    if !force.unwrap_or(false)
-        && lazy_renew_skippable(acct.access_token_expires_at, chrono::Utc::now().timestamp())
+    let acct = load_pool(&state).accounts.into_iter().find(|account| account.id == user_id)
+        .ok_or_else(|| format!("账号不存在: {user_id}"))?;
+    let creds = crate::tasks::wb_common::effective_creds(&state, &user_id, &acct.uid);
+    let agent = crate::tasks::http_agent(30);
+    let mode = if force.unwrap_or(false) { crate::tasks::wb_session::RefreshMode::Force }
+        else { crate::tasks::wb_session::RefreshMode::Due(24) };
+    let (new, refreshed) = crate::tasks::wb_session::refresh(&state.data_dir, &user_id, &creds, mode, &agent)
+        .map_err(|error| error.message())?;
+    if !refreshed { return Ok("凭证有效，无需续期（未联网验证）".into()); }
     {
-        let remaining = acct.access_token_expires_at.unwrap_or_default() - chrono::Utc::now().timestamp();
-        return Err(format!(
-            "凭证剩余有效期 {:.1} 小时，暂无需续期（如需立即续期请使用手动续期）",
-            remaining as f64 / 3600.0
-        ));
-    }
-
-    // 双源取值「谁新用谁」（审查 P1）：token store 副本与桌面 auth 文件都可能被更新
-    // （客户端运行时刷新 auth 文件，工具侧续期刷新 token store）。分别解析两源的
-    // refresh 到期时间（as_ts_seconds 统一归一为秒：整数毫秒/秒与 RFC3339 字符串均可），
-    // 取到期更晚的一源作为生效 refresh_token；无到期信息的源视为 0（最旧），
-    // 同新/均无到期时优先工具侧 store 副本（保持原有语义）。
-    // auth 文件仅在 uid 与本账号匹配时采信，防止把客户端当前登录的其他账号 token 串号。
-    let store: serde_json::Value = crate::tasks::wb_common::load_token_store(&state);
-    let rec = store.get("tokens").and_then(|t| t.get(&acct.id)).cloned().unwrap_or_default();
-    let store_cand = (
-        as_str(fs_utils::dig(&rec, &["refresh_token"])),
-        as_ts_seconds(fs_utils::dig(&rec, &["refresh_expires_at_ms", "refreshExpiresAt", "refresh_expires_at"]))
-            .or_else(|| as_ts_seconds(fs_utils::dig(&rec, &["expires_at_ms"]))),
-    );
-    let auth_raw = fs_utils::read_json::<serde_json::Value>(&auth_file_path_of(&state));
-    let auth_cand = {
-        let fuid = as_str(fs_utils::dig(&auth_raw, &["uid"]));
-        if fuid.as_deref() == Some(acct.uid.as_str()) && !acct.uid.is_empty() {
-            (
-                // 5.8.2+ auth 文件 refreshToken 为加密包装，透明解密后参与新旧取源比较
-                dig_plain_string(&auth_raw, &["refreshToken", "refresh_token"]),
-                as_ts_seconds(fs_utils::dig(&auth_raw, &["refreshExpiresAt", "refresh_expires_at"]))
-                    .or_else(|| as_ts_seconds(fs_utils::dig(&auth_raw, &["expiresAtMs", "expiresAt"]))),
-            )
-        } else {
-            (None, None)
-        }
-    };
-    let pick_newer = |a: &(Option<String>, Option<i64>), b: &(Option<String>, Option<i64>)| -> Option<String> {
-        let a_tok = a.0.as_deref().filter(|t| !t.is_empty());
-        let b_tok = b.0.as_deref().filter(|t| !t.is_empty());
-        match (a_tok, b_tok) {
-            (Some(x), Some(y)) => {
-                if b.1.unwrap_or(0) > a.1.unwrap_or(0) {
-                    Some(y.to_string())
-                } else {
-                    Some(x.to_string())
-                }
-            }
-            (Some(x), None) => Some(x.to_string()),
-            (None, Some(y)) => Some(y.to_string()),
-            (None, None) => None,
-        }
-    };
-    let refresh = pick_newer(&store_cand, &auth_cand)
-        .ok_or("该账号无 refreshToken（不可刷新，需重新登录）")?;
-    if refresh.is_empty() {
-        return Err("该账号 refreshToken 为空（不可刷新，需重新登录）".into());
-    }
-
-    // 红线：X-Refresh-Token 仅出现在 refresh 端点；30s 超时（审查 P2，与其余 ureq 调用点一致）
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(30))
-        .build();
-    let resp = agent
-        .post("https://www.codebuddy.cn/v2/plugin/auth/token/refresh")
-        .set("Authorization", "Bearer")
-        .set("User-Agent", crate::tasks::wb_common::WB_DESKTOP_UA)
-        .set("X-Refresh-Token", &refresh)
-        .set("X-Auth-Refresh-Source", "workbuddy")
-        .set("Content-Type", "application/json")
-        .send_string("{}");
-    let body: serde_json::Value = match resp {
-        Ok(r) => r.into_json().unwrap_or_default(),
-        Err(ureq::Error::Status(code, r)) => {
-            let _ = r;
-            return Err(format!("刷新失败（HTTP {code}）：refresh token 可能已失效，需重新登录"));
-        }
-        Err(e) => return Err(format!("刷新请求失败: {e}")),
-    };
-    let new_access = as_str(fs_utils::dig(&body, &["accessToken"])).ok_or("刷新响应中无 accessToken")?;
-    let new_refresh = as_str(fs_utils::dig(&body, &["refreshToken"]));
-    let expires_in: Option<i64> = fs_utils::dig(&body, &["expiresIn"]).and_then(|v| v.as_i64());
-    let refresh_expires_in: Option<i64> = fs_utils::dig(&body, &["refreshExpiresIn"]).and_then(|v| v.as_i64());
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let exp_ms = expires_in.map(|s| now_ms + s * 1000);
-    let rexp_ms = refresh_expires_in.map(|s| now_ms + s * 1000);
-
-    // 回写工具侧副本 + 账号池过期时间
-    let creds = serde_json::json!({
-        "access_token": new_access,
-        "refresh_token": new_refresh,
-        "expires_at_ms": exp_ms,
-        "refresh_expires_at_ms": rexp_ms,
-    });
-    upsert_token_store(&state, &acct.id, &creds)?;
-    // 短临界区写回：重读最新池 → 按 id 更新仍存在的账号；窗口内账号已被删除
-    // 则跳过池回写（token store 副本已更新，删除方本就不保留该账号）
-    {
-        let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _pool_guard = state.wb_pool_lock.lock().unwrap_or_else(|error| error.into_inner());
         let mut pool = load_pool(&state);
-        if let Some(a) = pool.accounts.iter_mut().find(|a| a.id == acct.id) {
-            a.access_token_expires_at = exp_ms.map(|m| m / 1000);
-            a.refresh_token_expires_at = rexp_ms.map(|m| m / 1000);
-            a.needs_relogin = false;
-            a.relogin_reason.clear();
+        if let Some(account) = pool.accounts.iter_mut().find(|account| account.id == user_id) {
+            account.access_token_expires_at = new.expires_at_ms.map(|expiry| expiry / 1000);
+            account.refresh_token_expires_at = new.refresh_expires_at_ms.map(|expiry| expiry / 1000);
+            account.needs_relogin = false;
+            account.relogin_reason.clear();
             save_pool(&state, &pool)?;
         }
     }
-    fs_utils::app_log(&state.data_dir, &format!("WorkBuddy 凭证续期成功: {}", acct.id));
     Ok("凭证已续期".into())
 }
 
@@ -731,21 +702,15 @@ fn lazy_renew_skippable(access_token_expires_at: Option<i64>, now_ts: i64) -> bo
 /// 仅纳入有工具侧凭证副本的账号（auth 文件为只读态，不在此兜底）。
 pub(crate) fn wb_upstream_accounts(state: &AppState) -> Vec<crate::api_server::pool::WbSyncAccount> {
     let pool = load_pool(state);
-    let store: serde_json::Value = crate::tasks::wb_common::load_token_store(state);
-    let tokens = store
-        .get("tokens")
-        .and_then(|t| t.as_object())
-        .cloned()
-        .unwrap_or_default();
     let mut out = Vec::new();
     for a in &pool.accounts {
-        let rec = tokens.get(&a.id).cloned().unwrap_or_default();
-        let token = as_str(fs_utils::dig(&rec, &["access_token"])).unwrap_or_default();
+        let creds = crate::tasks::wb_common::stored_creds(&state.data_dir, &a.id);
+        let token = creds.access_token;
         if token.is_empty() {
             continue;
         }
-        let domain = as_str(fs_utils::dig(&rec, &["domain"])).unwrap_or_default();
-        let eid = as_str(fs_utils::dig(&rec, &["enterprise_id", "enterpriseId"])).unwrap_or_default();
+        let domain = creds.domain;
+        let eid = creds.enterprise_id;
         out.push(crate::api_server::pool::WbSyncAccount {
             uid: a.id.clone(),
             name: if a.nickname.is_empty() { a.id.clone() } else { a.nickname.clone() },
@@ -762,7 +727,7 @@ pub(crate) fn wb_upstream_accounts(state: &AppState) -> Vec<crate::api_server::p
                 .credits_fetched_at
                 .as_deref()
                 .and_then(crate::fs_utils::parse_ts_loose),
-            needs_relogin: a.needs_relogin,
+            needs_relogin: a.needs_relogin || crate::tasks::wb_session::health(&state.data_dir, &a.id).status == "auth_required",
             group_id: a.group_id.clone(),
         });
     }
@@ -966,13 +931,22 @@ pub fn workbuddy_accounts_import(
     // 凭证统一落库逐条聚合：单条失败不中断（账号已入池，重新导入可补齐）
     for (final_id, rec) in cred_writes {
         match upsert_token_store(&state, &final_id, &rec) {
-            Ok(()) => with_cred += 1,
+            Ok(()) => {
+                with_cred += 1;
+                if !crate::tasks::wb_common::creds_of(&rec).access_token.is_empty() {
+                    if let Some(account) = pool.accounts.iter_mut().find(|account| account.id == final_id) {
+                        account.needs_relogin = false;
+                        account.relogin_reason.clear();
+                    }
+                }
+            }
             Err(e) => rejected.push(serde_json::json!({
                 "id": final_id,
                 "reason": format!("账号已入池，但凭证落库失败：{e}（重新导入可补齐）"),
             })),
         }
     }
+    save_pool(&state, &pool)?;
     fs_utils::app_log(
         &state.data_dir,
         &format!("workbuddy: 账号库导入 新增 {added} / 更新 {updated} / 带凭证 {with_cred} / 拒绝 {} / 标签绑定恢复 {tags_restored}（未知标签忽略 {tags_ignored}）", rejected.len()),
@@ -989,12 +963,14 @@ pub fn workbuddy_accounts_import(
 #[cfg(test)]
 mod tests {
     use super::{
-        as_str, as_ts_seconds, extract_access_token, lazy_renew_skippable, merge_auth_entry,
-        uid_from_snapshot_slot, AuthMerge, WorkBuddyAccount, WbPool,
+        accounts_list_inner, as_str, as_ts_seconds, extract_access_token, lazy_renew_skippable,
+        merge_auth_entry, save_pool, uid_from_snapshot_slot, AuthMerge, WorkBuddyAccount, WbPool,
     };
     // auth_key_names 仅测试直用（非测试代码已改经 extract_access_token 间接引用）
     use super::super::common::auth_key_names;
     use crate::fs_utils;
+    use crate::state::AppState;
+    use std::sync::{Arc, Mutex};
 
     fn entry(id: &str, uid: &str, nickname: &str) -> WorkBuddyAccount {
         WorkBuddyAccount {
@@ -1003,6 +979,115 @@ mod tests {
             nickname: nickname.into(),
             ..Default::default()
         }
+    }
+
+    /// 临时 AppState（独立 SQLite/KV；调用方清理目录）
+    fn tmp_state(tag: &str) -> AppState {
+        let d = std::env::temp_dir().join(format!("wb_accounts_view_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("data")).unwrap();
+        std::fs::create_dir_all(d.join("conf")).unwrap();
+        std::fs::create_dir_all(d.join("logs")).unwrap();
+        AppState {
+            data_dir: d,
+            jwt_refresh_lock: Arc::new(Mutex::new(())),
+            qoder_pool_lock: Arc::new(Mutex::new(())),
+            wb_pool_lock: Arc::new(Mutex::new(())),
+            doubao_pool_lock: Arc::new(Mutex::new(())),
+            group_defs_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    #[test]
+    fn managed_cleanup_includes_rollbacks_chats_and_matching_marker_only() {
+        let state = tmp_state("cleanup");
+        for root in ["profiles_workbuddy", "profiles_codebuddy", "workbuddy_chats", "codebuddy_chats"] {
+            for suffix in ["", ".bak", ".bak2"] {
+                std::fs::create_dir_all(state.data_dir.join("data").join(root).join(format!("wb-test{suffix}"))).unwrap();
+            }
+            std::fs::create_dir_all(state.data_dir.join("data").join(root).join("wb-other")).unwrap();
+        }
+        let profiles = state.data_dir.join("data").join("profiles_workbuddy");
+        std::fs::write(profiles.join("current_account.txt"), "wb-test").unwrap();
+        let other_profiles = state.data_dir.join("data").join("profiles_codebuddy");
+        std::fs::write(other_profiles.join("current_account.txt"), "wb-other").unwrap();
+        super::clean_managed_account_files(&state.data_dir, "wb-test").unwrap();
+        super::clean_managed_account_files(&state.data_dir, "wb-test").unwrap();
+        assert!(!profiles.join("wb-test.bak2").exists());
+        assert!(!profiles.join("current_account.txt").exists());
+        assert!(other_profiles.join("current_account.txt").exists());
+        assert!(profiles.join("wb-other").exists());
+        assert!(super::clean_managed_account_files(&state.data_dir, "../escape").is_err());
+        let _ = std::fs::remove_dir_all(&state.data_dir);
+    }
+
+    #[test]
+    fn upstream_rejects_conflicting_identity_and_deleted_credentials() {
+        let state = tmp_state("upstream_identity");
+        save_pool(&state, &WbPool { accounts: vec![entry("wb-test", "uid-a", "A")] }).unwrap();
+        let db = crate::store::db(&state.data_dir);
+        crate::store::docs::wb_token_store_upsert(&db, "wb-test", &serde_json::json!({"uid": "uid-b", "access_token": "synthetic-b"})).unwrap();
+        assert!(super::wb_upstream_accounts(&state).is_empty());
+        assert!(crate::tasks::wb_common::stored_creds(&state.data_dir, "wb-test").access_token.is_empty());
+        crate::store::docs::wb_token_store_upsert(&db, "wb-test", &serde_json::json!({"access_token": "synthetic-a"})).unwrap();
+        assert_eq!(super::wb_upstream_accounts(&state)[0].token, "synthetic-a");
+        assert_eq!(crate::tasks::wb_common::stored_creds(&state.data_dir, "wb-test").uid, "uid-a");
+        save_pool(&state, &WbPool::default()).unwrap();
+        assert!(crate::tasks::wb_common::stored_creds(&state.data_dir, "wb-test").access_token.is_empty());
+        let _ = std::fs::remove_dir_all(&state.data_dir);
+    }
+
+    #[test]
+    fn deleted_account_rejects_late_refresh_and_import_writes() {
+        let state = tmp_state("deleted_write");
+        let creds = crate::tasks::wb_common::Creds { access_token: "synthetic-late".into(), ..Default::default() };
+        assert!(crate::tasks::wb_common::save_token_store(&state, "gone", &creds).is_err());
+        assert!(super::upsert_token_store(&state, "gone", &serde_json::json!({"access_token": "synthetic-late"})).is_err());
+        assert!(crate::store::db(&state.data_dir).row_get("wb_tokens", "gone").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&state.data_dir);
+    }
+
+    /// 列表视图必须透出积分到期字段：账号列表「积分到期」列依赖该字段，
+    /// 回归防止 WorkBuddyAccountView 再次漏掉 credits_expire_at。
+    #[test]
+    fn accounts_view_exposes_credits_expire_at() {
+        let state = tmp_state("credits_expire");
+        let mut acc = entry("wb-expire000001", "u-expire", "积分到期");
+        acc.credits_balance = Some(2100.0);
+        acc.credits_expire_at = Some(1_794_921_410); // 2026-11-17 21:16:50（UTC+8）
+        save_pool(&state, &WbPool { accounts: vec![acc] }).unwrap();
+
+        let views = accounts_list_inner(&state).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].credits_balance, Some(2100.0));
+        assert_eq!(views[0].credits_expire_at, Some(1_794_921_410));
+        let json = serde_json::to_value(&views[0]).unwrap();
+        assert_eq!(
+            json.get("credits_expire_at").and_then(|v| v.as_i64()),
+            Some(1_794_921_410)
+        );
+        let _ = std::fs::remove_dir_all(&state.data_dir);
+    }
+
+    /// 需重登（登录态失效）账号不展示历史余额/到期：陈旧值无法刷新，作为实时值
+    /// 展示会误导（用户实测「积分不对」根因）。仅视图层置空，池内存储值保留，
+    /// 重登成功后由积分刷新链路回填恢复。
+    #[test]
+    fn accounts_view_blanks_stale_credits_when_needs_relogin() {
+        let state = tmp_state("needs_relogin_blank");
+        let mut acc = entry("wb-stale0000001", "u-stale", "需重登");
+        acc.credits_balance = Some(2492.67);
+        acc.credits_expire_at = Some(1_794_793_707);
+        acc.needs_relogin = true;
+        save_pool(&state, &WbPool { accounts: vec![acc] }).unwrap();
+
+        let views = accounts_list_inner(&state).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].credits_balance, None);
+        assert_eq!(views[0].credits_expire_at, None);
+        // 池内存储值不被清空（重登后仍可恢复）
+        assert_eq!(super::load_pool(&state).accounts[0].credits_balance, Some(2492.67));
+        let _ = std::fs::remove_dir_all(&state.data_dir);
     }
 
     /// 建一个临时快照槽根目录（调用方负责清理）
@@ -1094,12 +1179,16 @@ mod tests {
     #[test]
     fn merge_same_uid_new_token_updates_and_keeps_old_id() {
         let mut pool = WbPool { accounts: vec![entry("wb-oldoldoldold", "u1", "old")] };
+        pool.accounts[0].needs_relogin = true;
+        pool.accounts[0].relogin_reason = "old failure".into();
         let target_id = merge_auth_entry(&mut pool, auth_merge("wb-newnewnewnew", "u1", Some(456)));
         assert_eq!(pool.accounts.len(), 1);
         assert_eq!(pool.accounts[0].id, "wb-oldoldoldold"); // 保留旧 id：快照/分组引用不悬空
         assert_eq!(target_id, "wb-oldoldoldold"); // 凭证副本须写回旧 id 名下
         assert_eq!(pool.accounts[0].uid, "u1");
         assert_eq!(pool.accounts[0].access_token_expires_at, Some(456));
+        assert!(!pool.accounts[0].needs_relogin);
+        assert!(pool.accounts[0].relogin_reason.is_empty());
     }
 
     /// 新 uid（新账号）：新增条目，沿用传入 id

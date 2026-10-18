@@ -889,7 +889,7 @@ fn run_wb_stream(
                                         // 他方进程刷新中（≠真实刷新失败）：本轮直接换号，不走
                                         // classify_error→note_error，防瞬时忙态误置 disabled；
                                         // 对方刷新结果由下轮请求持锁双检/stale 对比复用
-                                        if e == wb_upstream::ERR_PEER_REFRESHING {
+                                        if e == wb_upstream::ERR_PEER_REFRESHING || e.starts_with(wb_upstream::ERR_REFRESH_TRANSIENT) {
                                             break;
                                         }
                                     }
@@ -1255,7 +1255,7 @@ pub async fn wb_aggregate_chat(
                                                 Some(format!("wb refresh uid={} err={}", picked.uid, e));
                                             // 他方进程刷新中：本轮换号且不走 note_error（防瞬时
                                             // 忙态误置 disabled），对方刷新结果由下轮请求复用
-                                            if e == wb_upstream::ERR_PEER_REFRESHING {
+                                            if e == wb_upstream::ERR_PEER_REFRESHING || e.starts_with(wb_upstream::ERR_REFRESH_TRANSIENT) {
                                                 break;
                                             }
                                         }
@@ -1658,7 +1658,7 @@ pub async fn wb_tool_exec_chat(
                                             // 他方进程刷新中：以 Err 收束本轮 outcome（跳过
                                             // classify_error→note_error 防误置 disabled），外层
                                             // 换号重试；对方刷新结果由下轮请求持锁双检复用
-                                            if e == wb_upstream::ERR_PEER_REFRESHING {
+                                            if e == wb_upstream::ERR_PEER_REFRESHING || e.starts_with(wb_upstream::ERR_REFRESH_TRANSIENT) {
                                                 break Err(format!(
                                                     "wb-toolexec refresh uid={} 他方进程正在刷新，本轮换号",
                                                     picked.uid

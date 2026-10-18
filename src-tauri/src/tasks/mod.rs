@@ -34,6 +34,10 @@ pub mod wb_checkin;
 pub mod wb_common;
 pub mod wb_credits;
 pub mod wb_report;
+pub mod wb_session;
+
+#[cfg(all(test, windows))]
+pub(crate) mod buddy_live_support;
 
 use crate::state::AppState;
 
@@ -95,7 +99,7 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
             &mut print_progress,
         )),
         // WorkBuddy 每周兜底续期（对齐 python --renew-only，lazy 24h）
-        "wb-renew" => Ok(wb_checkin::run_renew_only(state, 24)),
+        "wb-renew" => wb_checkin::run_renew_only(state, 24),
         // WorkBuddy 每日成长（任务配置页；调度器/CLI 共用，成长三开关驱动）
         "wb-growth" => {
             let s = crate::commands::workbuddy::load_settings(state);

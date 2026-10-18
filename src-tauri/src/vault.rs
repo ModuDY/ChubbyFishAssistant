@@ -272,7 +272,13 @@ pub fn ns_set(data_dir: &Path, ns: &str, key: &str, v: &serde_json::Value) -> Re
 
 /// 删除命名空间凭证（失败仅日志，不阻断上层删除流程——残留加密记录无碍安全）
 pub fn ns_remove(data_dir: &Path, ns: &str, key: &str) {
-    let result = with_open(data_dir, |sh| {
+    if let Err(error) = ns_remove_strict(data_dir, ns, key) {
+        fs_utils::app_log(data_dir, &format!("vault: 删除 {ns}:{key} 凭证失败: {error}"));
+    }
+}
+
+pub fn ns_remove_strict(data_dir: &Path, ns: &str, key: &str) -> Result<(), String> {
+    with_open(data_dir, |sh| {
         let client = sh
             .get_client(CLIENT_PATH.to_vec())
             .map_err(|e| format!("获取 vault client 失败: {e}"))?;
@@ -281,10 +287,7 @@ pub fn ns_remove(data_dir: &Path, ns: &str, key: &str) {
             .delete(&ns_vault_key(ns, key))
             .map_err(|e| format!("vault 删除失败: {e}"))?;
         sh.save().map_err(|e| format!("vault 快照落盘失败: {e}"))
-    });
-    if let Err(e) = result {
-        fs_utils::app_log(data_dir, &format!("vault: 删除 {ns}:{key} 凭证失败（残留加密记录无碍安全）: {e}"));
-    }
+    })
 }
 
 // ---------------- 公共 API ----------------

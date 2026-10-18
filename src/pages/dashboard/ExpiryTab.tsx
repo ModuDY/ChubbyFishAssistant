@@ -80,7 +80,7 @@ export default function ExpiryTab({
     if (scope === 'buddy') {
       for (const a of wbCredits?.accounts ?? []) {
         // 积分包数与 KPI「积分包总数」口径对齐：只计剩余 > 0 的包（已用完不计，审查遗留修复）
-        const activePkgs = (a.packages ?? []).filter((p) => p.remaining > 0);
+        const activePkgs = (a.packages ?? []).filter((p) => p.remaining != null && p.remaining > 0);
         const expires = activePkgs
           .filter((p) => p.expire_ts != null && p.expire_ts > 0)
           .map((p) => p.expire_ts as number);
@@ -197,13 +197,13 @@ export default function ExpiryTab({
       for (const acc of wbCredits?.accounts ?? []) {
         for (const pkg of acc.packages ?? []) {
           // 剩余积分为 0 的包（已用完）无到期提醒价值，过滤不展示
-          if (pkg.remaining <= 0) continue;
+          if (pkg.remaining == null || pkg.remaining <= 0) continue;
           items.push({
             key: `buddy-${acc.user_id}-${pkg.name}-${pkg.expire_ts ?? 0}`,
             label: `Buddy · ${acc.name} · ${pkg.name}`,
             kind: '积分包',
             expire_ts: pkg.expire_ts,
-            note: `剩余 ${pkg.remaining.toFixed(2)} / ${(pkg.total ?? 0).toFixed(2)}`,
+            note: `剩余 ${pkg.remaining.toFixed(2)} / ${pkg.total?.toFixed(2) ?? '未知'}`,
           });
         }
       }
@@ -297,7 +297,7 @@ export default function ExpiryTab({
                 <th className="px-4 py-2 text-right" title="Trae = 积分包 + 会员包计数；Buddy/Qoder = 剩余 > 0 的包数（与 KPI 口径一致）">
                   积分包
                 </th>
-                <th className="px-4 py-2 text-right">最近到期</th>
+                <th className="px-4 py-2 text-right" title="最近一个仍有剩余的积分包到期日（非全部积分到期日；长期有效包不计入）">最近到期</th>
                 <th className="px-4 py-2 text-left">状态</th>
               </tr>
             </thead>

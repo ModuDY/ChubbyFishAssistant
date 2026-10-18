@@ -391,15 +391,14 @@ pub(super) fn upsert_token_store(state: &AppState, id: &str, creds: &serde_json:
     let _table =
         crate::tasks::wb_common::WB_TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // 凭证收敛（P0-1）：读走 secure 回填，写走 secure 占位（敏感字段进 vault，DB 不落明文）
-    let existing = crate::tasks::wb_common::token_store_load_secure(&state.data_dir);
-    let mut rec = existing
-        .get("tokens")
-        .and_then(|t| t.get(id))
-        .cloned()
-        .unwrap_or(serde_json::json!({}));
+    if crate::store::db(&state.data_dir).row_get("wb_accounts", id)?.is_none() {
+        return Err("账号已删除，拒绝写回凭证".into());
+    }
+    let mut rec = crate::tasks::wb_common::token_record_secure(&state.data_dir, id);
+    if !rec.is_object() { rec = serde_json::json!({}); }
     if let Some(rm) = rec.as_object_mut() {
         for (k, v) in creds.as_object().unwrap_or(&serde_json::Map::new()) {
-            if !v.is_null() {
+            if !v.is_null() && !v.as_str().is_some_and(str::is_empty) {
                 rm.insert(k.clone(), v.clone());
             }
         }
@@ -413,14 +412,6 @@ pub(super) fn upsert_token_store(state: &AppState, id: &str, creds: &serde_json:
 /// 每账号续期互斥（审查 P1）：外层 std Mutex 只保护锁表本身（短临界区），
 /// 内层 tokio Mutex 才是账号级互斥——try_lock 拿不到即拒绝，不排队不阻塞。
 /// 锁表用 OnceLock 惰性初始化（HashMap::new 非 const，无法直接用于 static）。
-pub(super) fn wb_renew_locks(
-) -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>> {
-    static LOCKS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
-    > = std::sync::OnceLock::new();
-    LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
 // ── CLI settings.json 回滚（审查 P2 原子写）────────────────────────────────
 
 /// 回滚 settings.json 到写入前原文（审查 P2 原子写）：

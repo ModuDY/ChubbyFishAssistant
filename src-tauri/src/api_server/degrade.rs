@@ -55,6 +55,40 @@ pub fn clear() {
     *until = 0;
 }
 
+/// 降级期内短路：把出站体直接换成中性提示词，省掉「先撞一次 400」。
+///
+/// 此前 `active()` **没有任何调用方**——降级期只被记录、不被使用，于是降级期内
+/// 每个请求都仍带着触发拦截的那段 system 指纹先撞一次 400，拿到审核文案才降级
+/// 重试。上游是逐字匹配，这段指纹在降级期内必然还在，那一次往返与一次账号级
+/// 错误计次纯属白付（降级期的意义因此折损一半）。
+///
+/// 纯逻辑（不读全局态），便于测试直接覆盖三种组合。
+pub fn pre_apply(enabled: bool, degraded: bool, body: &[u8]) -> Option<Vec<u8>> {
+    if enabled && degraded {
+        Some(super::prompt::apply_degraded_system(body))
+    } else {
+        None
+    }
+}
+
+/// `pre_apply` 的热路径包装：读开关原子量与当前降级状态。
+///
+/// 返回 true 表示本请求已按降级发首包——调用方据此把「每请求一次降级重试」
+/// 标记为已用：内容已是中性，命中拦截后再换成中性重发一次不会有任何变化。
+pub fn pre_apply_if_active(enabled: &std::sync::atomic::AtomicBool, body: &mut Vec<u8>) -> bool {
+    match pre_apply(
+        enabled.load(std::sync::atomic::Ordering::Relaxed),
+        active(),
+        body,
+    ) {
+        Some(rewritten) => {
+            *body = rewritten;
+            true
+        }
+        None => false,
+    }
+}
+
 /// `now` 之后最近的一次 Asia/Shanghai 00:00（Unix 秒）。
 ///
 /// 用固定 +08:00 偏移计算，不依赖系统时区配置（容器/宿主机时区不确定）。
