@@ -2,7 +2,7 @@
 
 <img src="build-assets/app-icon.png" alt="大肥鱼助手" width="128" />
 
-# 大肥鱼助手（AI Work Assistant）
+# 大肥鱼助手（ChubbyFishAssistant）
 
 Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 18 + Rust
 

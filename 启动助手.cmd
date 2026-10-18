@@ -28,7 +28,7 @@ if defined RUNNING (
   echo.
   echo [WARN] Sources are newer than the built program, so it must be rebuilt.
   echo        A running instance is holding the exe. Please close
-  echo        "AI Work Assistant" first, then run this file again.
+  echo        "ChubbyFishAssistant" first, then run this file again.
   echo.
   pause
   exit /b 1
@@ -73,12 +73,12 @@ echo.
 
 :launch
 if defined RUNNING (
-  echo AI Work Assistant is already running. Nothing to do.
+  echo ChubbyFishAssistant is already running. Nothing to do.
   ping -n 4 127.0.0.1 >nul
   exit /b 0
 )
 
-echo Starting AI Work Assistant...
+echo Starting ChubbyFishAssistant...
 rem 直接 start 拉起（GUI 子系统，无控制台窗口；不再绕 powershell，省一次进程创建与窗口闪烁）
 start "" "%EXE%"
 exit /b 0

@@ -4,6 +4,11 @@ import { promo_banner_base64 as promoBanner } from '../assets/promo-banner.base6
 
 /** 应用品牌与关于信息（集中管理，改名只改这里；版本号不再硬编码——运行时经 getVersion() 读 Cargo.toml 单一来源） */
 export const APP_NAME = '大肥鱼助手';
+/**
+ * 英文名：用于关于页署名、仓库与发布说明。
+ * **不是** exe 名 / identifier / 数据目录——那些是持久化契约（见 AGENT.md 品牌命名约定）。
+ */
+export const APP_NAME_EN = 'ChubbyFishAssistant';
 export const APP_TAGLINE = '多账号签到与管理 · 一站式工作台';
 export const APP_OVERVIEW =
   'Windows 桌面端多账号签到与管理一站式工作台（Tauri 2 + React 18 + Rust）。' +

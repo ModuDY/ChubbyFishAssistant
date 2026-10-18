@@ -1,9 +1,10 @@
-# AGENT.md — 大肥鱼助手 (ai-work-assistant) v3.7.12
+# AGENT.md — 大肥鱼助手 / ChubbyFishAssistant (ai-work-assistant) v3.7.12
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 > 注：品牌已由 Trae Work Assistant 迁移为 **AI Work 助手（ai-work-assistant）**，2026-10 更名 **大肥鱼助手**；本机仓库目录暂为 `trae-work-assistant`，后续可整体重命名。
 >
-> **品牌命名约定（改名时必读）**：用户可见的品牌名统一为「大肥鱼助手」，集中在前端 `src/lib/about.ts` 的 `APP_NAME`、`src-tauri/tauri.conf.json` 的 `productName`/窗口 `title`/`publisher`、`index.html` 的 `<title>`、托盘 tooltip、`Cargo.toml` 的 `description`。
+> **品牌命名约定（改名时必读）**：中文名 **大肥鱼助手**，英文名 **ChubbyFishAssistant**。
+> 中文名集中在 `src/lib/about.ts` 的 `APP_NAME`、`src-tauri/tauri.conf.json` 的 `productName`/窗口 `title`/`publisher`、`index.html` 的 `<title>`、托盘 tooltip、`Cargo.toml` 的 `description`；英文名集中在 `APP_NAME_EN`（关于页署名、文档/发布说明），**不写进窗口标题与安装包名**。
 > **以下标识属于持久化契约，改名时必须保持原样**（改了就断数据/断升级）：`identifier`（`com.aiwork.assistant`）、数据目录 `%APPDATA%\AIWorkAssistant`、`mainBinaryName`（`ai-work-assistant`）、计划任务名 `AIWorkAssistant_DailyCheckin`、通知分组 `AIWorkAssistant`、CC Switch 条目 id `aiwork-*`、备份文件扩展名 `.aiwbak`。
 
 ## 1. 一句话

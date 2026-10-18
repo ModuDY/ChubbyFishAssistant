@@ -16,6 +16,7 @@ import petAvatar from '../assets/brand/pet-avatar.png';
 import type { UpdateCheckResult, UpdateDownloadProgress, UpdateDownloaded } from '../types';
 import {
   APP_NAME,
+  APP_NAME_EN,
   APP_TAGLINE,
   APP_OVERVIEW,
   APP_AUTHOR,
@@ -174,6 +175,9 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
                 )}
                 检查更新
               </button>
+            </div>
+            <div className="mt-0.5 text-[11px] font-medium tracking-wider text-slate-400 dark:text-zinc-500">
+              {APP_NAME_EN}
             </div>
             <div className="mt-0.5 text-xs text-slate-500 dark:text-zinc-400">{APP_TAGLINE}</div>
             {/* 更新状态行 */}
