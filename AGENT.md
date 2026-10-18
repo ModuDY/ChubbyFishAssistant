@@ -6,6 +6,8 @@
 > **品牌命名约定（改名时必读）**：中文名 **大肥鱼助手**，英文名 **ChubbyFishAssistant**。
 > 中文名集中在 `src/lib/about.ts` 的 `APP_NAME`、`src-tauri/tauri.conf.json` 的 `productName`/窗口 `title`/`publisher`、`index.html` 的 `<title>`、托盘 tooltip、`Cargo.toml` 的 `description`；英文名集中在 `APP_NAME_EN`（关于页署名、文档/发布说明），**不写进窗口标题与安装包名**。
 > **以下标识属于持久化契约，改名时必须保持原样**（改了就断数据/断升级）：`identifier`（`com.aiwork.assistant`）、数据目录 `%APPDATA%\AIWorkAssistant`、`mainBinaryName`（`ai-work-assistant`）、计划任务名 `AIWorkAssistant_DailyCheckin`、通知分组 `AIWorkAssistant`、CC Switch 条目 id `aiwork-*`、备份文件扩展名 `.aiwbak`。
+>
+> **图标素材**：`src-tauri/icons/` 由 `npx tauri icon <1024 png>` 生成（当前源图为透明底角色头部特写，取自桌宠素材首帧）；前端标题栏/关于页头像为 `src/assets/brand/pet-avatar.png`（同一构图 256px）。**改图标后必须 `touch src-tauri/build.rs` 再 build**——tauri-build 的 rerun-if-changed 不监听 icons 目录，否则 exe 内嵌的仍是旧图标。
 
 ## 1. 一句话
 
