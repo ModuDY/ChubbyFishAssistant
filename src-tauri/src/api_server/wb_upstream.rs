@@ -142,12 +142,30 @@ pub fn make_wb_request(c: &WbCreds, body: &[u8]) -> Result<Box<dyn Read + Send>,
         }
         Err(e) => {
             let s = format!("{}", e);
-            let detail = if s.contains("dns") || s.contains("resolve") || s.contains("name resolution") {
+            // 分层归类「传输错误」（与 make_qoder_request 逐字对齐）：
+            // 区分 DNS / 超时 / 连接被重置 / 证书校验 / TLS 握手，避免把
+            // 「连接被重置」误报成「TLS证书验证失败」（重置类错误串里含 "tls"）
+            let low = s.to_ascii_lowercase();
+            let detail = if low.contains("dns") || low.contains("resolve") || low.contains("name resolution") {
                 format!("DNS解析失败（{}），请检查网络: {}", c.chat_base(), e)
-            } else if s.contains("timed out") || s.contains("timeout") {
+            } else if low.contains("timed out") || low.contains("timeout") {
                 format!("连接超时（{} 10秒内未响应）: {}", c.chat_base(), e)
-            } else if s.contains("tls") || s.contains("certificate") || s.contains("ssl") {
+            } else if low.contains("aborted")
+                || low.contains("reset")
+                || low.contains("eof")
+                || low.contains("10054")
+                || s.contains("中止了一个已建立的连接")
+                || s.contains("远程主机强迫关闭")
+            {
+                format!("连接被重置（网络中断或被代理/安全软件打断），请检查网络或代理设置: {}", e)
+            } else if low.contains("certificate")
+                || low.contains("unknownissuer")
+                || low.contains("certnotvalid")
+                || low.contains("self-signed")
+            {
                 format!("TLS证书验证失败: {}", e)
+            } else if low.contains("tls") || low.contains("ssl") || low.contains("handshake") {
+                format!("TLS握手失败（连接未能建立，非证书问题）: {}", e)
             } else {
                 format!("传输错误: {}", e)
             };

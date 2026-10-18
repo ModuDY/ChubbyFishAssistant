@@ -2625,13 +2625,32 @@ fn make_upstream_request(
         }
         Err(e) => {
             let err_str = format!("{}", e);
-            // 区分 DNS 解析失败 / 连接超时 / TLS 错误，提供更精准的诊断
-            let detail = if err_str.contains("dns") || err_str.contains("resolve") || err_str.contains("name resolution") {
+            // 分层归类「传输错误」：区分 DNS / 超时 / 连接被重置 / 证书校验 /
+            // TLS 握手，避免把「连接被重置」误报成「TLS证书验证失败」误导排查
+            // （WSAECONNRESET 类错误串里含 "tls"）
+            let low = err_str.to_ascii_lowercase();
+            let detail = if low.contains("dns") || low.contains("resolve") || low.contains("name resolution") {
                 format!("DNS解析失败（{} 无法解析），请检查网络或代理设置: {}", AGENT_HOST, e)
-            } else if err_str.contains("timed out") || err_str.contains("timeout") {
+            } else if low.contains("timed out") || low.contains("timeout") {
                 format!("连接超时（{} 10秒内未响应），请检查网络连通性: {}", AGENT_HOST, e)
-            } else if err_str.contains("tls") || err_str.contains("certificate") || err_str.contains("ssl") {
+            } else if low.contains("aborted")
+                || low.contains("reset")
+                || low.contains("eof")
+                || low.contains("10054")
+                || err_str.contains("中止了一个已建立的连接")
+                || err_str.contains("远程主机强迫关闭")
+            {
+                // 连接被对端/中间层（代理、安全软件）重置，非证书问题
+                format!("连接被重置（网络中断或被代理/安全软件打断），请检查网络或代理设置: {}", e)
+            } else if low.contains("certificate")
+                || low.contains("unknownissuer")
+                || low.contains("certnotvalid")
+                || low.contains("self-signed")
+            {
                 format!("TLS证书验证失败: {}", e)
+            } else if low.contains("tls") || low.contains("ssl") || low.contains("handshake") {
+                // 其余 TLS 层失败：握手未完成，与「证书校验失败」区分
+                format!("TLS握手失败（连接未能建立，非证书问题）: {}", e)
             } else {
                 format!("传输错误: {}", e)
             };

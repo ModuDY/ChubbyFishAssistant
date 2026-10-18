@@ -1102,17 +1102,29 @@ pub fn make_qoder_request(
             Err((code, body_text, retry_after))
         }
         Err(e) => {
-            // 四分型传输错误（与 make_wb_request 逐字对齐，仅 host 换成 Qoder）
+            // 分层归类传输错误（与 make_wb_request 逐字对齐，仅 host 换成 Qoder）
             let s = format!("{}", e);
-            let detail = if s.contains("dns")
-                || s.contains("resolve")
-                || s.contains("name resolution")
-            {
+            let low = s.to_ascii_lowercase();
+            let detail = if low.contains("dns") || low.contains("resolve") || low.contains("name resolution") {
                 format!("DNS解析失败（{QODER_CHAT_HOST}），请检查网络: {}", e)
-            } else if s.contains("timed out") || s.contains("timeout") {
+            } else if low.contains("timed out") || low.contains("timeout") {
                 format!("连接超时（{QODER_CHAT_HOST} 10秒内未响应）: {}", e)
-            } else if s.contains("tls") || s.contains("certificate") || s.contains("ssl") {
+            } else if low.contains("aborted")
+                || low.contains("reset")
+                || low.contains("eof")
+                || low.contains("10054")
+                || s.contains("中止了一个已建立的连接")
+                || s.contains("远程主机强迫关闭")
+            {
+                format!("连接被重置（网络中断或被代理/安全软件打断），请检查网络或代理设置: {}", e)
+            } else if low.contains("certificate")
+                || low.contains("unknownissuer")
+                || low.contains("certnotvalid")
+                || low.contains("self-signed")
+            {
                 format!("TLS证书验证失败: {}", e)
+            } else if low.contains("tls") || low.contains("ssl") || low.contains("handshake") {
+                format!("TLS握手失败（连接未能建立，非证书问题）: {}", e)
             } else {
                 format!("传输错误: {}", e)
             };
