@@ -1,0 +1,13 @@
+{
+  "identifier": "pet",
+  "description": "桌宠窗口权限（验证期最小集）：仅保留拖拽与显隐，置顶/穿透等由 Rust 命令负责",
+  "windows": ["pet"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-hide",
+    "core:window:allow-show",
+    "core:window:allow-close",
+    "core:window:allow-set-focus"
+  ]
+}

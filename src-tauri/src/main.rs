@@ -1,5 +1,8 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// 亦对 debug 生效：双击 debug exe 时不再额外弹出控制台黑窗（GUI 首启体验与正式版一致）。
+// CLI 计划任务（--task-run）不受影响——GUI 子系统的 stdout 重定向与退出码均已实测正常，
+// 且所有运行日志仍写入 %APPDATA%\AIWorkAssistant\logs\app.log。
+#![windows_subsystem = "windows"]
 
 mod commands;
 mod backup;
@@ -142,6 +145,12 @@ fn main() {
         .manage(Mutex::new(Option::<commands::api_server::ApiServerRuntime>::None))
         .manage(commands::checkin::CheckinGuard(tokio::sync::Mutex::new(())))
         .invoke_handler(tauri::generate_handler![
+            // 桌宠渲染路线验证（P0，临时；见 commands/pet.rs 头部说明）
+            commands::pet::pet_probe_ready,
+            commands::pet::pet_probe_hide_and_restore,
+            commands::pet::pet_toggle,
+            commands::pet::pet_close,
+            commands::pet::pet_probe_report,
             commands::backup::backup_unlock,
             commands::backup::backup_action,
             commands::env::app_locate,

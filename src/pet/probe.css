@@ -1,0 +1,187 @@
+/* 桌宠验证页样式（P0 临时）
+   关键约束：整个页面必须是"全透明底"——任何背景色都会让透明窗口失效，
+   也就无法判断视频的透明通道到底有没有生效。 */
+
+html.pet-window,
+body.pet-window {
+  background: transparent !important;
+  overflow: hidden;
+}
+
+body.pet-window {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* 验证页容器：不加任何底色 */
+.probe-root {
+  position: fixed;
+  inset: 0;
+  background: transparent;
+  font-family: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  font-size: 11px;
+  color: #e5e7eb;
+}
+
+/* ---------- 舞台：视频 + 判定用背景 ---------- */
+.probe-stage {
+  position: absolute;
+  left: 0;
+  top: 0;
+  right: 0;
+  height: 210px;
+  overflow: hidden;
+}
+
+/* 三种背景用于肉眼判断透明：
+   checker 棋盘 = 透明处应透出棋盘；solid-* = 透明处应透出纯色而非黑框 */
+.probe-backdrop {
+  position: absolute;
+  inset: 0;
+}
+/* 无背景：此处若透出桌面/后面的窗口，说明窗口级透明真的生效 */
+.probe-backdrop.none {
+  background: transparent;
+}
+
+.probe-backdrop.checker {
+  background-image:
+    linear-gradient(45deg, #64748b 25%, transparent 25%),
+    linear-gradient(-45deg, #64748b 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #64748b 75%),
+    linear-gradient(-45deg, transparent 75%, #64748b 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+  background-color: #1e293b;
+}
+.probe-backdrop.magenta {
+  background: #ff00ff;
+}
+.probe-backdrop.dark {
+  background: #0b1220;
+}
+/* 半透明横条纹：用于识破"透明被替换成黑/白不透明底" */
+.probe-backdrop.stripes {
+  background: repeating-linear-gradient(90deg, #f43f5e 0 10px, #22d3ee 10px 20px);
+}
+
+.probe-video {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  /* 按宽度铺满舞台：素材为 640×360（16:9），窗口宽 340 → 高约 191，不裁切 */
+  width: 100%;
+  height: auto;
+  /* 不加背景色，否则覆盖视频透明区 */
+}
+
+/* 用 canvas 渲染的替代视图（逐帧定位时切到它） */
+.probe-canvas {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 100%;
+  height: auto;
+  image-rendering: pixelated;
+}
+
+/* ---------- 控制面板 ---------- */
+.probe-panel {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  top: 210px;
+  padding: 8px 10px;
+  box-sizing: border-box;
+  background: rgba(9, 11, 18, 0.92);
+  border-top: 1px solid rgba(148, 163, 184, 0.35);
+  overflow-y: auto;
+}
+
+.probe-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 6px;
+}
+
+.probe-btn {
+  padding: 3px 7px;
+  border-radius: 5px;
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  background: rgba(51, 65, 85, 0.75);
+  color: #e2e8f0;
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.probe-btn:hover {
+  background: rgba(71, 85, 105, 0.9);
+}
+.probe-btn.primary {
+  background: rgba(37, 99, 235, 0.85);
+  border-color: rgba(96, 165, 250, 0.6);
+}
+.probe-btn.active {
+  outline: 2px solid #38bdf8;
+}
+.probe-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.probe-label {
+  color: #94a3b8;
+  margin-right: 4px;
+}
+
+.probe-result {
+  margin: 4px 0 0;
+  padding: 5px 7px;
+  border-radius: 5px;
+  background: rgba(15, 23, 42, 0.9);
+  border-left: 3px solid #475569;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 10.5px;
+  line-height: 1.55;
+  color: #cbd5e1;
+}
+.probe-result.pass {
+  border-left-color: #22c55e;
+}
+.probe-result.fail {
+  border-left-color: #ef4444;
+}
+.probe-result.warn {
+  border-left-color: #f59e0b;
+}
+
+.probe-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 5px;
+}
+.probe-title {
+  font-weight: 600;
+  color: #f1f5f9;
+}
+.probe-fps {
+  color: #7dd3fc;
+  font-family: ui-monospace, Consolas, monospace;
+}
+
+/* 结论汇总 */
+.probe-verdict {
+  margin-top: 6px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgba(30, 41, 59, 0.95);
+  font-size: 11px;
+  line-height: 1.6;
+}
