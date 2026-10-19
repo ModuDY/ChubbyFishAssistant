@@ -518,6 +518,21 @@ export default function PetRoot() {
   // 气泡底边贴在角色头顶上方 8px（距底部 = 100 - top%）
   const bubbleBottom = hitBox ? `calc(${(100 - hitBox.top).toFixed(2)}% + 8px)` : '48%';
 
+  // 菜单落位：角色在窗口下半部，若仍从光标处向下展开会盖住角色。
+  // 故优先把菜单「翻到角色上方」悬浮（不遮挡桌宠）；上方确实放不下时，再回落为向下展开。
+  const MENU_W = 148;
+  const MENU_H = 146;
+  const charTopPct = hitBox ? Math.max(0, hitBox.top - 3) : 52;
+  const spaceAbovePx = (charTopPct / 100) * window.innerHeight;
+  const menuLeft = menu ? Math.max(4, Math.min(menu.x - 12, window.innerWidth - MENU_W)) : 4;
+  const menuStyle: CSSProperties =
+    spaceAbovePx >= MENU_H
+      ? { left: menuLeft, bottom: `calc(${(100 - charTopPct).toFixed(2)}% + 6px)` }
+      : {
+          left: menuLeft,
+          top: menu ? Math.max(4, Math.min(menu.y, window.innerHeight - MENU_H)) : 4,
+        };
+
   return (
     <div className={`pet-root ${dragging ? 'dragging' : ''}`} style={{ opacity }}>
       {/*
@@ -576,10 +591,7 @@ export default function PetRoot() {
         <div className="pet-menu-backdrop" onPointerDown={closeMenu} onContextMenu={(e) => e.preventDefault()}>
           <div
             className="pet-menu"
-            style={{
-              left: Math.max(4, Math.min(menu.x, window.innerWidth - 152)),
-              top: Math.max(4, Math.min(menu.y, window.innerHeight - 148)),
-            }}
+            style={menuStyle}
             onPointerDown={(e) => e.stopPropagation()}
           >
             <button type="button" onClick={runCheckin}>
