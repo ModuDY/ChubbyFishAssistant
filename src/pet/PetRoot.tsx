@@ -18,7 +18,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { api } from '../lib/tauri';
 import PetBubble from './PetBubble';
 import PetSprite, { MASK_COLS, MASK_ROWS, type SpriteBox } from './PetSprite';
-import { coreAction, makeTransient, raise } from './petState';
+import { coreAction, makeTransient, pickTransientAction, raise } from './petState';
 import type { PetCoreState, PetTransient } from './petState';
 import { pickLine } from './lines';
 import { usePetEvents } from './usePetEvents';
@@ -104,6 +104,8 @@ export default function PetRoot() {
   const [idleTick, setIdleTick] = useState(0);
   const [playKey, setPlayKey] = useState(0);
   const [bubble, setBubble] = useState<{ seq: number; text: string } | null>(null);
+  /** AI 气泡结束的时刻：之后 1.5s 内不再弹普通播报气泡，避免画面"一跳" */
+  const [sayEndAt, setSayEndAt] = useState(0);
   /** 右键菜单位置（网关运行态由 `gatewayRunning` 统一提供，见下） */
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   /**
@@ -137,6 +139,10 @@ export default function PetRoot() {
   /** 瞬态最新值：定时器里判断"是否正忙"，避免彩蛋打断正在播的动作 */
   const transientRef = useRef<PetTransient | null>(null);
   transientRef.current = transient;
+  /** 各动作实测时长（ms）缓存：key = actionId，用于瞬态兜底计时 */
+  const durationRef = useRef<Record<string, number>>({});
+  /** 当前正在播的动作 id（onDuration 回调里需要知道是哪个动作） */
+  const actionIdRef = useRef('');
   /** 拖拽中：拖拽期间不插播彩蛋 */
   const draggingRef = useRef(false);
   draggingRef.current = dragging;
@@ -184,7 +190,10 @@ export default function PetRoot() {
   const playTransient = useCallback(
     (kind: PetTransient['kind'], text?: string, actionOverride?: string) => {
       seqRef.current += 1;
-      const t = makeTransient(seqRef.current, kind, text, actionOverride);
+      const action = pickTransientAction(kind, actionOverride);
+      // 兜底时长按该素材的实测时长算（PetSprite loadedmetadata 上报），
+      // 否则 10s 的素材会在第 4s 被掐断
+      const t = makeTransient(seqRef.current, kind, action, text, durationRef.current[action]);
       setTransient(t);
       setPlayKey(t.seq);
       showBubble(t.text);
@@ -194,6 +203,12 @@ export default function PetRoot() {
     },
     [showBubble],
   );
+
+  /** 记录各动作的实测时长（ms），供上面的兜底计时器使用 */
+  const handleDuration = useCallback((ms: number) => {
+    const id = actionIdRef.current;
+    if (id && ms > 0) durationRef.current[id] = ms;
+  }, []);
 
   const enterSad = useCallback(
     (text?: string) => {
@@ -640,6 +655,7 @@ export default function PetRoot() {
 
   /* --------------------------- 播放调度 --------------------------- */
   const actionId = dragging ? 'drag-dangle' : (transient?.action ?? coreAction(core, idleTick));
+  actionIdRef.current = actionId;
 
   const onSpriteEnded = useCallback(() => {
     if (transient) {
@@ -665,6 +681,8 @@ export default function PetRoot() {
 
   // 气泡底边贴在角色头顶上方 8px（距底部 = 100 - top%）
   const bubbleBottom = hitBox ? `calc(${(100 - hitBox.top).toFixed(2)}% + 8px)` : '48%';
+  // AI 气泡比普通播报气泡再高 10px：两者切换时不会"原地跳"，也不会把角色头顶压住
+  const sayBubbleBottom = hitBox ? `calc(${(100 - hitBox.top).toFixed(2)}% + 18px)` : '52%';
 
   // 菜单落位：贴着角色**右侧**、垂直居中悬浮。
   // 窗口宽度 = 角色舞台 + 右侧 160px 留白（pet.css 的 --pet-menu-space），
@@ -714,20 +732,25 @@ export default function PetRoot() {
         onEnded={onSpriteEnded}
         onMeasure={handleMeasure}
         onMask={handleMask}
+        onDuration={handleDuration}
       />
       {/* 气泡锚点：底边贴在角色头顶上方，而不是窗口顶部 */}
       {bubbleEnabled && say ? (
         // AI 发言优先：流式中文本随 delta 增长（打字机），流结束后按长度延时消失
-        <div className="pet-bubble-anchor" style={{ bottom: bubbleBottom }}>
+        <div className="pet-bubble-anchor" style={{ bottom: sayBubbleBottom }}>
           <PetBubble
             seq={say.sessionId}
             text={say.text}
             thinking={say.thinking}
             streaming={say.streaming}
-            onDone={cancelSay}
+            onDone={() => {
+              // 记一下结束时刻：紧接着跳回"积分播报"气泡会显得很突兀
+              setSayEndAt(Date.now());
+              cancelSay();
+            }}
           />
         </div>
-      ) : bubbleEnabled && bubble ? (
+      ) : bubbleEnabled && bubble && Date.now() - sayEndAt > 1500 ? (
         <div className="pet-bubble-anchor" style={{ bottom: bubbleBottom }}>
           <PetBubble seq={bubble.seq} text={bubble.text} onDone={clearBubble} />
         </div>

@@ -24,6 +24,12 @@ export const AUTO_TRIGGER_TYPES: ReadonlySet<PetSignalType> = new Set<PetSignalT
 /** 基础间隔（ms）与抖动上限（ms） */
 const AUTO_GAP_MS = 120_000;
 const AUTO_JITTER_MS = 30_000;
+/**
+ * 命中概率（2026-10-19 新增）：
+ * 节流只保证"不会太频繁"，但每次事件都点评仍然机械。过闸后再掷一次骰子，
+ * 让它像"偶尔插一句"而不是"报幕员"。
+ */
+const AUTO_PROBABILITY = 0.35;
 /** 网关运行态缓存刷新间隔（ms） */
 const GATEWAY_POLL_MS = 30_000;
 
@@ -70,6 +76,8 @@ export function usePetAutoSay(opts: Options) {
     const now = Date.now();
     const gap = AUTO_GAP_MS + Math.random() * AUTO_JITTER_MS;
     if (lastRef.current && now - lastRef.current < gap) return;
+    // 过闸后再掷骰子：大部分事件只是安静播动作，偶尔才接一句话
+    if (Math.random() > AUTO_PROBABILITY) return;
     lastRef.current = now;
     void o.startSay(prompt, context ?? null, 'auto');
   }, []);

@@ -34,6 +34,8 @@ type Props = {
   onMeasure?: (box: SpriteBox) => void;
   /** 当前帧的「可点击格子」掩码（每次换动作重新采样，供 Rust 侧做透明区点击穿透） */
   onMask?: (cells: Uint8Array) => void;
+  /** 当前素材的实测时长（ms）：父组件用它给瞬态动作算兜底计时 */
+  onDuration?: (ms: number) => void;
 };
 
 /** 采样分辨率：160×90 足够定位包围盒，又不会在读回像素上花时间 */
@@ -111,6 +113,7 @@ export default function PetSprite({
   onEnded,
   onMeasure,
   onMask,
+  onDuration,
 }: Props) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const measuredRef = useRef(false);
@@ -292,6 +295,11 @@ export default function PetSprite({
       preload="auto"
       // 首帧常是淡入/起手式（角色还没站定），等 400ms 取稳定姿态再量包围盒
       onLoadedData={() => window.setTimeout(() => measure(), 400)}
+      // 上报素材实测时长：父组件按它给瞬态兜底计时器，避免 10s 的素材在第 4s 被掐断
+      onLoadedMetadata={() => {
+        const d = videoRef.current?.duration;
+        if (d && Number.isFinite(d) && d > 0) onDuration?.(d * 1000);
+      }}
       // 缓冲够了再试一次播放：首启时 play() 常被拒，等到 canplay 才有机会成功
       onCanPlay={() => playWithRetry()}
       onEnded={onEnded}

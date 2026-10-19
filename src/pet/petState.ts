@@ -78,17 +78,24 @@ export type PetTransient = {
   ms: number;
 };
 
+/** 按语义随机挑一个动作（供调用方先拿到 action、再查它的实测时长） */
+export function pickTransientAction(kind: PetTransientKind, override?: string): string {
+  const pool = TRANSIENT_ACTIONS[kind];
+  return override ?? pool[Math.floor(Math.random() * pool.length)];
+}
+
 export function makeTransient(
   seq: number,
   kind: PetTransientKind,
+  action: string,
   text?: string,
-  /** 指定动作（如拖拽落下固定用 click-shy），省略则从候选池随机 */
-  actionOverride?: string,
+  /** 素材实测时长（ms），由 PetSprite 的 onDuration 上报 */
+  durationMs?: number,
 ): PetTransient {
-  const pool = TRANSIENT_ACTIONS[kind];
-  const action = actionOverride ?? pool[Math.floor(Math.random() * pool.length)];
-  // 素材时长普遍 2~4s；给 1.5 倍余量，onEnded 正常触发时不会走到这里
-  const ms = kind === 'click' ? 2600 : 4200;
+  // 兜底时长口径（2026-10-19 修正）：
+  // 素材普遍 10s，原来固定 2.6s/4.2s 会在第 4 秒把动作切走——一次性动作只播了不到一半。
+  // 现在优先用实测时长（+400ms 余量让 onEnded 先到），没测到时给 12s 上限。
+  const ms = durationMs && durationMs > 0 ? durationMs + 400 : 12_000;
   return { seq, kind, action, text, ms };
 }
 
