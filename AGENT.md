@@ -433,6 +433,20 @@ ai-work-assistant/
 - 升版提交执行 `npm run set-version <x.y.z>` 一键同步（底层 `scripts/sync_version.mjs`：package.json / Cargo.toml / Cargo.lock / AGENT.md 标题）；CHANGELOG.md 手动新增条目
 - 版本号单一来源为 `src-tauri/Cargo.toml`：tauri.conf.json 不写 version（自动回退），Rust 端 `env!("CARGO_PKG_VERSION")` 自动取，前端关于页运行时经 `getVersion()` 读取（about.ts 不写版本号），NSIS / MSI 安装包版本号自动跟随
 
+**自用打包模式（默认，2026-10-19 用户确认）**：
+
+本项目目前是作者自用，**不需要 MSI / portable / `latest.json`**，也不要为"资产不齐"纠结：
+
+```bash
+npm run tauri build            # 只出 NSIS setup（tauri.conf targets = ["nsis"]）
+node scripts/rename_release.mjs  # 复制到 release/；缺 MSI 时只告警并跳过清单，退出码 0
+```
+
+- 不跑 `--bundles msi`（本机没有 WiX 缓存，会卡在联网下载）
+- 不生成、不上传 `latest.json`（缺资产会让更新器 fail-closed，宁可不发）
+- 自动更新因此在自用模式下不可用——这是预期行为，不是缺陷
+- 只有用户明确要求"正式发布"时，才走下面的全流程与红线
+
 **发版全流程**（仅用户明确发版时）：
 
 1. **调整版本**：`npm run set-version <x.y.z>` + CHANGELOG.md 新增条目

@@ -76,6 +76,7 @@ if (moved === 0) die('未找到任何安装包产物，请先执行 npm run taur
 
 // 生成发布校验清单 latest.json：版本号 + 各资产 SHA-256。
 // 更新器（updater.rs）下载安装包后与清单比对，不匹配即拒绝安装（更新包完整性校验）。
+let skipManifest = false;
 const assets = {};
 for (const name of [
   `${product}_${version}_x64-setup.exe`,
@@ -89,18 +90,29 @@ for (const name of [
       console.error('WARN（清单跳过，文件不存在）:', name);
       continue;
     }
+    // 自用模式（默认）：只出 NSIS setup、不追求资产齐全，
+    // 此时不生成 latest.json——清单缺资产会让更新器 fail-closed。
+    if (!process.argv.includes('--strict')) {
+      console.error('WARN（缺该资产，跳过发布清单，仅保留安装包）:', name);
+      skipManifest = true;
+      break;
+    }
     die(`清单生成失败：产物缺失 ${name}`);
   }
   const h = createHash('sha256').update(readFileSync(p)).digest('hex');
   assets[name] = h;
   console.log(`SHA256 ${h}  ${name}`);
 }
-// 与原 Python 版输出字节对齐（updater.rs 消费契约）：2 空格缩进、中文原样、无末尾换行
-writeFileSync(join(outDir, MANIFEST_NAME), JSON.stringify({ version, assets }, null, 2));
-console.log('OK:', join(outDir, MANIFEST_NAME));
-console.error('提示：发布时请将', MANIFEST_NAME, '作为 Release 资产一并上传');
+if (skipManifest) {
+  console.error('未生成 latest.json：当前是自用打包（只有 setup.exe），清单需要资产齐全才有意义');
+} else {
+  // 与原 Python 版输出字节对齐（updater.rs 消费契约）：2 空格缩进、中文原样、无末尾换行
+  writeFileSync(join(outDir, MANIFEST_NAME), JSON.stringify({ version, assets }, null, 2));
+  console.log('OK:', join(outDir, MANIFEST_NAME));
+  console.error('提示：发布时请将', MANIFEST_NAME, '作为 Release 资产一并上传');
+}
 
-if (missing.length) {
+if (missing.length && !skipManifest) {
   console.error(`WARNING: 有 ${missing.length} 个产物缺失，上传 release 前请核对清单：`);
   for (const m of missing) console.error('  -', m);
   if (process.argv.includes('--strict')) {
