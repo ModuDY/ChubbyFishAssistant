@@ -155,7 +155,16 @@ export function usePetEvents(onSignal: (signal: PetSignal) => void): void {
                 type: p.delta >= MILESTONE_DELTA ? 'jump' : 'rich',
                 text: `+${formatAmount(p.delta)}`,
               });
+            } else if (typeof p.credits === 'number') {
+              // Trae 的 claim 响应经常不带奖励字段（delta=0），此时退化为播报该账号当前积分，
+              // 否则桌宠签 Trae 时全程静默——只有 Buddy 有 wb-credits-updated，Trae 没有余额事件
+              emit({ type: 'rich', text: `Trae 积分 ${formatAmount(p.credits)}` });
+            } else {
+              emit({ type: 'neutral', text: '签上了，积分没变化' });
             }
+          } else if (p.status === 'already') {
+            // 今天已签：给个反馈，别让桌宠像没收到消息
+            emit({ type: 'neutral', text: '今天签过啦' });
           } else if (p.status === 'fail') {
             emit({ type: 'sad', text: short(p.message) ?? '这个账号没签上' });
           }
