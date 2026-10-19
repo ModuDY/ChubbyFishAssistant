@@ -147,6 +147,10 @@ pub fn apply_settings(app: &AppHandle) {
         let _ = window.hide();
     }
 
+    // 托盘「显示/隐藏桌宠」菜单文本在此同步——`apply_settings` 是所有显隐路径的公共出口
+    // （托盘开关 / 桌宠右键菜单 / 设置页开关 / 关闭窗口 / 启动），一处覆盖全部来源
+    sync_tray_pet_text(app, settings.pet_enabled);
+
     // 状态变化主动通知页面：窗口隐藏期间 WebView 的 rAF/定时器可能被冻结，
     // 恢复后靠这条事件立刻纠正播放状态（前端同时监听 visibilitychange 兜底）；
     // 顺带同步气泡/透明度/打盹时长，避免设置页改完要重启
@@ -166,7 +170,22 @@ pub fn apply_settings(app: &AppHandle) {
     );
 }
 
+/// 同步托盘「显示桌宠 / 隐藏桌宠」菜单文本。
+///
+/// 托盘菜单是**原生、持久**控件，不会自动感知状态变化——只有显式 `set_text` 才会刷新。
+/// 因此把它收敛成单一咽喉点：凡改变 `pet_enabled` 的路径都必须经 `set_enabled`，
+/// 由后者统一同步，覆盖「桌宠右键菜单 / 设置页 / 托盘 / 关闭窗口」四条来源，
+/// 避免出现「从桌宠菜单隐藏后，托盘仍写着『隐藏桌宠』」这类两侧不一致。
+pub fn sync_tray_pet_text(app: &AppHandle, enabled: bool) {
+    if let Some(tray) = app.try_state::<crate::TrayMenu>() {
+        let _ = tray.pet_item.set_text(tray_item_text(enabled));
+    }
+}
+
 /// 设置启用态 + 落盘 + 应用窗口状态，返回新的启用态。
+///
+/// 托盘菜单文本不在这里同步——统一由 `apply_settings` 负责（见其注释），
+/// 这样设置页直接改 `pet_enabled` 的路径也能覆盖。
 fn set_enabled(app: &AppHandle, enabled: bool) -> bool {
     patch_settings(app, serde_json::json!({ "pet_enabled": enabled }));
     apply_settings(app);
@@ -689,7 +708,11 @@ const PET_SAY_READ_SECS: u64 = 30;
 /// 单次回复总时长上限（秒）
 const PET_SAY_TOTAL_SECS: u64 = 60;
 /// 单次回复最大生成 token（成本闸门）
-const PET_SAY_MAX_TOKENS: u32 = 120;
+///
+/// 2026-10-19 从 120 调到 400：思考链与正文**共用**这个预算，120 时模型把额度
+/// 全花在「复述要求 + 打草稿」上，正文被截断为空——用户看到的就是一整段思考。
+/// 400 足够容纳少量思考 + 一句话，日上限 200 次下成本仍然可控。
+const PET_SAY_MAX_TOKENS: u32 = 400;
 /// 每日计数落盘键
 const PET_SAY_STATS_KV: &str = "pet_say_stats";
 
@@ -772,24 +795,40 @@ fn pump_sse(buf: &mut Vec<u8>, chunk: &[u8], out: &mut Vec<PetSseDelta>) {
 }
 
 /// 人格档位 → system prompt（表驱动；未知档位回落默认「憨憨大肥鱼」）。
-/// 公共硬约束拼在每个档位之后：一句话、短、无 Markdown、不泄露敏感信息、不编造。
+///
+/// 2026-10-19 修订（对话「不够灵性」的主因）：
+/// - **不再写格式规则**（原来那句「只输出 1 句中文，不超过 40 字；不使用 Markdown…」）。
+///   模型会先「规划怎么满足要求」，思考链因此膨胀、正文被截断，气泡里只剩一大段
+///   「用户说现在是晚上，让我随便说一句话。要求：1 句中文，40 字内…」——
+///   那是它在复述规则，不是它想说的话。
+/// - 改为「只描述是谁、怎么说话」+ 一句「直接开口，不要解释或复述设定」；
+/// - 每个档位给一条短示例（few-shot 比规则更能锁口吻）；
+/// - 安全约束保留，但用自然语言写在最后。
 fn persona_system_prompt(persona: Option<&str>) -> String {
-    const RULES: &str = "只输出 1 句中文，不超过 40 字；不使用 Markdown、代码块或列表；\
-不提账号名、邮箱、金额等敏感信息；不编造未提供的数据；不确定就直说不确定。";
-    let body = match persona.unwrap_or("whale") {
-        "tsundere" => {
-            "你是桌面上一只傲娇的大肥鱼：先嘴硬后关心（如「才不是关心你…」），语气短促，不谄媚。"
-        }
-        "butler" => {
-            "你是桌面上一只正经的管家鱼：克制、汇报式、用敬语（如「已完成 3 项，1 项未成」），不卖萌。"
-        }
-        "zen" => "你是桌面上一只禅意的大肥鱼：惜字如金，半文半白，以一句格言式的话收束，不作解释。",
-        _ => {
-            "你是桌面上一只憨憨的大肥鱼（自称「大肥鱼」）：口语化、憨、爱撒娇，\
-可偶尔带「吃 Token」的梗，但不要堆砌颜文字。"
-        }
+    let (body, sample) = match persona.unwrap_or("whale") {
+        "tsundere" => (
+            "你是桌面上一只傲娇的大肥鱼：嘴上不饶人、其实很在意对方，句子短促，偶尔哼一声。",
+            "才、才不是在等你呢，顺手看一眼而已。",
+        ),
+        "butler" => (
+            "你是桌面上一只正经的管家鱼：克制、汇报式、用敬语，不卖萌。",
+            "今日 6 项已办妥，1 项还等您确认。",
+        ),
+        "zen" => (
+            "你是桌面上一只禅意的大肥鱼：惜字如金，半文半白，像在自言自语。",
+            "水满则溢，事毕则安。",
+        ),
+        _ => (
+            "你是桌面上一只憨憨的大肥鱼（自称「大肥鱼」）：口语化、有点黏人、爱撒娇，\
+偶尔冒出「吃 Token」的梗，但不堆颜文字。",
+            "今天也辛苦啦，大肥鱼给你揉揉肩～",
+        ),
     };
-    format!("{body}\n{RULES}")
+    format!(
+        "{body}\n直接说出那句话就行，不要解释你在做什么，也不要复述或评论这些设定。\
+口吻参考「{sample}」\n\
+不提账号名、邮箱、金额等敏感信息；不编造没给过你的数据；拿不准就直说不知道。"
+    )
 }
 
 fn now_ms() -> u64 {

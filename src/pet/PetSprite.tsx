@@ -121,6 +121,35 @@ export default function PetSprite({
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
   const playTimerRef = useRef<number | null>(null);
+  /**
+   * 暂停期间被推迟的动作。
+   *
+   * 为什么必须推迟：暂停时换源会 `load()` 清掉当前帧，而恢复后若 `play()` 被拒
+   * （窗口刚显示、合成器未就绪）就会一直空着——表现为「角色消失、气泡还在」。
+   */
+  const deferredRef = useRef<{ id: string; url: string; loop: boolean; playKey: number } | null>(
+    null,
+  );
+  /** 自愈守卫：同一轮异常只强制重载一次，避免反复 load 抖动 */
+  const healedRef = useRef(false);
+
+  /** 把视频切到目标动作：换动作则重设 src 并 load()；同动作仅按 playKey 回到开头 */
+  const applyAction = useCallback(
+    (video: HTMLVideoElement, id: string, u: string, key: number) => {
+      if (video.dataset.action !== id) {
+        video.dataset.action = id;
+        video.src = u;
+        video.load();
+      } else if (key > 0) {
+        try {
+          video.currentTime = 0;
+        } catch {
+          /* seek 失败（尚未 loadedmetadata）忽略，下一次 play 会从头开始 */
+        }
+      }
+    },
+    [],
+  );
 
   /**
    * 播放（失败退避重试）。
@@ -184,26 +213,19 @@ export default function PetSprite({
     if (!video || !url) return;
 
     video.loop = loop;
-    if (video.dataset.action !== actionId) {
-      video.dataset.action = actionId;
-      video.src = url;
-      video.load();
-    } else if (playKey > 0) {
-      try {
-        video.currentTime = 0;
-      } catch {
-        /* seek 失败（尚未 loadedmetadata）忽略，下一次 play 会从头开始 */
-      }
-    }
-
     if (paused) {
+      // 暂停期间**不换源**：换源会 load() 清掉当前帧，恢复后若 play() 被拒就会一直空着。
+      // 先把目标动作记下来，等下面的「恢复」效应补换。
+      deferredRef.current = { id: actionId, url, loop, playKey };
       video.pause();
-    } else {
-      playWithRetry();
+      return;
     }
-  }, [actionId, url, loop, playKey, paused, playWithRetry]);
+    deferredRef.current = null;
+    applyAction(video, actionId, url, playKey);
+    playWithRetry();
+  }, [actionId, url, loop, playKey, paused, applyAction, playWithRetry]);
 
-  // 隐藏窗口时立刻停解码；恢复时由上面的 effect 续播
+  // 隐藏即停 / 恢复续播：窗口不可见时立刻停解码；恢复时补换被推迟的动作并重建缓冲
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
@@ -211,14 +233,47 @@ export default function PetSprite({
       video.pause();
       return;
     }
-    // 隐藏期间 Chromium 会挂起媒体加载：恢复显示时可能连首帧都没有
-    // （窗口可见、画面整块空的直接原因），此时重新触发一次加载再播。
-    // 加 currentSrc 判断：首次挂载时 src 还没设上，免得和上面的效应抢着 load()
-    if (video.readyState < 2 && video.currentSrc) video.load();
+    const d = deferredRef.current;
+    if (d) {
+      deferredRef.current = null;
+      video.loop = d.loop;
+      applyAction(video, d.id, d.url, d.playKey);
+    } else if (video.readyState < 2 && video.currentSrc) {
+      // 隐藏期间 Chromium 会挂起媒体加载：恢复显示时可能连首帧都没有
+      // （窗口可见、画面整块空的直接原因），此时重新触发一次加载再播。
+      // 加 currentSrc 判断：首次挂载时 src 还没设上，免得和上面的效应抢着 load()
+      video.load();
+    }
+    healedRef.current = false;
     playWithRetry();
     // 窗口隐藏时首帧可能取不到（抽帧失败）：显示后补测一次
     measure();
-  }, [paused, measure, playWithRetry]);
+  }, [paused, applyAction, measure, playWithRetry]);
+
+  /**
+   * 自愈守卫：窗口可见且未暂停，却长时间拿不到可播放帧（readyState < 2 或 videoWidth=0）
+   * → 强制重载并重播一次。触发场景：切动作时解码失败、恢复显示时缓冲未就绪；
+   * 没有这一步，角色会一直"消失"而气泡照常显示。
+   */
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const video = videoRef.current;
+      if (!video || pausedRef.current) return;
+      if (video.readyState >= 2 && video.videoWidth > 0) {
+        healedRef.current = false;
+        return;
+      }
+      if (healedRef.current) return;
+      healedRef.current = true;
+      try {
+        video.load();
+      } catch {
+        /* 极端情况下 load 抛错：忽略，下一轮再试 */
+      }
+      playWithRetry();
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [playWithRetry]);
 
   // 卸载时清掉待执行的播放重试
   useEffect(

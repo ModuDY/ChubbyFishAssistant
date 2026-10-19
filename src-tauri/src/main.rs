@@ -30,7 +30,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::Manager;
 
 /// 托盘菜单句柄：API 网关与代理启停项文本随服务状态动态切换
-///（API 由 api_server::sync_tray_api_text 同步；代理由 proxy::sync_tray_proxy_text 同步）
+///（API 由 api_server::sync_api_state 同步两侧菜单；代理由 proxy::sync_tray_proxy_text 同步）
 pub struct TrayMenu {
     pub api_item: MenuItem<tauri::Wry>,
     pub proxy_item: MenuItem<tauri::Wry>,
@@ -602,18 +602,15 @@ fn main() {
                                 }
                             }
                             "pet-toggle" => {
-                                // 桌宠显隐：与设置页开关共用同一持久化字段（pet_enabled），
-                                // 菜单文本随状态切换，避免用户看到与实际不符的提示
+                                // 桌宠显隐：与设置页开关共用同一持久化字段（pet_enabled）。
+                                // 菜单文本由 pet::set_enabled → sync_tray_pet_text 统一同步
+                                //（覆盖托盘/桌宠菜单/设置页/关闭窗口四条路径），此处无需再改
                                 let enabled = commands::pet::pet_toggle(app.clone());
                                 let st = app.state::<AppState>();
                                 fs_utils::app_log(
                                     &st.data_dir,
                                     if enabled { "菜单：显示桌宠" } else { "菜单：隐藏桌宠" },
                                 );
-                                let tray = app.state::<TrayMenu>();
-                                let _ = tray
-                                    .pet_item
-                                    .set_text(commands::pet::tray_item_text(enabled));
                             }
                             "checkin" => {
                                 // 托盘一键签到：Trae（start_checkin_core 内部防重入锁）
@@ -804,11 +801,8 @@ fn main() {
                 if window.label() == commands::pet::PET_LABEL {
                     api.prevent_close();
                     let app = window.app_handle();
+                    // pet_hide 内部经 set_enabled → sync_tray_pet_text 同步托盘文本
                     let _ = commands::pet::pet_hide(app.clone());
-                    let tray = app.state::<TrayMenu>();
-                    let _ = tray
-                        .pet_item
-                        .set_text(commands::pet::tray_item_text(false));
                     return;
                 }
                 if window.label() != "main" {

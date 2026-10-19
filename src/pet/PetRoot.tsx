@@ -59,15 +59,30 @@ type PetUpdatePayload = {
   aiMode?: string;
   /** P3：人格档位 */
   persona?: string;
+  /**
+   * API 网关运行态（Rust 在每次启停时推送）。
+   * 用于让**已打开的**右键菜单立即改写「启动 / 停止」文案，避免两侧菜单状态不一致。
+   */
+  gatewayRunning?: boolean;
 };
+
+/**
+ * 每次换一个「切入点」：同一情境反复用同一句指令时，模型会复读同一个开头。
+ * 只做角度扰动，不追加任何格式要求（格式要求会让它先在思考里"规划怎么满足"）。
+ */
+const SAY_ANGLES = ['随口说一句', '吐槽一句', '关心我一句', '跟我撒个娇'];
 
 /** 组装给 AI 的提问：只含状态摘要与时间，不含账号名/邮箱/金额等敏感信息 */
 function buildSayPrompt(context?: string): string {
-  const h = new Date().getHours();
+  const now = new Date();
+  const h = now.getHours();
   const greet = h < 6 ? '凌晨' : h < 12 ? '早上' : h < 14 ? '中午' : h < 18 ? '下午' : '晚上';
+  const clock = `${String(h).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+  const angle = SAY_ANGLES[Math.floor(Math.random() * SAY_ANGLES.length)];
+  // 给「情境」而不是「要求」：知道现在几点、刚发生了什么，才有话可说
   return context
-    ? `现在是${greet}。刚才发生的事：${context}。请就这件事跟我说一句话。`
-    : `现在是${greet}。随便跟我说一句话。`;
+    ? `现在是${greet} ${clock}。刚发生：${context}。${angle}，就着这件事。`
+    : `现在是${greet} ${clock}，我正对着电脑。${angle}。`;
 }
 
 export default function PetRoot() {
@@ -86,8 +101,15 @@ export default function PetRoot() {
   const [idleTick, setIdleTick] = useState(0);
   const [playKey, setPlayKey] = useState(0);
   const [bubble, setBubble] = useState<{ seq: number; text: string } | null>(null);
-  /** 右键菜单：位置 + 打开时探测到的网关运行态（决定「启动 / 停止」文案） */
-  const [menu, setMenu] = useState<{ x: number; y: number; gateway: boolean } | null>(null);
+  /** 右键菜单位置（网关运行态由 `gatewayRunning` 统一提供，见下） */
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  /**
+   * API 网关运行态（全局单一来源）：
+   * - 初始 / 打开菜单时经 `apiServer.status()` 探测；
+   * - 之后由 Rust 每次启停推送的 `pet-update{gatewayRunning}` 实时刷新。
+   * 两个菜单（托盘 + 桌宠）因此始终显示同一状态，不会各写各的。
+   */
+  const [gatewayRunning, setGatewayRunning] = useState(false);
   const [bubbleEnabled, setBubbleEnabled] = useState(true);
   const [opacity, setOpacity] = useState(1);
   const [sleepMinutes, setSleepMinutes] = useState(5);
@@ -305,6 +327,10 @@ export default function PetRoot() {
       if (patch.aiMode === 'off' || patch.aiMode === 'manual' || patch.aiMode === 'auto') {
         setAiMode(patch.aiMode);
       }
+      // 网关启停：Rust 推送的运行态直接驱动菜单文案（两个菜单共用此单一状态）
+      if (typeof patch.gatewayRunning === 'boolean') {
+        setGatewayRunning(patch.gatewayRunning);
+      }
     };
 
     void api.pet
@@ -323,6 +349,14 @@ export default function PetRoot() {
         setPaused(false);
       });
 
+    // 网关运行态初值：Rust 只在启停时推送，窗口加载晚于启动时会漏掉这次推送，故补探一次
+    void api.apiServer
+      .status()
+      .then((s) => {
+        if (!disposed) setGatewayRunning(!!s?.running);
+      })
+      .catch(() => {});
+
     void listen<PetUpdatePayload>('pet-update', (event) => {
       if (!disposed) apply(event.payload ?? {});
     }).then((un) => {
@@ -330,10 +364,19 @@ export default function PetRoot() {
       else unlisten = un;
     });
 
-    // 只在「页面变隐藏」时补暂停；恢复一律交给 pet-update(visible:true)，
-    // 避免页面误报 hidden 后再也没人把它恢复回来
+    // 页面变隐藏时补暂停；变可见时**仅当窗口真在显示**才解除暂停
+    // （避免页面误报 hidden 后再也没人把它恢复回来 → 角色一直"消失"而气泡还在）
     const onVisibility = () => {
-      if (document.hidden) setPaused(true);
+      if (document.hidden) {
+        setPaused(true);
+        return;
+      }
+      void api.pet
+        .status()
+        .then((s) => {
+          if (!disposed && s.visible) setPaused(false);
+        })
+        .catch(() => {});
     };
     document.addEventListener('visibilitychange', onVisibility);
 
@@ -531,10 +574,13 @@ export default function PetRoot() {
     e.stopPropagation();
     const x = e.clientX;
     const y = e.clientY;
+    // 先按当前已知状态开菜单（不阻塞），随后补一次探测校正新鲜度；
+    // 之后的实时变化由 Rust 推送的 pet-update{gatewayRunning} 驱动
+    setMenu({ x, y });
     void api.apiServer
       .status()
-      .then((s) => setMenu({ x, y, gateway: !!s?.running }))
-      .catch(() => setMenu({ x, y, gateway: false }));
+      .then((s) => setGatewayRunning(!!s?.running))
+      .catch(() => {});
   };
 
   const runCheckin = useCallback(() => {
@@ -723,8 +769,8 @@ export default function PetRoot() {
                 跟我聊一句
               </button>
             ) : null}
-            <button type="button" onClick={() => toggleGateway(menu.gateway)}>
-              {menu.gateway ? '停止 API 网关' : '启动 API 网关'}
+            <button type="button" onClick={() => toggleGateway(gatewayRunning)}>
+              {gatewayRunning ? '停止 API 网关' : '启动 API 网关'}
             </button>
             <div className="pet-menu-sep" />
             <button type="button" onClick={focusMainFromMenu}>

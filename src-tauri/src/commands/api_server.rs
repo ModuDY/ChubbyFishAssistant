@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 use crate::fs_utils;
 use crate::models::{
@@ -718,8 +718,8 @@ pub async fn do_start(
         });
     }
 
-    // 同步托盘菜单文本 + 系统通知（账号数分池展示：Trae 池空 ≠ 无资源，Buddy 池可能正常服务）
-    sync_tray_api_text(app, true);
+    // 同步两侧菜单状态 + 系统通知（账号数分池展示：Trae 池空 ≠ 无资源，Buddy 池可能正常服务）
+    sync_api_state(app, true);
     let notify_body = if pool_file.wb_enabled {
         format!(
             "监听端口 {port}\nTrae 池 {pool_count} 个账号 · Buddy 池 {wb_pool_count} 个账号"
@@ -761,7 +761,7 @@ pub async fn do_stop(
         rt.shared.flush_pending_writes();
         fs_utils::app_log(&state.data_dir, "API 服务已停止");
         drop(guard);
-        sync_tray_api_text(app, false);
+        sync_api_state(app, false);
         crate::commands::workbuddy::push_notify(
             Some(app),
             &state.data_dir,
@@ -782,13 +782,24 @@ pub async fn api_server_stop(
     do_stop(&app, &state, &runtime).await
 }
 
-/// 同步托盘「API 服务」菜单文本（服务未运行显示"启动"，运行中显示"停止"）
-fn sync_tray_api_text(app: &tauri::AppHandle, running: bool) {
+/// 把「API 网关」运行态同步到**两侧菜单**（单一咽喉点：`do_start` / `do_stop` 各调一次，
+/// 覆盖托盘、桌宠右键菜单、主窗口 UI、开机自启四条启停来源）。
+///
+/// 两个菜单都是"值快照"式渲染，不会自动感知变化，必须主动推送：
+/// 1. 托盘菜单是**原生持久**控件 → `set_text` 刷新「启动/停止」文案；
+/// 2. 桌宠窗口的右键菜单是自绘的 → 向 pet 窗口发 `pet-update{gatewayRunning}`，
+///    让**已经打开的**菜单立即改写文案（不留旧状态）。
+fn sync_api_state(app: &tauri::AppHandle, running: bool) {
     if let Some(tray) = app.try_state::<crate::TrayMenu>() {
         let _ = tray
             .api_item
             .set_text(if running { "停止 API 服务" } else { "启动 API 服务" });
     }
+    let _ = app.emit_to(
+        crate::commands::pet::PET_LABEL,
+        "pet-update",
+        serde_json::json!({ "gatewayRunning": running }),
+    );
 }
 
 #[tauri::command]
