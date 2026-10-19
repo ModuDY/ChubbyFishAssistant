@@ -23,6 +23,9 @@ import type { PetCoreState, PetTransient } from './petState';
 import { pickLine } from './lines';
 import { usePetEvents } from './usePetEvents';
 import type { PetSignal } from './usePetEvents';
+import { usePetSay, type SayState } from './usePetSay';
+import { usePetAutoSay, AUTO_TRIGGER_TYPES } from './usePetAutoSay';
+import type { PetAiMode } from '../types';
 import './pet.css';
 
 /** 单击与双击的判定窗口（ms）：小于该间隔的第二次按下视为双击 */
@@ -52,7 +55,20 @@ type PetUpdatePayload = {
   opacity?: number;
   scale?: number;
   sleepMinutes?: number;
+  /** P3：AI 档位（off/manual/auto） */
+  aiMode?: string;
+  /** P3：人格档位 */
+  persona?: string;
 };
+
+/** 组装给 AI 的提问：只含状态摘要与时间，不含账号名/邮箱/金额等敏感信息 */
+function buildSayPrompt(context?: string): string {
+  const h = new Date().getHours();
+  const greet = h < 6 ? '凌晨' : h < 12 ? '早上' : h < 14 ? '中午' : h < 18 ? '下午' : '晚上';
+  return context
+    ? `现在是${greet}。刚才发生的事：${context}。请就这件事跟我说一句话。`
+    : `现在是${greet}。随便跟我说一句话。`;
+}
 
 export default function PetRoot() {
   const [core, setCore] = useState<PetCoreState>('idle');
@@ -75,6 +91,8 @@ export default function PetRoot() {
   const [bubbleEnabled, setBubbleEnabled] = useState(true);
   const [opacity, setOpacity] = useState(1);
   const [sleepMinutes, setSleepMinutes] = useState(5);
+  /** AI 对话档位（P3；Rust 下发，默认 off = 只用本地台词） */
+  const [aiMode, setAiMode] = useState<PetAiMode>('off');
   /** 角色可见包围盒（首帧 alpha 采样得出，窗口百分比）；null = 尚未测量 */
   const [hitBox, setHitBox] = useState<SpriteBox | null>(null);
 
@@ -101,6 +119,17 @@ export default function PetRoot() {
   const stallFiredRef = useRef(false);
   /** 菜单打开期间强制整窗可交互（否则菜单落到角色包围盒外会被点击穿透吃掉） */
   const menuOpenRef = useRef(false);
+  /** 暂停态最新值（auto 档「别打扰」判定用） */
+  const pausedRef = useRef(false);
+  pausedRef.current = paused;
+  /** AI 流式态最新值（同上） */
+  const sayRef = useRef<SayState>(null);
+  /** 最近一次业务事件摘要（供 AI 回复的"背景"） */
+  const lastEventSummaryRef = useRef<string | undefined>(undefined);
+  /** 最近一次发言的触发来源：决定失败时是否回落本地台词（自动档静默，避免刷屏） */
+  const lastTriggerRef = useRef<'user' | 'auto'>('user');
+  /** 本次发言是否由我们把核心态抬到了 thinking（结束只回退自己抬高的一档） */
+  const sayThinkingRef = useRef(false);
 
   // 透明窗口要求 html/body 无背景：class 只在本页挂载期间存在
   useEffect(() => {
@@ -154,10 +183,54 @@ export default function PetRoot() {
     [clearSadTimer, showBubble],
   );
 
+  /* ------------------------- AI 发言（P3） ------------------------- */
+  const handleSayFallback = useCallback(
+    (reason: string) => {
+      // 档位关闭/网关未启动等"预期内"的拒绝不提示；主动触发给一句本地台词兜底，
+      // 自动档静默（否则会变成刷屏）
+      if (lastTriggerRef.current !== 'user') return;
+      if (reason.includes('未开启')) return;
+      showBubble(pickLine('idle', lastLineRef.current));
+    },
+    [showBubble],
+  );
+
+  const { say, startSay, cancelSay } = usePetSay({
+    // 首个 reasoning delta → 点亮「深度思考碎碎念」（上游大肥鱼梗的原始设定）
+    onReasoningFirst: () => playTransient('idle', undefined, 'mumble-deep'),
+    onFallback: handleSayFallback,
+  });
+  sayRef.current = say;
+
+  /** 主动触发（右键「跟我聊一句」） */
+  const sayNow = useCallback(() => {
+    lastTriggerRef.current = 'user';
+    const ctx = lastEventSummaryRef.current;
+    void startSay(buildSayPrompt(ctx), ctx ?? null, 'user');
+  }, [startSay]);
+
+  /** 自动点评（auto 档）：节流 + 「别打扰」判定都在 usePetAutoSay 内 */
+  const { say: autoSay } = usePetAutoSay({
+    enabled: aiMode === 'auto',
+    isBusy: () =>
+      pausedRef.current ||
+      !bubbleEnabled ||
+      draggingRef.current ||
+      !!transientRef.current ||
+      !!sayRef.current?.streaming ||
+      document.hidden,
+    startSay: (prompt, context, trigger) => {
+      lastTriggerRef.current = trigger ?? 'auto';
+      return startSay(prompt, context, trigger);
+    },
+  });
+
   /* ------------------------- 业务事件 → 状态 ------------------------- */
   usePetEvents((signal: PetSignal) => {
     lastEventRef.current = Date.now();
     stallFiredRef.current = false;
+    // 记录最近事件摘要，供 AI 回复当"背景"（只含状态文案，不含账号/金额）
+    if (signal.text) lastEventSummaryRef.current = signal.text;
 
     // 睡梦中被新事件唤醒：先播 idle-wake 醒神，再进入实际状态
     if (coreRef.current === 'sleepy' && signal.type !== 'idle') {
@@ -205,6 +278,11 @@ export default function PetRoot() {
         showBubble(signal.text);
         break;
     }
+
+    // auto 档点评：只在「有内容可说」的信号且带文案时触发（节流与静默判定在 hook 内）
+    if (aiMode === 'auto' && AUTO_TRIGGER_TYPES.has(signal.type) && signal.text) {
+      autoSay(buildSayPrompt(signal.text), signal.text);
+    }
   });
 
   /* --------------------- 隐藏即停（窗口不可见） --------------------- */
@@ -224,6 +302,9 @@ export default function PetRoot() {
       if (typeof patch.sleepMinutes === 'number' && patch.sleepMinutes > 0) {
         setSleepMinutes(patch.sleepMinutes);
       }
+      if (patch.aiMode === 'off' || patch.aiMode === 'manual' || patch.aiMode === 'auto') {
+        setAiMode(patch.aiMode);
+      }
     };
 
     void api.pet
@@ -234,6 +315,7 @@ export default function PetRoot() {
           bubble: s.bubble,
           opacity: s.opacity,
           sleepMinutes: s.sleepMinutes,
+          aiMode: s.aiMode,
         });
       })
       .catch(() => {
@@ -261,6 +343,23 @@ export default function PetRoot() {
       document.removeEventListener('visibilitychange', onVisibility);
     };
   }, []);
+
+  /* ------------------- AI 发言 ↔ 核心态 / 气泡 ------------------- */
+  useEffect(() => {
+    if (say?.streaming) {
+      // 发言期间：把核心态抬到 thinking（优先级低于 working/sad，不打断签到）；
+      // 同时清掉普通气泡，避免流结束回落到旧台词
+      setBubble(null);
+      if (coreRef.current !== 'thinking' && coreRef.current !== 'working' && coreRef.current !== 'sad') {
+        sayThinkingRef.current = true;
+        setCore('thinking');
+      }
+    } else if (sayThinkingRef.current) {
+      // 流结束：只回退本次自己抬起来的那一档
+      sayThinkingRef.current = false;
+      setCore((cur) => (cur === 'thinking' ? 'idle' : cur));
+    }
+  }, [say?.streaming]);
 
   /* ----------------------- 打盹（长时间无事件） ----------------------- */
   useEffect(() => {
@@ -522,7 +621,8 @@ export default function PetRoot() {
   // 窗口宽度 = 角色舞台 + 右侧 160px 留白（pet.css 的 --pet-menu-space），
   // 所以菜单能完整画在角色右边而不遮挡角色、也不被窗口裁掉。
   const MENU_W = 148;
-  const MENU_H = 146;
+  /** 菜单最大高度估值（含可选的「跟我聊一句」按钮，留余量） */
+  const MENU_H = 180;
   const MENU_GAP = 6;
   const box = hitBox ?? { left: 14, top: 52, width: 72, height: 48 };
   const charRightPx = ((box.left + box.width) / 100) * window.innerWidth;
@@ -567,7 +667,18 @@ export default function PetRoot() {
         onMask={handleMask}
       />
       {/* 气泡锚点：底边贴在角色头顶上方，而不是窗口顶部 */}
-      {bubbleEnabled && bubble ? (
+      {bubbleEnabled && say ? (
+        // AI 发言优先：流式中文本随 delta 增长（打字机），流结束后按长度延时消失
+        <div className="pet-bubble-anchor" style={{ bottom: bubbleBottom }}>
+          <PetBubble
+            seq={say.sessionId}
+            text={say.text}
+            thinking={say.thinking}
+            streaming={say.streaming}
+            onDone={cancelSay}
+          />
+        </div>
+      ) : bubbleEnabled && bubble ? (
         <div className="pet-bubble-anchor" style={{ bottom: bubbleBottom }}>
           <PetBubble seq={bubble.seq} text={bubble.text} onDone={clearBubble} />
         </div>
@@ -601,6 +712,17 @@ export default function PetRoot() {
             <button type="button" onClick={runCheckin}>
               一键签到
             </button>
+            {aiMode !== 'off' ? (
+              <button
+                type="button"
+                onClick={() => {
+                  closeMenu();
+                  sayNow();
+                }}
+              >
+                跟我聊一句
+              </button>
+            ) : null}
             <button type="button" onClick={() => toggleGateway(menu.gateway)}>
               {menu.gateway ? '停止 API 网关' : '启动 API 网关'}
             </button>

@@ -90,6 +90,9 @@ body.pet-window {
 .pet-bubble {
   position: relative;
   max-width: 230px;
+  /* P3 流式：AI 回复可能较长，限高防遮挡角色（超出裁掉，回复本身已限 40 字） */
+  max-height: 132px;
+  overflow: hidden;
   padding: 6px 10px;
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.95);
@@ -102,6 +105,17 @@ body.pet-window {
   box-shadow: 0 4px 14px rgba(15, 23, 42, 0.18);
   pointer-events: none;
   animation: pet-bubble-in 0.18s ease-out;
+}
+
+/* 思考链小字（P3 碎碎念）：弱化展示，不喧宾夺主 */
+.pet-bubble-think {
+  margin-bottom: 4px;
+  font-size: 11px;
+  font-style: italic;
+  line-height: 1.45;
+  color: #94a3b8;
+  text-align: left;
+  word-break: break-word;
 }
 
 /* 气泡小尾巴，指向角色头顶 */

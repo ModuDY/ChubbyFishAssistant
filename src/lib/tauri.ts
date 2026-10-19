@@ -117,6 +117,8 @@ const INVOKE_TIMEOUT_OVERRIDES: Record<string, number | null> = {
   refresh_remaining_credits: 600_000,
   // 证书安装：PowerShell RunAs 触发 UAC，等待用户点击无时长上限（取消/失败会立即返回错误）
   cert_install: null,
+  // 桌宠 AI 发言：命令本身立即返回 sessionId，流式结果经 pet-say-* 事件下发；给较短的兜底超时
+  pet_say: 15_000,
 };
 
 /** F11：底层错误在源头翻译为可读文案——剥冗余 "Error: " 前缀、网络类错误转人话；
@@ -288,6 +290,13 @@ export const api = {
     savePosition: () => invoke('pet_save_position'),
     /** 双击桌宠 → 呼出并聚焦主窗口 */
     focusMain: () => invoke('pet_focus_main'),
+    /**
+     * 让桌宠说一句 AI 话（P3）。命令立即返回 sessionId；流式结果经
+     * `pet-say-start` / `pet-say-delta` / `pet-say-done` / `pet-say-error` 事件下发。
+     * 同步 reject 表示「无法发言」（未开启 / 网关未启动 / 节流 / 超上限）→ 调用方回落本地台词。
+     */
+    say: (prompt: string, context?: string | null, trigger?: 'user' | 'auto') =>
+      invoke<number>('pet_say', { prompt, context: context ?? null, trigger: trigger ?? 'user' }),
     /**
      * 上报「可点击格子」掩码（窗口百分比网格，1=角色 0=透明）。
      * Rust 侧据此让角色以外的区域放行鼠标消息，避免透明窗口挡住下层窗口的点击。

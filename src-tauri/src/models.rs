@@ -392,6 +392,10 @@ pub struct Settings {
     /// 人格档位（P3 台词/对话用；None = 默认人格）
     #[serde(default)]
     pub pet_persona: Option<String>,
+    /// AI 对话档位（P3）：off（默认，只用本地台词）/ manual（仅右键主动触发）/
+    /// auto（主动 + 事件自动点评）。None 等价 off
+    #[serde(default)]
+    pub pet_ai_mode: Option<String>,
     /// 多久无业务事件进入打盹态（分钟；None = 5）
     #[serde(default)]
     pub pet_sleep_minutes: Option<u32>,

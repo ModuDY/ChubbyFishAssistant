@@ -6,7 +6,7 @@ import { api } from '../lib/tauri';
 import { THEMES } from '../lib/themes';
 import { APP_TABS } from './Sidebar';
 import { ICON_CHOICES, resolveAppIcon, DEFAULT_APP_ICONS } from '../lib/appIcons';
-import type { AppKey, Settings as SettingsType } from '../types';
+import type { AppKey, Settings as SettingsType, PetAiMode } from '../types';
 
 /**
  * 通用设置面板：外观 / 语言 / 通用与通知 / 代理相关配置。
@@ -447,6 +447,34 @@ export default function GeneralSettingsPanel() {
                 </span>
               </div>
             </div>
+            <div>
+              <label className="label">AI 对话</label>
+              <select
+                value={form.pet_ai_mode ?? 'off'}
+                onChange={(e) => update('pet_ai_mode', e.target.value as PetAiMode)}
+                className="input w-40"
+              >
+                <option value="off">关闭（只用本地台词）</option>
+                <option value="manual">仅主动（右键「跟我聊一句」）</option>
+                <option value="auto">自动点评 + 主动</option>
+              </select>
+            </div>
+            <div>
+              <label className="label">人格</label>
+              <select
+                value={form.pet_persona ?? 'whale'}
+                onChange={(e) => update('pet_persona', e.target.value)}
+                className="input w-40"
+              >
+                <option value="whale">憨憨大肥鱼</option>
+                <option value="tsundere">傲娇</option>
+                <option value="butler">正经管家</option>
+                <option value="zen">禅意</option>
+              </select>
+            </div>
+            <p className="text-xs text-amber-600 dark:text-amber-500">
+              AI 对话经本机 API 网关生成，会真实消耗账号额度（每日上限 200 次；自动点评 2 分钟节流）。
+            </p>
             <p className="text-xs text-slate-400">
               拖到哪记到哪（500ms 去抖后落盘）；双击桌宠可呼出主窗口。
             </p>

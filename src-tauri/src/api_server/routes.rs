@@ -492,11 +492,29 @@ pub async fn chat_completions(
         );
     }
 
+    let key_str = key_id
+        .map(|Extension(k)| k.0)
+        .unwrap_or_else(|| "anonymous".to_string());
+    run_chat_completion(state, key_str, body.to_vec(), Protocol::OpenAi).await
+}
+
+/// 聊天补全的**进程内**执行入口（抽出供 HTTP 处理器与桌宠 `pet_say` 共用）。
+///
+/// 前提与边界：`chat_completions` 只做体积/协议头前置校验，其余（请求计数、JSON 校验、
+/// 模型解析、白名单准入、调度分流）全在本函数内——语句顺序与原实现逐行一致，行为零变化。
+/// `proto` 为客户端协议：HTTP 侧传 `Protocol::OpenAi`，桌宠内部调用同为 OpenAI 格式；
+/// `key_str` 为用量记账标识（HTTP 侧来自命中的 API Key，桌宠侧固定 `internal:pet`，
+/// 便于在用量页单独审计"桌宠消耗"）。
+pub(crate) async fn run_chat_completion(
+    state: Arc<ApiSharedState>,
+    key_str: String,
+    body_vec: Vec<u8>,
+    proto: Protocol,
+) -> Response {
     state
         .total_requests
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let body_vec = body.to_vec();
     // 校验 JSON：无效请求体直接 400，不转发上游（与 /v1/messages 行为对齐）
     let peek: Value = match serde_json::from_slice(&body_vec) {
         Ok(v) => v,
@@ -516,12 +534,11 @@ pub async fn chat_completions(
         .unwrap_or(&state.default_model)
         .to_string();
     // issue #26 白名单准入（空名单不限）
-    if let Some(resp) = whitelist_check(&state, &model, Protocol::OpenAi) {
+    if let Some(resp) = whitelist_check(&state, &model, proto) {
         return resp;
     }
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
-    let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
 
     // 统一调度分流点（§4.1 ③~⑥）：resolve_target 决定资源池/会话池粘性/跨池回退/
     // 错误矩阵，替代原 resolve_wb_target 单向判定；默认策略下行为与改造前一致（§9.1）。
@@ -529,7 +546,7 @@ pub async fn chat_completions(
     let guard = state.inflight_guard();
     match dispatch::resolve_target(&state, &model, &peek, Some(&key_str)) {
         Err(e) => dispatch_error_response(
-            &state, e, Protocol::OpenAi, &model, stream, &key_str,
+            &state, e, proto, &model, stream, &key_str,
             start_ts.elapsed().as_millis() as u64,
         ),
         Ok(r) => match r.pool {
@@ -539,25 +556,25 @@ pub async fn chat_completions(
                 let hint = effective_effort_hint(&state, r.effort_hint, explicit);
                 let body_vec = apply_effort_hint(body_vec, hint);
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new());
+                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, proto, key_str, guard, std::collections::HashSet::new());
                 }
-                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new()).await;
+                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, proto, key_str, guard, std::collections::HashSet::new()).await;
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：请求体由执行路径按目录条目构造（agent 信封），
                 // 无 effort/后缀预处理（思考档位由 resolve_thinking 按条目解析）
                 if stream {
-                    return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard);
+                    return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, proto, key_str, guard);
                 }
-                return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await;
+                return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, proto, key_str, guard).await;
             }
             TargetPool::Doubao => {
                 // 豆包上游（E-01）：请求体由执行路径按模型表构造（消息合并），
                 // 无 effort/后缀预处理（档位由模型表 deep_think/auto_cot 决定）
                 if stream {
-                    return super::doubao_route::doubao_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard);
+                    return super::doubao_route::doubao_stream_chat(state_clone, body_vec, r.model, start_ts, proto, key_str, guard);
                 }
-                return super::doubao_route::doubao_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await;
+                return super::doubao_route::doubao_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, proto, key_str, guard).await;
             }
             TargetPool::Trae => {
                 // issue #31 T3.2/T3.3：Trae 池 effort 通道（默认思考两池对齐）——
@@ -571,9 +588,9 @@ pub async fn chat_completions(
                     &state.data_dir, body_vec, wire, r.max_mode_hint, &model, &r.model,
                 );
                 if stream {
-                    stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard)
+                    stream_chat(state_clone, body_vec, r.model, stream, start_ts, proto, key_str, guard)
                 } else {
-                    aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await
+                    aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, proto, key_str, guard).await
                 }
             }
             TargetPool::Custom => {
@@ -582,9 +599,9 @@ pub async fn chat_completions(
                 match super::custom_models::find_enabled(&state.data_dir, &model) {
                     Some(cm) => {
                         if stream {
-                            custom_route::custom_stream_chat(state_clone, body_vec, r.model, cm, start_ts, Protocol::OpenAi, key_str, guard)
+                            custom_route::custom_stream_chat(state_clone, body_vec, r.model, cm, start_ts, proto, key_str, guard)
                         } else {
-                            custom_route::custom_aggregate_chat(state_clone, body_vec, r.model, cm, stream, start_ts, Protocol::OpenAi, key_str, guard).await
+                            custom_route::custom_aggregate_chat(state_clone, body_vec, r.model, cm, stream, start_ts, proto, key_str, guard).await
                         }
                     }
                     None => openai_error(StatusCode::NOT_FOUND, "model_not_found", &format!("自定义模型 {} 已被删除", model)),

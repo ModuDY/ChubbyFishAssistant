@@ -491,11 +491,23 @@ export interface Settings {
   pet_bubble?: boolean | null;
   /** 人格档位（P3 用） */
   pet_persona?: string | null;
+  /** AI 对话档位（P3）：off（默认，只用本地台词）/ manual（仅右键主动）/ auto（主动 + 事件自动点评） */
+  pet_ai_mode?: PetAiMode | null;
   /** 无事件进入打盹态的分钟数（null = 5） */
   pet_sleep_minutes?: number | null;
   /** 素材包（P4 预留） */
   pet_pack?: string | null;
 }
+
+/**
+ * 桌宠 AI 对话档位（P3）：
+ * off = 只用本地台词池；manual = 仅右键「跟我聊一句」主动触发；
+ * auto = 主动触发 + 事件自动点评（低频节流，消耗本机账号真实额度）
+ */
+export type PetAiMode = 'off' | 'manual' | 'auto';
+
+/** 桌宠人格档位（P3，Rust 侧映射 system prompt；未知值回落 whale） */
+export type PetPersona = 'whale' | 'tsundere' | 'butler' | 'zen';
 
 /** 桌宠窗口实时状态（pet_status 返回值） */
 export interface PetStatus {
@@ -507,6 +519,10 @@ export interface PetStatus {
   opacity: number;
   bubble: boolean;
   sleepMinutes: number;
+  /** P3：AI 对话档位（pet_status/pet-update 下发） */
+  aiMode?: PetAiMode;
+  /** P3：人格档位 */
+  persona?: string;
 }
 
 /** F-74：会话域（WorkBuddy = ~/.workbuddy，CodeBuddy = ~/.codebuddy） */

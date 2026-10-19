@@ -9,6 +9,11 @@
 //!
 //! 文件末尾保留了渲染路线验证期的诊断命令（`?probe=1` 页面使用），不影响正式链路。
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use futures_util::StreamExt;
 use tauri::{
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, WebviewWindow,
 };
@@ -154,6 +159,9 @@ pub fn apply_settings(app: &AppHandle) {
             "opacity": settings.pet_opacity.unwrap_or(1.0),
             "scale": scale,
             "sleepMinutes": settings.pet_sleep_minutes.unwrap_or(5),
+            // P3：AI 档位与人格随设置即时下发（改完不必重启）
+            "aiMode": settings.pet_ai_mode.clone().unwrap_or_else(|| "off".into()),
+            "persona": settings.pet_persona.clone().unwrap_or_else(|| "whale".into()),
         }),
     );
 }
@@ -212,6 +220,9 @@ pub fn pet_status(app: AppHandle) -> serde_json::Value {
         "opacity": settings.pet_opacity.unwrap_or(1.0),
         "bubble": settings.pet_bubble.unwrap_or(true),
         "sleepMinutes": settings.pet_sleep_minutes.unwrap_or(5),
+        // P3：AI 档位/人格（首启桌宠窗口读一次，避免只依赖 pet-update 事件）
+        "aiMode": settings.pet_ai_mode.clone().unwrap_or_else(|| "off".into()),
+        "persona": settings.pet_persona.clone().unwrap_or_else(|| "whale".into()),
     })
 }
 
@@ -649,4 +660,473 @@ pub fn pet_probe_report(report: String) -> Result<String, String> {
     let path = std::env::temp_dir().join("pet-probe-report.json");
     std::fs::write(&path, report).map_err(|e| e.to_string())?;
     Ok(path.to_string_lossy().to_string())
+}
+
+// ───────────────────────── 桌宠 AI 对话（P3） ─────────────────────────
+//
+// 目标：让桌宠气泡说由**本机已有 API 网关**生成的短句，真流式（逐字长出），并把上游
+// `reasoning_content` 接「深度思考碎碎念」（前端按首个 reasoning delta 播 mumble-deep）。
+//
+// 为什么走**进程内**而不是回环 HTTP：网关所有路由经 `auth::bearer_auth`（仅 /health
+// 环回豁免），回环调用需要 API Key 且会污染 Key 用量；且仓库无 reqwest。这里直接拿
+// `ApiServerRuntime.shared`（`Arc<ApiSharedState>`）调 `routes::run_chat_completion`，
+// 不带 Key、不经 socket —— 零新增外发，与"仅经本机网关到上游"红线一致。
+//
+// 竞态说明（有意如此，勿误判为 bug）：进程内调用持有 `Arc<ApiSharedState>`，用户在网关
+// 页面点「停止 API 网关」**不会**打断已开始的这一流；下一次 `pet_say` 因 runtime 为
+// None 返回 Err("网关未启动")，前端回落本地台词。
+
+/// 桌宠 AI 请求在用量/日志里的记账标识（与真实 Key 区分，便于用量页单独审计）
+const PET_SAY_KEY: &str = "internal:pet";
+/// 两次发言最小间隔（ms）：防连点/事件风暴把额度打空
+const PET_SAY_MIN_INTERVAL_MS: u64 = 5_000;
+/// 每日发言上限（超出后一律回落本地台词）
+const PET_SAY_DAILY_CAP: u32 = 200;
+/// 首字节等待上限（秒）
+const PET_SAY_FIRST_BYTE_SECS: u64 = 15;
+/// 后续分片读等待上限（秒）
+const PET_SAY_READ_SECS: u64 = 30;
+/// 单次回复总时长上限（秒）
+const PET_SAY_TOTAL_SECS: u64 = 60;
+/// 单次回复最大生成 token（成本闸门）
+const PET_SAY_MAX_TOKENS: u32 = 120;
+/// 每日计数落盘键
+const PET_SAY_STATS_KV: &str = "pet_say_stats";
+
+/// 当前在跑的流式任务（新的盖旧的：起新任务前 abort）
+static SAY_TASK: Mutex<Option<tauri::async_runtime::JoinHandle<()>>> = Mutex::new(None);
+/// 会话序号：前端按 sessionId 丢弃过期事件（与 abort 形成双保险）
+static SAY_GEN: AtomicU64 = AtomicU64::new(0);
+/// 上次发言时间（ms）
+static SAY_LAST_MS: Mutex<u64> = Mutex::new(0);
+
+/// 上游 SSE 增量（转发给前端的语义单元）
+#[derive(Debug, PartialEq)]
+enum PetSseDelta {
+    Text(String),
+    Reasoning(String),
+    Error(String),
+    Done,
+}
+
+/// 在字节缓冲里找子串位置（仅用于找 SSE 帧分隔符 `\n\n`）
+fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
+}
+
+/// 增量解析 OpenAI 兼容 SSE。
+///
+/// 按 `\n\n` 分帧——**在字节层**分帧，天然抗"UTF-8 半字被切断"（只在整帧完成后再解码）；
+/// `:` 开头为 keep-alive 注释跳过；剥 `data:` 前缀（多行 data 用 `\n` 连接）；
+/// `[DONE]` → Done；顶层 `error` 帧 → Error（否则会把"思考完就停"当成正常收尾）；
+/// 其余取 `choices[0].delta.content` / `.reasoning_content`。
+fn pump_sse(buf: &mut Vec<u8>, chunk: &[u8], out: &mut Vec<PetSseDelta>) {
+    buf.extend_from_slice(chunk);
+    while let Some(pos) = find_sub(buf, b"\n\n") {
+        let block: Vec<u8> = buf.drain(..pos + 2).collect();
+        let text = String::from_utf8_lossy(&block[..pos]);
+        let mut data_lines: Vec<&str> = Vec::new();
+        for line in text.lines() {
+            if line.starts_with(':') {
+                continue; // keep-alive 注释行
+            }
+            if let Some(rest) = line.strip_prefix("data:") {
+                data_lines.push(rest.trim_start());
+            }
+        }
+        if data_lines.is_empty() {
+            continue;
+        }
+        let data = data_lines.join("\n");
+        if data.trim() == "[DONE]" {
+            out.push(PetSseDelta::Done);
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else {
+            continue;
+        };
+        if let Some(err) = v.get("error") {
+            let msg = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("上游返回错误");
+            out.push(PetSseDelta::Error(msg.to_string()));
+            continue;
+        }
+        if let Some(delta) = v.pointer("/choices/0/delta") {
+            if let Some(r) = delta.get("reasoning_content").and_then(|x| x.as_str()) {
+                if !r.is_empty() {
+                    out.push(PetSseDelta::Reasoning(r.to_string()));
+                }
+            }
+            if let Some(c) = delta.get("content").and_then(|x| x.as_str()) {
+                if !c.is_empty() {
+                    out.push(PetSseDelta::Text(c.to_string()));
+                }
+            }
+        }
+    }
+}
+
+/// 人格档位 → system prompt（表驱动；未知档位回落默认「憨憨大肥鱼」）。
+/// 公共硬约束拼在每个档位之后：一句话、短、无 Markdown、不泄露敏感信息、不编造。
+fn persona_system_prompt(persona: Option<&str>) -> String {
+    const RULES: &str = "只输出 1 句中文，不超过 40 字；不使用 Markdown、代码块或列表；\
+不提账号名、邮箱、金额等敏感信息；不编造未提供的数据；不确定就直说不确定。";
+    let body = match persona.unwrap_or("whale") {
+        "tsundere" => {
+            "你是桌面上一只傲娇的大肥鱼：先嘴硬后关心（如「才不是关心你…」），语气短促，不谄媚。"
+        }
+        "butler" => {
+            "你是桌面上一只正经的管家鱼：克制、汇报式、用敬语（如「已完成 3 项，1 项未成」），不卖萌。"
+        }
+        "zen" => "你是桌面上一只禅意的大肥鱼：惜字如金，半文半白，以一句格言式的话收束，不作解释。",
+        _ => {
+            "你是桌面上一只憨憨的大肥鱼（自称「大肥鱼」）：口语化、憨、爱撒娇，\
+可偶尔带「吃 Token」的梗，但不要堆砌颜文字。"
+        }
+    };
+    format!("{body}\n{RULES}")
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn today_local() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+/// 今日已发言次数（跨日归零）
+fn say_count_today(data_dir: &std::path::Path) -> u32 {
+    let store = crate::store::db(data_dir);
+    let v: serde_json::Value = store.kv_get(PET_SAY_STATS_KV);
+    let day = today_local();
+    if v.get("day").and_then(|d| d.as_str()) != Some(day.as_str()) {
+        return 0;
+    }
+    v.get("count").and_then(|c| c.as_u64()).unwrap_or(0) as u32
+}
+
+/// 今日已发言次数 +1（跨日自动归零），返回新计数；读写失败不阻塞发言
+fn say_count_bump(data_dir: &std::path::Path) -> u32 {
+    let store = crate::store::db(data_dir);
+    let next = say_count_today(data_dir).saturating_add(1);
+    let v = serde_json::json!({ "day": today_local(), "count": next });
+    let _ = store.kv_set(PET_SAY_STATS_KV, &v);
+    next
+}
+
+fn emit_say(app: &AppHandle, event: &str, payload: serde_json::Value) {
+    let _ = app.emit_to(PET_LABEL, event, payload);
+}
+
+fn emit_say_error(app: &AppHandle, session: u64, code: &str, message: &str) {
+    emit_say(
+        app,
+        "pet-say-error",
+        serde_json::json!({ "sessionId": session, "code": code, "message": message }),
+    );
+}
+
+/// 短文案：尽量抽 JSON 里的 message 字段，抽不到就原样截断（避免整段错误体塞气泡）
+fn short_msg(s: &str) -> String {
+    let t = s.trim();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
+        if let Some(m) = v
+            .pointer("/error/message")
+            .or_else(|| v.get("message"))
+            .and_then(|x| x.as_str())
+        {
+            return m.chars().take(80).collect();
+        }
+    }
+    t.chars().take(80).collect()
+}
+
+/// 实际执行一次流式发言：取共享状态 → 跑补全 → 泵 SSE → 逐 delta 下发
+async fn run_say(app: AppHandle, session: u64, body_vec: Vec<u8>, trigger: String, model: String) {
+    let shared = {
+        let rt = app.state::<Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
+        let guard = rt.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(|r| r.shared.clone())
+    };
+    let Some(shared) = shared else {
+        emit_say_error(&app, session, "gateway_down", "网关未启动");
+        return;
+    };
+
+    let resp = crate::api_server::routes::run_chat_completion(
+        shared,
+        PET_SAY_KEY.to_string(),
+        body_vec,
+        crate::api_server::routes::Protocol::OpenAi,
+    )
+    .await;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096)
+            .await
+            .unwrap_or_default();
+        let raw = String::from_utf8_lossy(&bytes);
+        let code = if status.as_u16() == 503 { "no_healthy" } else { "upstream" };
+        emit_say_error(&app, session, code, &short_msg(&raw));
+        return;
+    }
+
+    emit_say(
+        &app,
+        "pet-say-start",
+        serde_json::json!({ "sessionId": session, "trigger": trigger, "model": model }),
+    );
+
+    let t0 = Instant::now();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut stream = resp.into_body().into_data_stream();
+    let mut first = true;
+    let mut ended = false;
+
+    loop {
+        if t0.elapsed() > Duration::from_secs(PET_SAY_TOTAL_SECS) {
+            emit_say_error(&app, session, "timeout", "回复超时");
+            return;
+        }
+        let wait = if first { PET_SAY_FIRST_BYTE_SECS } else { PET_SAY_READ_SECS };
+        match tokio::time::timeout(Duration::from_secs(wait), stream.next()).await {
+            Err(_) => {
+                emit_say_error(&app, session, "timeout", "回复超时");
+                return;
+            }
+            Ok(None) => break,
+            Ok(Some(Err(_))) => {
+                emit_say_error(&app, session, "upstream", "流读取失败");
+                return;
+            }
+            Ok(Some(Ok(chunk))) => {
+                first = false;
+                let mut deltas = Vec::new();
+                pump_sse(&mut buf, &chunk, &mut deltas);
+                for d in deltas {
+                    match d {
+                        PetSseDelta::Text(s) => {
+                            text.push_str(&s);
+                            emit_say(
+                                &app,
+                                "pet-say-delta",
+                                serde_json::json!({ "sessionId": session, "kind": "text", "delta": s }),
+                            );
+                        }
+                        PetSseDelta::Reasoning(s) => {
+                            reasoning.push_str(&s);
+                            emit_say(
+                                &app,
+                                "pet-say-delta",
+                                serde_json::json!({ "sessionId": session, "kind": "reasoning", "delta": s }),
+                            );
+                        }
+                        PetSseDelta::Error(m) => {
+                            emit_say_error(&app, session, "upstream", &short_msg(&m));
+                            return;
+                        }
+                        PetSseDelta::Done => ended = true,
+                    }
+                }
+                if ended {
+                    break;
+                }
+            }
+        }
+    }
+
+    // 收尾：处理没有以 `\n\n` 结束的残余帧
+    if !buf.is_empty() {
+        let mut deltas = Vec::new();
+        pump_sse(&mut buf, b"\n\n", &mut deltas);
+        for d in deltas {
+            match d {
+                PetSseDelta::Text(s) => text.push_str(&s),
+                PetSseDelta::Reasoning(s) => reasoning.push_str(&s),
+                PetSseDelta::Error(m) => {
+                    emit_say_error(&app, session, "upstream", &short_msg(&m));
+                    return;
+                }
+                PetSseDelta::Done => {}
+            }
+        }
+    }
+
+    if text.trim().is_empty() {
+        emit_say_error(&app, session, "empty", "这次没说出话");
+        return;
+    }
+
+    emit_say(
+        &app,
+        "pet-say-done",
+        serde_json::json!({
+            "sessionId": session,
+            "ok": true,
+            "text": text,
+            "reasoning": reasoning,
+            "model": model,
+            "ms": t0.elapsed().as_millis() as u64,
+        }),
+    );
+}
+
+/// 桌宠说一句 AI 话（P3）。返回 sessionId；同步错误直接给前端做本地台词兜底。
+///
+/// 同步快速失败（任一命中即 `Err`，前端立刻本地台词、不弹 AI 气泡）：
+/// 档位为 off / trigger 与档位不匹配 / 网关未启动 / 距上次发言过近 / 当日超上限。
+#[tauri::command]
+pub async fn pet_say(
+    app: AppHandle,
+    prompt: String,
+    context: Option<String>,
+    trigger: Option<String>,
+) -> Result<u64, String> {
+    let st = app.state::<AppState>();
+    let settings = st.settings();
+    let mode = settings.pet_ai_mode.clone().unwrap_or_else(|| "off".into());
+    if mode == "off" {
+        return Err("AI 对话未开启".into());
+    }
+    let trig = trigger.unwrap_or_else(|| "user".into());
+    if trig == "auto" && mode != "auto" {
+        return Err("自动点评未开启".into());
+    }
+
+    // 网关运行态（None = 未启动）；顺带取默认模型名
+    let model = {
+        let rt = app.state::<Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
+        let guard = rt.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(|r| r.shared.default_model.clone())
+    };
+    let Some(model) = model else {
+        return Err("网关未启动".into());
+    };
+
+    // 节流 + 日上限
+    let now = now_ms();
+    {
+        let mut last = SAY_LAST_MS.lock().unwrap_or_else(|e| e.into_inner());
+        if *last != 0 && now.saturating_sub(*last) < PET_SAY_MIN_INTERVAL_MS {
+            return Err("刚说过，缓一缓".into());
+        }
+        *last = now;
+    }
+    if say_count_today(&st.data_dir) >= PET_SAY_DAILY_CAP {
+        return Err("今天聊够啦".into());
+    }
+    say_count_bump(&st.data_dir);
+
+    // 组装请求体（只这三类字段，不碰任何嵌套契约字段名）
+    let system = persona_system_prompt(settings.pet_persona.as_deref());
+    let user = match context.as_deref() {
+        Some(c) if !c.trim().is_empty() => format!("{prompt}\n（背景：{c}）"),
+        _ => prompt,
+    };
+    let body = serde_json::json!({
+        "model": &model,
+        "stream": true,
+        "max_tokens": PET_SAY_MAX_TOKENS,
+        "reasoning_effort": "low",
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user },
+        ],
+    });
+    let body_vec = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+
+    // 新的盖旧的：abort 上一轮流，避免并发占用账号并发位
+    if let Some(old) = SAY_TASK.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        old.abort();
+    }
+    let session = SAY_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let app2 = app.clone();
+    let task = tauri::async_runtime::spawn(async move {
+        run_say(app2, session, body_vec, trig, model).await;
+    });
+    *SAY_TASK.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
+
+    Ok(session)
+}
+
+#[cfg(test)]
+mod say_tests {
+    use super::*;
+
+    /// 跨 chunk 分帧 + UTF-8 半字切断：整帧完成前不产出，完成后能正确解码多字节字符
+    #[test]
+    fn pump_survives_split_frame_and_split_utf8() {
+        let full = "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n\n";
+        let bytes = full.as_bytes();
+        // 在「你」（3 字节）中间切开
+        let mid = full.find('你').unwrap() + 1;
+        let mut buf = Vec::new();
+        let mut out = Vec::new();
+        pump_sse(&mut buf, &bytes[..mid], &mut out);
+        assert!(out.is_empty(), "帧未完成时不应产出");
+        pump_sse(&mut buf, &bytes[mid..], &mut out);
+        assert_eq!(out, vec![PetSseDelta::Text("你好".to_string())]);
+    }
+
+    /// keep-alive 注释行跳过；`[DONE]` 识别为结束
+    #[test]
+    fn pump_skips_keepalive_and_detects_done() {
+        let mut buf = Vec::new();
+        let mut out = Vec::new();
+        pump_sse(&mut buf, b": keep-alive\n\ndata: [DONE]\n\n", &mut out);
+        assert_eq!(out, vec![PetSseDelta::Done]);
+    }
+
+    /// 顶层 error 帧 → Error（否则会被当成正常收尾）
+    #[test]
+    fn pump_reports_error_frame() {
+        let mut buf = Vec::new();
+        let mut out = Vec::new();
+        pump_sse(
+            &mut buf,
+            b"data: {\"error\":{\"message\":\"boom\",\"code\":\"x\"}}\n\n",
+            &mut out,
+        );
+        assert_eq!(out, vec![PetSseDelta::Error("boom".to_string())]);
+    }
+
+    /// 思考链先于正文：同一帧内 reasoning 在 text 之前
+    #[test]
+    fn pump_emits_reasoning_before_text() {
+        let mut buf = Vec::new();
+        let mut out = Vec::new();
+        let payload = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"想\",\"content\":\"说\"}}]}\n\n";
+        pump_sse(&mut buf, payload.as_bytes(), &mut out);
+        assert_eq!(
+            out,
+            vec![
+                PetSseDelta::Reasoning("想".to_string()),
+                PetSseDelta::Text("说".to_string()),
+            ]
+        );
+    }
+
+    /// 人格档位：每个档位都带公共硬约束；未知档位回落默认
+    #[test]
+    fn persona_prompt_has_hard_rules_and_default_fallback() {
+        for p in [None, Some("whale"), Some("tsundere"), Some("butler"), Some("zen"), Some("nope")] {
+            let s = persona_system_prompt(p);
+            assert!(s.contains("不编造未提供的数据"), "档位 {p:?} 缺少硬约束");
+            assert!(s.contains("不超过 40 字"), "档位 {p:?} 缺少长度约束");
+        }
+        assert!(persona_system_prompt(Some("nope")).contains("大肥鱼"));
+        assert!(persona_system_prompt(None).contains("大肥鱼"));
+    }
 }
