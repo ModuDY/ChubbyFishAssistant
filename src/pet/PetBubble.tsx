@@ -31,6 +31,15 @@ function clip(s: string, max: number): string {
   return one.length > max ? `${one.slice(0, max)}…` : one;
 }
 
+/**
+ * 思考小字只在「确实是中文思考」时显示：
+ * 部分模型用英文思考（"The user wants me to be a clingy…"），摆给中文用户看只是噪音。
+ */
+function worthShowingThink(s: string): boolean {
+  const cjk = (s.match(/[\u4e00-\u9fa5]/g) ?? []).length;
+  return cjk >= 4;
+}
+
 export default function PetBubble({ seq, text, onDone, streaming, thinking }: Props) {
   // 用 ref 读最终文本长度：避免 text 逐字变化时反复重启计时器
   const lenRef = useRef(0);
@@ -44,7 +53,9 @@ export default function PetBubble({ seq, text, onDone, streaming, thinking }: Pr
   }, [seq, streaming, onDone]);
 
   const body = text ? clip(text, MAX_TEXT) : '';
-  const think = thinking ? clip(thinking, MAX_THINK) : '';
+  // 正文一旦开吐就收起思考：模型常在 thinking 里复述人设与要求，和真话并排显示很出戏
+  const think =
+    !body && thinking && worthShowingThink(thinking) ? clip(thinking, MAX_THINK) : '';
 
   return (
     <div key={seq} className="pet-bubble" role="status">
