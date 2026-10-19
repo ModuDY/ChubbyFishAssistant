@@ -110,11 +110,15 @@ export function usePetEvents(onSignal: (signal: PetSignal) => void): void {
     const lastAt = new Map<PetSignalType, number>();
     // 余额上一次已知值：用于判断「查询完成但无变化」→ neutral（balance-normal）
     let lastCredits: number | null = null;
+    // 切换流程是否已跨过「回合开始」阶段（首行 thinking → 后续 working）
+    let switchStarted = false;
 
-    const emit = (signal: PetSignal) => {
+    const emit = (signal: PetSignal, force = false) => {
       if (disposed) return;
       const now = Date.now();
-      if (signal.type !== 'working') {
+      // force：核心态收尾（done/exit 降回 idle）必须生效，不能被同类节流吞掉，
+      // 否则桌宠会一直停留在 thinking/working 的循环动作里
+      if (!force && signal.type !== 'working') {
         const prev = lastAt.get(signal.type) ?? 0;
         if (now - prev < 2500) return;
         lastAt.set(signal.type, now);
@@ -134,12 +138,16 @@ export function usePetEvents(onSignal: (signal: PetSignal) => void): void {
     on<CheckinPayload>('checkin-progress', (p) => {
       switch (p?.type) {
         case 'start':
+          // 回合刚开始、还没进实际处理 → thinking（work-think）。
+          // 对齐上游 workStatus[0]=thinking（turn/start）、[1]=working（tool/call）
           emit({
-            type: 'working',
+            type: 'thinking',
             text: p.total ? `开工啦，本轮 ${p.total} 个账号` : '没有要签的账号',
           });
           break;
         case 'account':
+          // 进入实际处理：核心态升到 working，再叠加积分瞬态（瞬态播完回落 working）
+          emit({ type: 'working' });
           if (p.status === 'success') {
             if (p.delta && p.delta > 0) {
               // 大额增量 → jump-grab（里程碑），普通增量 → rich
@@ -147,8 +155,6 @@ export function usePetEvents(onSignal: (signal: PetSignal) => void): void {
                 type: p.delta >= MILESTONE_DELTA ? 'jump' : 'rich',
                 text: `+${formatAmount(p.delta)}`,
               });
-            } else {
-              emit({ type: 'working' });
             }
           } else if (p.status === 'fail') {
             emit({ type: 'sad', text: short(p.message) ?? '这个账号没签上' });
@@ -160,6 +166,8 @@ export function usePetEvents(onSignal: (signal: PetSignal) => void): void {
           emit({ type: 'pace', text: p.round ? `第 ${p.round} 轮重试…` : '稍等，重试中' });
           break;
         case 'done':
+          // 收尾先把核心态降回 idle：walking/thinking 的循环动作不降下来会一直转
+          emit({ type: 'idle', text: p.empty ? '今天都签过了' : '本轮结束' }, true);
           if ((p.failed ?? 0) > 0 && (p.ok ?? 0) > 0) {
             // 有成有败 → 清点归档（work-archive）
             emit({ type: 'archive', text: `收尾：成功 ${p.ok} / 失败 ${p.failed}` });
@@ -167,8 +175,6 @@ export function usePetEvents(onSignal: (signal: PetSignal) => void): void {
             emit({ type: 'sad', text: `${p.failed} 个账号未成功` });
           } else if ((p.ok ?? 0) > 0) {
             emit({ type: 'happy', text: `签到完成，新签 ${p.ok} 个` });
-          } else {
-            emit({ type: 'idle', text: p.empty ? '今天都签过了' : '本轮结束' });
           }
           break;
         default:
@@ -182,8 +188,9 @@ export function usePetEvents(onSignal: (signal: PetSignal) => void): void {
       if (!p) return;
       switch (p.type) {
         case 'start':
+          // 同 Trae：回合开始先 thinking（work-think），进入账号处理再升 working
           emit({
-            type: 'working',
+            type: 'thinking',
             text: p.total ? `Buddy 开工：${p.total} 个账号` : 'Buddy 开工',
           });
           break;
@@ -195,26 +202,26 @@ export function usePetEvents(onSignal: (signal: PetSignal) => void): void {
           }
           break;
         case 'account':
+          // 先升核心态，失败再叠加 sad（sad 优先级最高，不会被 working 盖掉）
+          emit({ type: 'working' });
           if (p.status === 'fail') {
             emit({ type: 'sad', text: short(p.message) ?? '有个账号没签上' });
-          } else {
-            emit({ type: 'working' });
           }
           break;
         case 'done':
+          // 同 Trae：收尾先降核心态，再叠加收尾瞬态
+          emit({ type: 'idle' }, true);
           if ((p.failed ?? 0) > 0 && (p.ok ?? 0) > 0) {
             emit({ type: 'archive', text: `Buddy 收尾：成功 ${p.ok} / 失败 ${p.failed}` });
           } else if ((p.failed ?? 0) > 0) {
             emit({ type: 'sad', text: `${p.failed} 个账号未成功` });
           } else if ((p.ok ?? 0) > 0) {
             emit({ type: 'happy', text: `Buddy 签到完成，新签 ${p.ok} 个` });
-          } else {
-            emit({ type: 'idle' });
           }
           break;
         case 'exit':
           // 轮次退出：无论成败都该回落，否则宠物会一直「忙碌」
-          emit({ type: 'idle' });
+          emit({ type: 'idle' }, true);
           break;
         default:
           break;
@@ -246,15 +253,24 @@ export function usePetEvents(onSignal: (signal: PetSignal) => void): void {
       const p = parseJson<{ stage?: string; status?: string; message?: string }>(raw);
       if (!p) return;
       if (p.status === 'error' || p.status === 'fail') {
+        switchStarted = false;
         emit({ type: 'sad', text: short(p.message) ?? '切换没成功' });
-      } else {
-        // 核心态 working + 叠加 turn-run（切换账号的手势）
-        emit({ type: 'working' });
-        emit({ type: 'turn', text: short(p.message) ?? '正在切换账号…' });
+        return;
       }
+      // 首行 = 回合开始（thinking / work-think），随后进入实际处理（working + turn-run 手势）
+      if (!switchStarted) {
+        switchStarted = true;
+        emit({ type: 'thinking', text: short(p.message) ?? '正在切换账号…' });
+        return;
+      }
+      emit({ type: 'working' });
+      emit({ type: 'turn', text: short(p.message) ?? '正在切换账号…' });
     });
 
     on<DonePayload>('switch-done', (p) => {
+      switchStarted = false;
+      // 收尾降核心态，再叠加成败瞬态（否则会停在 thinking/working 循环动作）
+      emit({ type: 'idle' }, true);
       emit(
         p?.success
           ? { type: 'happy', text: '切换完成' }

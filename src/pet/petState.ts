@@ -37,8 +37,10 @@ const TRANSIENT_ACTIONS: Record<PetTransientKind, string[]> = {
   rich: ['balance-jingle', 'balance-full', 'balance-count'],
   broke: ['balance-broke', 'balance-empty'],
   click: ['click-wave', 'click-happy', 'click-tickle', 'click-tsundere'],
-  // 空闲彩蛋（低频）：东张西望 / 发呆碎碎念
-  idle: ['idle-look', 'mumble-daze'],
+  // 空闲彩蛋（低频）：东张西望 / 发呆碎碎念 / 深度思考碎碎念。
+  // 上游把「深度思考碎碎念」放在 animations.categories 的「文字」随机池（weight 10）里，
+  // 不是 thinking 态专用动作，所以归 idle 随机池，而不是"working 无进度"的 mumble 池
+  idle: ['idle-look', 'mumble-daze', 'mumble-deep'],
   // 重试等待（签到 retry）
   pace: ['work-pace'],
   // 批量收尾（done 混合结果时清点归档）

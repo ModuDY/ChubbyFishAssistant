@@ -285,6 +285,7 @@ ai-work-assistant/
 - **透明区点击穿透（2026-10-19）**：窗口是矩形而角色只占底部一块，空白区域虽 alpha=0 仍整块接收鼠标消息（表现为「角色周围有一层看不见的遮罩挡住下层窗口的点击」）。前端每次换动作按 alpha 采样出 24×28「可点击格子」并集，经 `pet_set_hit_mask` 上报；Rust `start_hit_watcher` 线程 24ms 跟随光标，落在透明格子即 `set_ignore_cursor_events(true)`（`WS_EX_TRANSPARENT`），回到角色格子再撤掉（连续两帧一致才切，防 `WS_EX_LAYERED` 反复增删闪烁；左键按住/拖拽期间不切）。不用 `SetWindowRgn`——会连渲染一起裁剪，切掉头顶气泡。掩码未就绪/全透明一律不穿透（宁可多挡，不能让角色点不到）。
 - **首启空白（2026-10-19 修复）**：窗口按 `visible:false` 建好后 show，首启时页面仍被判 hidden、`play()` 被拒，原实现只试一次就放弃 → 窗口在而画面整块空。现 `paused` 只认 Rust 下发的 `visible`（不再叠加 `document.hidden`），`play()` 失败按 250ms×(n+1) 退避重试，恢复显示时 `readyState<2` 且已有 src 则重新 `load()`，`onCanPlay` 再补一次。
 - **素材 alpha 底噪（2026-10-19）**：webm 背景残留 alpha ≈ 8%（20/255），浅色窗口上可见淡灰矩形。素材层改不了（本机无 libvpx，VP9+alpha 只有硬件编码、不支持 yuva420p），故由 `PetRoot` 内联 SVG 定义 `feComponentTransfer/feFuncA`（`a'=(a-0.1)/0.9`），`pet.css` 给 `.pet-video` 挂 `filter: url(#pet-alpha-floor)`。`ALPHA_FLOOR` 常量可调：调大更干净、角色边缘更硬。**若将来能重编码素材，应优先在素材层清零（一次处理、零运行时开销）。**
+- **动作接线对齐上游（2026-10-19）**：动作语义以上游 `PC2005-cloud/dsh-pet` 的 `dsh-pet/assets/config.jsonc` 为准——`animations.events.workStatus` 按索引=档位（0=thinking 回合开始 / 1=working 工具调用 / 2=result / 3=waiting / 4=success / 5=error），故签到/切换在 `start` 阶段先发 `thinking`（播 work-think）、首个 `account` 事件再升 `working`（work-busy）；`深度思考碎碎念` 在上游属 `animations.categories` 的「文字」随机池（weight 10），不是 thinking 专用，故并入 idle 彩蛋池。收尾（`done`/`exit`/`switch-done`）必须 `emit(idle, force=true)` 显式降核心态，否则会卡在 thinking/working 的循环动作。
 
 ## 6. Tauri 事件（Rust → 前端）
 
