@@ -9,10 +9,10 @@
  * 交互约定（P0）：
  * - 拖拽 = 按住移动超过 5px（调用 `startDragging`），松开播落地反馈并记住位置；
  * - 单击 = 随机点击回应 + 台词；双击 = 呼出主窗口（单击延迟 240ms 给双击让路）；
- * - 右键菜单禁用（窗口无边框，菜单会飞出屏幕）。
+ * - 右键 = 打开自绘菜单（无边框窗口没有系统菜单），复用签到 / 网关 / 呼出主窗口 / 隐藏动作。
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { CSSProperties, PointerEvent as ReactPointerEvent } from 'react';
+import type { CSSProperties, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from 'react';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { api } from '../lib/tauri';
@@ -35,6 +35,10 @@ const SAD_HOLD_MS = 9000;
 const IDLE_SWAP_MS = 24_000;
 /** 打盹检测轮询间隔 */
 const SLEEP_CHECK_MS = 20_000;
+/** 空闲彩蛋间隔：长时间纯 idle 时偶尔来一发东张西望 / 发呆碎碎念 */
+const IDLE_FLAVOR_MS = 45_000;
+/** working 无进度判定：超过该时长没有新事件就播 mumble-screen（对屏碎碎念） */
+const WORK_MUMBLE_MS = 45_000;
 /**
  * 素材背景残留 alpha 的底噪（约 8% = 20/255）。
  * 渲染时把 ≤ 该值的 alpha 压成 0，否则在浅色窗口上会看出一个淡灰矩形。
@@ -66,6 +70,8 @@ export default function PetRoot() {
   const [idleTick, setIdleTick] = useState(0);
   const [playKey, setPlayKey] = useState(0);
   const [bubble, setBubble] = useState<{ seq: number; text: string } | null>(null);
+  /** 右键菜单：位置 + 打开时探测到的网关运行态（决定「启动 / 停止」文案） */
+  const [menu, setMenu] = useState<{ x: number; y: number; gateway: boolean } | null>(null);
   const [bubbleEnabled, setBubbleEnabled] = useState(true);
   const [opacity, setOpacity] = useState(1);
   const [sleepMinutes, setSleepMinutes] = useState(5);
@@ -85,6 +91,16 @@ export default function PetRoot() {
   const dragRef = useRef<{ x: number; y: number; started: boolean } | null>(null);
   /** 已上报 Rust 的点击穿透掩码（并集，见 handleMask） */
   const maskRef = useRef<Uint8Array | null>(null);
+  /** 瞬态最新值：定时器里判断"是否正忙"，避免彩蛋打断正在播的动作 */
+  const transientRef = useRef<PetTransient | null>(null);
+  transientRef.current = transient;
+  /** 拖拽中：拖拽期间不插播彩蛋 */
+  const draggingRef = useRef(false);
+  draggingRef.current = dragging;
+  /** working 无进度只碎碎念一次：新事件到来时复位 */
+  const stallFiredRef = useRef(false);
+  /** 菜单打开期间强制整窗可交互（否则菜单落到角色包围盒外会被点击穿透吃掉） */
+  const menuOpenRef = useRef(false);
 
   // 透明窗口要求 html/body 无背景：class 只在本页挂载期间存在
   useEffect(() => {
@@ -141,6 +157,12 @@ export default function PetRoot() {
   /* ------------------------- 业务事件 → 状态 ------------------------- */
   usePetEvents((signal: PetSignal) => {
     lastEventRef.current = Date.now();
+    stallFiredRef.current = false;
+
+    // 睡梦中被新事件唤醒：先播 idle-wake 醒神，再进入实际状态
+    if (coreRef.current === 'sleepy' && signal.type !== 'idle') {
+      playTransient('idle', undefined, 'idle-wake');
+    }
 
     switch (signal.type) {
       case 'working':
@@ -165,6 +187,14 @@ export default function PetRoot() {
         break;
       case 'broke':
         playTransient('broke', signal.text ?? pickLine('broke', lastLineRef.current));
+        break;
+      // 纯瞬态信号：只叠加播一次动作，不改核心态
+      case 'pace':
+      case 'archive':
+      case 'neutral':
+      case 'turn':
+      case 'jump':
+        playTransient(signal.type, signal.text);
         break;
       case 'idle':
       default:
@@ -236,21 +266,52 @@ export default function PetRoot() {
   useEffect(() => {
     const timer = window.setInterval(() => {
       const idleFor = Date.now() - lastEventRef.current;
+      // working 且长时间无进度 → 对屏碎碎念（mumble-screen），每次停顿只播一次
+      if (
+        coreRef.current === 'working' &&
+        idleFor >= WORK_MUMBLE_MS &&
+        !stallFiredRef.current &&
+        !transientRef.current &&
+        !draggingRef.current
+      ) {
+        stallFiredRef.current = true;
+        playTransient('mumble', pickLine('working', lastLineRef.current));
+        return;
+      }
       if (idleFor < sleepMinutes * 60_000) return;
       // 只有空闲态会进打盹：业务态（working/sad）绝不因为"没新事件"就睡觉
       if (coreRef.current === 'idle') {
+        // 入睡前先打个哈欠（idle-yawn），再接打盹循环
+        playTransient('idle', undefined, 'idle-yawn');
         setCore('sleepy');
         showBubble(pickLine('sleepy', lastLineRef.current));
       }
     }, SLEEP_CHECK_MS);
     return () => window.clearInterval(timer);
-  }, [sleepMinutes, showBubble]);
+  }, [sleepMinutes, showBubble, playTransient]);
 
   /* --------------------- idle 循环动作交替（避免单调） --------------------- */
   useEffect(() => {
     const timer = window.setInterval(() => setIdleTick((n) => n + 1), IDLE_SWAP_MS);
     return () => window.clearInterval(timer);
   }, []);
+
+  /* ----------------------- 空闲彩蛋（低频） ----------------------- */
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (coreRef.current !== 'idle') return;
+      if (transientRef.current || draggingRef.current) return;
+      // 纯 idle 长时间无事件：偶尔东张西望 / 发呆碎碎念（idle-look / mumble-daze 随机）
+      playTransient('idle', pickLine('idle', lastLineRef.current));
+    }, IDLE_FLAVOR_MS);
+    return () => window.clearInterval(timer);
+  }, [playTransient]);
+
+  /* ----------------------- 启动彩蛋：伸个懒腰 ----------------------- */
+  useEffect(() => {
+    const timer = window.setTimeout(() => playTransient('idle', undefined, 'idle-stretch'), 900);
+    return () => window.clearTimeout(timer);
+  }, [playTransient]);
 
   /* --------------------------- 位置记忆 --------------------------- */
   useEffect(() => {
@@ -307,6 +368,8 @@ export default function PetRoot() {
     }
     if (!changed) return;
     maskRef.current = next;
+    // 菜单打开期间不覆盖「整窗可交互」掩码，否则菜单会被 Rust 的穿透逻辑吃掉点击
+    if (menuOpenRef.current) return;
     void api.pet.setHitMask(MASK_COLS, MASK_ROWS, Array.from(next)).catch(() => {
       /* 上报失败只影响点击穿透，不影响显示，静默忽略 */
     });
@@ -329,16 +392,20 @@ export default function PetRoot() {
       .catch(() => setDragging(false));
   };
 
-  const onPointerUp = () => {
+  const onPointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current;
     dragRef.current = null;
 
     if (drag?.started) {
       setDragging(false);
-      // 落地反馈：接在拖拽悬空之后（上游同样用 click-shy 作为释放反应）
-      playTransient('click', pickLine('click', lastLineRef.current), 'click-shy');
+      // 落地反馈：接在拖拽悬空之后；click-shy 害羞 / idle-squat 蹲一下，随机取一个
+      const landing = Math.random() < 0.5 ? 'click-shy' : 'idle-squat';
+      playTransient('click', pickLine('click', lastLineRef.current), landing);
       return;
     }
+
+    // 右键（contextmenu）不算单击：否则「右键开菜单」会顺带弹一句点击回应
+    if (e.button !== 0) return;
 
     // 单击延后执行，给双击让路；连点时不叠加多条计时器
     if (clickTimerRef.current) return;
@@ -355,6 +422,73 @@ export default function PetRoot() {
     }
     void api.pet.focusMain().catch(() => {});
   };
+
+  /* --------------------------- 右键菜单 --------------------------- */
+  const closeMenu = useCallback(() => setMenu(null), []);
+
+  // 右键打开菜单：顺带探一下网关运行态，决定菜单显示「启动 / 停止」
+  const onContextMenu = (e: ReactMouseEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const x = e.clientX;
+    const y = e.clientY;
+    void api.apiServer
+      .status()
+      .then((s) => setMenu({ x, y, gateway: !!s?.running }))
+      .catch(() => setMenu({ x, y, gateway: false }));
+  };
+
+  const runCheckin = useCallback(() => {
+    closeMenu();
+    void api.checkin
+      .start({ scope: 'all', skip_checked_in: true, skip_expired: false })
+      .then(() => showBubble('开始签到…'))
+      .catch(() => showBubble('签到启动失败'));
+  }, [closeMenu, showBubble]);
+
+  const toggleGateway = useCallback(
+    (running: boolean) => {
+      closeMenu();
+      void (running ? api.apiServer.stop() : api.apiServer.start())
+        .then(() => showBubble(running ? '网关已停止' : '网关已启动'))
+        .catch(() => showBubble('网关操作失败'));
+    },
+    [closeMenu, showBubble],
+  );
+
+  const focusMainFromMenu = useCallback(() => {
+    closeMenu();
+    void api.pet.focusMain().catch(() => {});
+  }, [closeMenu]);
+
+  const hideFromMenu = useCallback(() => {
+    closeMenu();
+    void api.pet.hide().catch(() => {});
+  }, [closeMenu]);
+
+  // Esc 关闭菜单（无边框窗口里没有系统菜单，键盘兜底更稳）
+  useEffect(() => {
+    if (!menu) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setMenu(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [menu]);
+
+  // 菜单开合 ↔ 点击穿透：打开时把掩码置为「整窗可交互」，关闭后恢复真实掩码。
+  // 否则菜单若落在角色包围盒外，会被 Rust 的透明区穿透逻辑吃掉点击（按钮点不动）
+  useEffect(() => {
+    menuOpenRef.current = menu !== null;
+    const cells = menu
+      ? Array.from({ length: MASK_COLS * MASK_ROWS }, () => 1)
+      : maskRef.current
+        ? Array.from(maskRef.current)
+        : null;
+    if (cells) {
+      void api.pet.setHitMask(MASK_COLS, MASK_ROWS, cells).catch(() => {});
+    }
+  }, [menu]);
 
   /* --------------------------- 播放调度 --------------------------- */
   const actionId = dragging ? 'drag-dangle' : (transient?.action ?? coreAction(core, idleTick));
@@ -432,8 +566,38 @@ export default function PetRoot() {
         onPointerUp={onPointerUp}
         onPointerCancel={onPointerUp}
         onDoubleClick={onDoubleClick}
-        onContextMenu={(e) => e.preventDefault()}
+        onContextMenu={onContextMenu}
       />
+      {/*
+        右键菜单：无边框窗口没有系统菜单，这里自绘一个轻量卡片。
+        位置夹紧在窗口内；backdrop 覆盖全窗以支持「点外部关闭」。
+      */}
+      {menu ? (
+        <div className="pet-menu-backdrop" onPointerDown={closeMenu} onContextMenu={(e) => e.preventDefault()}>
+          <div
+            className="pet-menu"
+            style={{
+              left: Math.max(4, Math.min(menu.x, window.innerWidth - 152)),
+              top: Math.max(4, Math.min(menu.y, window.innerHeight - 148)),
+            }}
+            onPointerDown={(e) => e.stopPropagation()}
+          >
+            <button type="button" onClick={runCheckin}>
+              一键签到
+            </button>
+            <button type="button" onClick={() => toggleGateway(menu.gateway)}>
+              {menu.gateway ? '停止 API 网关' : '启动 API 网关'}
+            </button>
+            <div className="pet-menu-sep" />
+            <button type="button" onClick={focusMainFromMenu}>
+              呼出主窗口
+            </button>
+            <button type="button" onClick={hideFromMenu}>
+              隐藏桌宠
+            </button>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

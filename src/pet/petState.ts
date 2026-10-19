@@ -37,9 +37,34 @@ const TRANSIENT_ACTIONS: Record<PetTransientKind, string[]> = {
   rich: ['balance-jingle', 'balance-full', 'balance-count'],
   broke: ['balance-broke', 'balance-empty'],
   click: ['click-wave', 'click-happy', 'click-tickle', 'click-tsundere'],
+  // 空闲彩蛋（低频）：东张西望 / 发呆碎碎念
+  idle: ['idle-look', 'mumble-daze'],
+  // 重试等待（签到 retry）
+  pace: ['work-pace'],
+  // 批量收尾（done 混合结果时清点归档）
+  archive: ['work-archive'],
+  // 余额查询无变化
+  neutral: ['balance-normal'],
+  // 切换账号 / 切换页面
+  turn: ['turn-run'],
+  // 大额到账 / 里程碑
+  jump: ['jump-grab'],
+  // 长时间 working 但无进度（对屏碎碎念）
+  mumble: ['mumble-screen'],
 };
 
-export type PetTransientKind = 'happy' | 'rich' | 'broke' | 'click';
+export type PetTransientKind =
+  | 'happy'
+  | 'rich'
+  | 'broke'
+  | 'click'
+  | 'idle'
+  | 'pace'
+  | 'archive'
+  | 'neutral'
+  | 'turn'
+  | 'jump'
+  | 'mumble';
 
 export type PetTransient = {
   /** 每次触发递增：同一动作连播时也能重启视频 */

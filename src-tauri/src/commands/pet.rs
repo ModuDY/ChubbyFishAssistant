@@ -31,6 +31,9 @@ const GWL_EXSTYLE: i32 = -20;
 const WS_EX_LAYERED: i32 = 0x0008_0000;
 /// 工具窗口：不出现在 Alt+Tab 与任务栏（Tauri 的 skipTaskbar 会加上它）
 const WS_EX_TOOLWINDOW: i32 = 0x0000_0080;
+/// 应用窗口位：会把窗口钉在任务栏。实测正式窗口会同时带 TOOLWINDOW 与 APPWINDOW，
+/// 需显式清掉后者，否则任务栏可能留一个按钮（详见设计方案 T0/§10.9）
+const WS_EX_APPWINDOW: i32 = 0x0004_0000;
 
 // ─────────────────────────── 设置读写 ───────────────────────────
 
@@ -126,6 +129,9 @@ pub fn apply_settings(app: &AppHandle) {
 
     if settings.pet_enabled {
         let _ = window.show();
+        // show 时系统/Tauri 可能补回 WS_EX_APPWINDOW（任务栏图标）；显式清掉，
+        // 与 skipTaskbar 的意图保持一致
+        let _ = and_not_ex_style(&window, WS_EX_APPWINDOW as i64);
     } else {
         let _ = window.hide();
     }
@@ -267,6 +273,33 @@ fn or_ex_style(_window: &WebviewWindow, _bits: i64) -> bool {
     true
 }
 
+/// 清除窗口的扩展样式位（`or_ex_style` 的对称操作）。
+///
+/// 用于抹掉系统/Tauri 在 show 时给置顶透明窗误补的 `WS_EX_APPWINDOW`，
+/// 否则桌宠会在任务栏留下一个按钮，与 `skipTaskbar` 的意图相反。
+#[cfg(windows)]
+fn and_not_ex_style(window: &WebviewWindow, bits: i64) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, SetWindowLongPtrW};
+    let Ok(hwnd) = window.hwnd() else {
+        return false;
+    };
+    let hwnd = hwnd.0 as _;
+    unsafe {
+        let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as i64;
+        let next = cur & !bits;
+        if next == cur {
+            return true;
+        }
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next as _);
+        true
+    }
+}
+
+#[cfg(not(windows))]
+fn and_not_ex_style(_window: &WebviewWindow, _bits: i64) -> bool {
+    true
+}
+
 /// 诊断页首次挂载时上报窗口状态：透明、置顶、无边框、不在任务栏。
 #[tauri::command]
 pub fn pet_probe_ready(window: WebviewWindow) -> Result<serde_json::Value, String> {
@@ -389,6 +422,149 @@ pub fn start_hit_watcher(app: AppHandle) {
 fn left_button_down() -> bool {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
     unsafe { (GetAsyncKeyState(VK_LBUTTON as i32) as u16 & 0x8000) != 0 }
+}
+
+// ───────────────── 置顶 watchdog：前台全屏自动降级隐藏 ─────────────────
+//
+// 问题：桌宠是 always-on-top 窗口，前台跑全屏应用（游戏 / 全屏视频 / 演示）时会一直压在
+// 上面，既碍事又可能挡住画面。
+//
+// 方案：后台线程低频轮询前台窗口，若其矩形覆盖整个显示器（判为全屏），就让桌宠临时**隐藏**；
+// 全屏退出后按 `pet_enabled` 自动恢复。只对账窗口显隐，**不写设置**——用户「显示桌宠」的意愿
+// （pet_enabled）不被覆盖（区别于 pet_show/pet_hide，那两个会落盘）。
+
+/// 启动置顶 watchdog（只需调用一次；重复调用为空操作）。
+pub fn start_top_watchdog(app: AppHandle) {
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        if STARTED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        std::thread::spawn(move || loop {
+            // 1s 一轮：全屏切换不是高频事件，低频即可，单轮只有两次廉价查询
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+
+            let Some(window) = pet_window(&app) else {
+                continue;
+            };
+            // 期望可见 = 用户设置要显示 且 前台不是全屏应用；与实际状态对账（幂等，可自愈）
+            let want =
+                app.state::<AppState>().settings().pet_enabled && !foreground_is_fullscreen();
+            let visible = window.is_visible().unwrap_or(false);
+            if want == visible {
+                continue;
+            }
+
+            let patch = if want {
+                let _ = window.show();
+                // 与 apply_settings 一致：show 后清掉任务栏位
+                let _ = and_not_ex_style(&window, WS_EX_APPWINDOW as i64);
+                serde_json::json!({ "visible": true })
+            } else {
+                let _ = window.hide();
+                serde_json::json!({ "visible": false })
+            };
+            // 同步前端播放状态：窗口隐藏期间 WebView 可能冻结定时器，恢复后需事件纠偏
+            let _ = app.emit_to(PET_LABEL, "pet-update", patch);
+        });
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+    }
+}
+
+/// 前台窗口是否为「铺满整个显示器」的全屏应用（游戏 / 全屏视频等）。
+///
+/// 判据：前台窗口可见、未最小化、不属于本进程，且矩形覆盖其所在显示器的外沿。
+/// 排除桌面外壳（Progman/WorkerW）与任务栏，否则在桌面点一下就会被误判成全屏。
+#[cfg(windows)]
+fn foreground_is_fullscreen() -> bool {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsIconic,
+        IsWindowVisible,
+    };
+
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return false;
+        }
+        if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+            return false;
+        }
+
+        // 本进程窗口（main / pet）不参与判定，避免自己的窗口触发降级
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == std::process::id() {
+            return false;
+        }
+
+        // 桌面外壳：点击桌面时前台会变成它，其矩形覆盖整屏
+        let mut buf = [0u16; 64];
+        let n = GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+        if n > 0 {
+            let class = String::from_utf16_lossy(&buf[..n as usize]);
+            if class == "Progman" || class == "WorkerW" || class == "Shell_TrayWnd" {
+                return false;
+            }
+        }
+
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if GetWindowRect(hwnd, &mut rect) == 0 {
+            return false;
+        }
+
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_null() {
+            return false;
+        }
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            rcMonitor: RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
+            rcWork: RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
+            dwFlags: 0,
+        };
+        if GetMonitorInfoW(monitor, &mut mi) == 0 {
+            return false;
+        }
+
+        // 容差 1px：部分全屏窗带 1 像素边框偏差
+        const TOL: i32 = 1;
+        let m = mi.rcMonitor;
+        rect.left <= m.left + TOL
+            && rect.top <= m.top + TOL
+            && rect.right >= m.right - TOL
+            && rect.bottom >= m.bottom - TOL
+    }
+}
+
+#[cfg(not(windows))]
+fn foreground_is_fullscreen() -> bool {
+    false
 }
 
 /// 光标是否落在角色的**透明**区域上。

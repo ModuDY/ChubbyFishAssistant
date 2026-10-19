@@ -19,7 +19,13 @@ export type PetSignalType =
   | 'happy'
   | 'sad'
   | 'rich'
-  | 'broke';
+  | 'broke'
+  // 以下为「纯瞬态」信号：只叠加播一次动作，不改核心态
+  | 'pace'
+  | 'archive'
+  | 'neutral'
+  | 'turn'
+  | 'jump';
 
 export type PetSignal = {
   type: PetSignalType;
@@ -85,6 +91,9 @@ function short(text: string | undefined, limit = 42): string | undefined {
   return oneLine.length > limit ? `${oneLine.slice(0, limit)}…` : oneLine;
 }
 
+/** 积分增量达到该阈值即视为「里程碑」，改用更夸张的 jump-grab 动作 */
+const MILESTONE_DELTA = 500;
+
 /**
  * 订阅全部业务事件。
  *
@@ -99,6 +108,8 @@ export function usePetEvents(onSignal: (signal: PetSignal) => void): void {
     let disposed = false;
     const subs: Array<Promise<UnlistenFn>> = [];
     const lastAt = new Map<PetSignalType, number>();
+    // 余额上一次已知值：用于判断「查询完成但无变化」→ neutral（balance-normal）
+    let lastCredits: number | null = null;
 
     const emit = (signal: PetSignal) => {
       if (disposed) return;
@@ -131,7 +142,11 @@ export function usePetEvents(onSignal: (signal: PetSignal) => void): void {
         case 'account':
           if (p.status === 'success') {
             if (p.delta && p.delta > 0) {
-              emit({ type: 'rich', text: `+${formatAmount(p.delta)}` });
+              // 大额增量 → jump-grab（里程碑），普通增量 → rich
+              emit({
+                type: p.delta >= MILESTONE_DELTA ? 'jump' : 'rich',
+                text: `+${formatAmount(p.delta)}`,
+              });
             } else {
               emit({ type: 'working' });
             }
@@ -140,10 +155,15 @@ export function usePetEvents(onSignal: (signal: PetSignal) => void): void {
           }
           break;
         case 'retry':
-          emit({ type: 'working', text: p.round ? `第 ${p.round} 轮重试…` : '稍等，重试中' });
+          // 核心态保持 working，叠加 work-pace 的「等待踱步」动作
+          emit({ type: 'working' });
+          emit({ type: 'pace', text: p.round ? `第 ${p.round} 轮重试…` : '稍等，重试中' });
           break;
         case 'done':
-          if ((p.failed ?? 0) > 0) {
+          if ((p.failed ?? 0) > 0 && (p.ok ?? 0) > 0) {
+            // 有成有败 → 清点归档（work-archive）
+            emit({ type: 'archive', text: `收尾：成功 ${p.ok} / 失败 ${p.failed}` });
+          } else if ((p.failed ?? 0) > 0) {
             emit({ type: 'sad', text: `${p.failed} 个账号未成功` });
           } else if ((p.ok ?? 0) > 0) {
             emit({ type: 'happy', text: `签到完成，新签 ${p.ok} 个` });
@@ -182,7 +202,9 @@ export function usePetEvents(onSignal: (signal: PetSignal) => void): void {
           }
           break;
         case 'done':
-          if ((p.failed ?? 0) > 0) {
+          if ((p.failed ?? 0) > 0 && (p.ok ?? 0) > 0) {
+            emit({ type: 'archive', text: `Buddy 收尾：成功 ${p.ok} / 失败 ${p.failed}` });
+          } else if ((p.failed ?? 0) > 0) {
             emit({ type: 'sad', text: `${p.failed} 个账号未成功` });
           } else if ((p.ok ?? 0) > 0) {
             emit({ type: 'happy', text: `Buddy 签到完成，新签 ${p.ok} 个` });
@@ -207,8 +229,13 @@ export function usePetEvents(onSignal: (signal: PetSignal) => void): void {
           ? p.total_balance
           : (p.accounts ?? []).reduce((sum, a) => sum + (a.balance ?? 0), 0);
       if (!Number.isFinite(total)) return;
+      const prev = lastCredits;
+      lastCredits = total;
       if (total <= 0) {
         emit({ type: 'broke', text: 'Buddy 余额见底了' });
+      } else if (prev !== null && total === prev) {
+        // 查询完成但余额没变 → balance-normal
+        emit({ type: 'neutral', text: '余额没有变化' });
       } else {
         emit({ type: 'rich', text: `Buddy 余额 ${formatAmount(total)}` });
       }
@@ -221,7 +248,9 @@ export function usePetEvents(onSignal: (signal: PetSignal) => void): void {
       if (p.status === 'error' || p.status === 'fail') {
         emit({ type: 'sad', text: short(p.message) ?? '切换没成功' });
       } else {
-        emit({ type: 'working', text: short(p.message) ?? '正在切换账号…' });
+        // 核心态 working + 叠加 turn-run（切换账号的手势）
+        emit({ type: 'working' });
+        emit({ type: 'turn', text: short(p.message) ?? '正在切换账号…' });
       }
     });
 

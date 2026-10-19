@@ -786,6 +786,10 @@ fn main() {
             // 避免 300×360 的矩形窗口挡住下层窗口的点击（掩码由前端采样后上报）
             commands::pet::start_hit_watcher(app.handle().clone());
 
+            // 置顶 watchdog：检测到前台全屏应用（游戏/全屏视频）时临时隐藏桌宠，
+            // 避免 always-on-top 窗口压在全屏画面上；退出全屏后按 pet_enabled 自动恢复
+            commands::pet::start_top_watchdog(app.handle().clone());
+
             Ok(())
         })
         .on_window_event(|window, event| {
