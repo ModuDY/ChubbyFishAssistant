@@ -277,10 +277,13 @@ ai-work-assistant/
 ### 5.5 桌宠窗口（P0，`commands/pet.rs`）
 
 - **窗口**：`tauri.conf.json` 声明式创建 `label="pet"`（透明/无边框/置顶/skipTaskbar/`visible:false`）；前端复用 `index.html` 的 `?pet=1` 分流（`?pet=1&probe=1` → 渲染诊断页），**不新增 Vite 入口**。
-- **命令**：`pet_show` / `pet_hide` / `pet_toggle`（写 `pet_enabled` 并立即作用窗口）· `pet_status`（enabled/visible/x/y/scale/opacity/bubble/sleepMinutes）· `pet_save_position`（无参：Rust 读 `outer_position` 物理坐标落盘，前端 `moved` 去抖 500ms 调用）· `pet_focus_main`（双击桌宠呼出主窗口）· `pet_set_hit_mask`（前端上报点击穿透掩码网格，见下）。诊断命令 `pet_probe_ready` / `pet_probe_hide_and_restore` / `pet_probe_report` 仅探针页使用。
+- **命令**：`pet_show` / `pet_hide` / `pet_toggle`（写 `pet_enabled` 并立即作用窗口）· `pet_status`（enabled/visible/x/y/scale/opacity/bubble/sleepMinutes/aiMode/persona）· `pet_save_position`（无参：Rust 读 `outer_position` 物理坐标落盘，前端 `moved` 去抖 500ms 调用）· `pet_focus_main`（双击桌宠呼出主窗口）· `pet_say`（P3：让桌宠说一句 AI 话，返回 sessionId，流式结果经 `pet-say-*` 事件下发，见下）· `pet_set_hit_mask`（前端上报点击穿透掩码网格，见下）。诊断命令 `pet_probe_ready` / `pet_probe_hide_and_restore` / `pet_probe_report` 仅探针页使用。
 - **生命周期**：`pet_enabled=false` 时必须**真正 hide**（透明窗口留着仍会截点击）；`CloseRequested` 一律 `prevent_close` + hide（窗口销毁后无重建路径，托盘开关会变死按钮）。
 - **设置联动**：`settings_set` 命中 `pet_*` 键即调 `pet::apply_settings`（尺寸/位置/置顶/显隐）并 emit `pet-update`，改完立即生效、无需重启。
 - **红线**：桌宠只**读**前端事件、只写 `pet_*` 设置，不碰账号/签到/积分数据，不新增网络外发（P3 台词走本机 127.0.0.1 网关）。
+- **AI 对话（P3，2026-10-19）**：`pet_say` 让桌宠说一句由**本机网关**生成的话，**进程内**执行——取 `ApiServerRuntime.shared`（`Arc<ApiSharedState>`）调 `routes::run_chat_completion`（由 `chat_completions` 主体抽出的公共入口，HTTP 行为零变化），**不走回环 HTTP**（网关路由全经 `bearer_auth`，回环需 API Key 且会污染 Key 用量），不带 Key、不经 socket。人格档位 `pet_persona`（whale/tsundere/butler/zen，`persona_system_prompt` 表驱动 + 硬约束）。Rust 按 `\n\n` **字节层**分帧解析上游 SSE（抗 UTF-8 半字切断），逐 delta 下发 `pet-say-delta{kind}`；首个 reasoning delta 点亮「深度思考碎碎念」（`mumble-deep`）。护栏：`max_tokens=400`（思考与正文共用预算，过小会把额度耗在思考上导致正文为空）、`reasoning_effort=low`、5s 最小间隔、200 次/日上限、首字节 15s / 总 60s 超时、模块级 `SAY_TASK` 新的盖旧的（abort 旧流）。触发：右键「跟我聊一句」（`pet_ai_mode` 非 off 时显示）+ auto 档事件点评（白名单 happy/sad/jump/idle，120s+抖动节流，**默认关**）。失败（未开启/网关未启动/节流/超上限/`no_healthy`/超时/空回复）一律回落本地台词池；用量以 `key_id="internal:pet"` 记账，可单独审计。
+- **角色偶发消失自愈（2026-10-19）**：暂停期间换源会 `load()` 清掉当前帧，恢复后若 `play()` 被拒就一直空白（表现为「角色消失、气泡还在」）。故暂停时**只记下目标动作、不换源**，恢复时补换；另加 3s 自愈守卫（可见且未暂停却拿不到可播放帧 → 强制重载重播）；`visibilitychange` 转可见时经 `pet_status` 确认窗口确实在显示才解除暂停。
+- **两侧菜单状态同步（2026-10-19）**：`pet_enabled` 的托盘文本由 `apply_settings` 统一同步（覆盖托盘 / 桌宠菜单 / 设置页 / 关闭窗口 / 启动）；网关启停由 `api_server::sync_api_state` 统一同步（刷新托盘文本 + 向 pet 窗口推 `pet-update{gatewayRunning}`）。桌宠菜单文案改由单一 `gatewayRunning` 状态驱动，**已打开的菜单**也会立即改写，两侧不再各写各的。
 - **前端几何（2026-10-19 修正）**：视频画布 640×360 而角色只占中间一块 → 根节点 `pointer-events:none`，点击/拖拽热区是独立的 `.pet-hit`，几何由首帧 alpha 包围盒（160×90 采样、alpha 阈值 64、延迟 400ms 取稳定帧，窗口显示后补测）反算成窗口百分比注入；气泡锚点底边 = 角色头顶 + 8px。窗口顶部/左右空白不再触发任何动作。
 - **透明区点击穿透（2026-10-19）**：窗口是矩形而角色只占底部一块，空白区域虽 alpha=0 仍整块接收鼠标消息（表现为「角色周围有一层看不见的遮罩挡住下层窗口的点击」）。前端每次换动作按 alpha 采样出 24×28「可点击格子」并集，经 `pet_set_hit_mask` 上报；Rust `start_hit_watcher` 线程 24ms 跟随光标，落在透明格子即 `set_ignore_cursor_events(true)`（`WS_EX_TRANSPARENT`），回到角色格子再撤掉（连续两帧一致才切，防 `WS_EX_LAYERED` 反复增删闪烁；左键按住/拖拽期间不切）。不用 `SetWindowRgn`——会连渲染一起裁剪，切掉头顶气泡。掩码未就绪/全透明一律不穿透（宁可多挡，不能让角色点不到）。
 - **首启空白（2026-10-19 修复）**：窗口按 `visible:false` 建好后 show，首启时页面仍被判 hidden、`play()` 被拒，原实现只试一次就放弃 → 窗口在而画面整块空。现 `paused` 只认 Rust 下发的 `visible`（不再叠加 `document.hidden`），`play()` 失败按 250ms×(n+1) 退避重试，恢复显示时 `readyState<2` 且已有 src 则重新 `load()`，`onCanPlay` 再补一次。
@@ -307,7 +310,11 @@ ai-work-assistant/
 | `qoder-checkin-progress` | `{"type":"start",total}` / `{"type":"account",index,user_id,name,status,message,reward?,campaigns?}` / `{"type":"done",ok,already,failed,failed_empty_campaigns,skipped_busy?}`（Qoder 签到管线，与 wb-checkin-progress 前端组件同构；`failed_empty_campaigns` 为活动未开始/不可用类失败计数，启动补签推送按 `failed - failed_empty_campaigns` 判定；`campaigns` 为 F-80-余 v2 逐活动明细 `[{id,name,kind,reward?}]`，档期日历数据源；`skipped_busy=true` 表示跨进程锁占用本轮跳过——调度稍后自动重试，前端专项提示**不计入**成功/失败统计；**疑点⑦ store 化**：监听与归约在前端 store 层 setupListeners/`applyQoderCheckinLine`（qoderCheckin.running/lines/done/doneRev），页面切走/卸载不丢事件，QoderCheckin 页按 doneRev 联动刷新） |
 | `qoder-oauth-progress` | `{stage:'init'\|'browser'\|'polling'\|'success'\|'error', message, auth_url?}`（Qoder 设备流登录进度；auth_url 仅 browser 阶段携带） |
 | `qoder-oauth-done` | `{ok, id?, nickname?, message}`（设备流结果；成功已入池，凭证不出 Rust） |
-| `pet-update` | `{visible,bubble,opacity,scale,sleepMinutes}`（Rust → pet 窗口；窗口显隐或 `pet_*` 设置变化时发送，桌宠据此暂停/续播视频并同步气泡配置） |
+| `pet-update` | `{visible,bubble,opacity,scale,sleepMinutes,aiMode,persona,gatewayRunning}`（Rust → pet 窗口；窗口显隐、`pet_*` 设置变化、API 网关启停时发送；桌宠据此暂停/续播视频、同步气泡配置与右键菜单文案） |
+| `pet-say-start` | `{sessionId,trigger:"user"\|"auto",model}`（桌宠 AI 发言已开始下流，前端据此进入流式态） |
+| `pet-say-delta` | `{sessionId,kind:"text"\|"reasoning",delta}`（流式增量逐块下发；reasoning 为思考链，前端小字显示并在首个 delta 点亮 mumble-deep） |
+| `pet-say-done` | `{sessionId,ok,text,reasoning,model,ms}`（终态；text/reasoning 为累计全文） |
+| `pet-say-error` | `{sessionId,code:"gateway_down"\|"no_healthy"\|"upstream"\|"timeout"\|"empty"\|"cancelled"\|"busy",message}`（终态；前端据此清空占位并回落本地台词池） |
 
 ## 7. 数据文件
 
@@ -317,7 +324,7 @@ ai-work-assistant/
 %APPDATA%\AIWorkAssistant\
 ├── conf/
 │   ├── app_settings.json         # Settings 全字段（snake_case）——UI 可编辑配置保留文件形态
-│   │                             #   含 pet_*（桌宠开关/位置/缩放/透明度/气泡，均 serde(default) 兼容老配置）
+│   │                             #   含 pet_*（桌宠开关/位置/缩放/透明度/气泡/人格档位 pet_persona/AI 对话档位 pet_ai_mode；均 serde(default) 兼容老配置）
 │   ├── vault.stronghold          # jwt/refresh_token 权威加密存储（Stronghold）
 │   └── vault_key.bin             # vault 主密码（DPAPI 加密）
 ├── data/

@@ -1158,13 +1158,17 @@ mod say_tests {
         );
     }
 
-    /// 人格档位：每个档位都带公共硬约束；未知档位回落默认
+    /// 人格档位：每个档位都带公共安全/长度约束，且都给了口吻示例；未知档位回落默认
     #[test]
     fn persona_prompt_has_hard_rules_and_default_fallback() {
         for p in [None, Some("whale"), Some("tsundere"), Some("butler"), Some("zen"), Some("nope")] {
             let s = persona_system_prompt(p);
-            assert!(s.contains("不编造未提供的数据"), "档位 {p:?} 缺少硬约束");
-            assert!(s.contains("不超过 40 字"), "档位 {p:?} 缺少长度约束");
+            assert!(s.contains("不编造没给过你的数据"), "档位 {p:?} 缺少『不编造』约束");
+            assert!(s.contains("不提账号名、邮箱、金额"), "档位 {p:?} 缺少隐私约束");
+            assert!(s.contains("拿不准就直说不知道"), "档位 {p:?} 缺少不确定兜底");
+            assert!(s.contains("通常就一两句"), "档位 {p:?} 缺少长度约束");
+            // few-shot 口吻示例：比抽象规则更能锁住语气
+            assert!(s.contains("口吻参考「"), "档位 {p:?} 缺少口吻示例");
         }
         assert!(persona_system_prompt(Some("nope")).contains("大肥鱼"));
         assert!(persona_system_prompt(None).contains("大肥鱼"));
