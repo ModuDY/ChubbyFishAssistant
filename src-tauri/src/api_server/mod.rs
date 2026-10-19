@@ -54,6 +54,10 @@ pub const FUNCTION: &str = "solo_work_lite";
 pub const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 pub const REFERER_BASE: &str = "https://trae-api-cn.mchost.guru";
 
+/// 网关活动事件发射器（设计 §6.5）：网关层无 AppHandle，由启动方注入。
+/// 参数 `(事件名, payload)`；当前用于向 pet 窗口推 `gateway-activity`。
+pub type ActivityEmitter = Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>;
+
 /// API 服务器运行时共享状态（传入 axum State）
 pub struct ApiSharedState {
     /// SOLO 上游账号池（trae llm_utils_chat）
@@ -105,6 +109,11 @@ pub struct ApiSharedState {
     /// 当前并发数（统一网关 §4.5）：由 InflightGuard RAII 维护，覆盖全部业务端点。
     /// Arc 包装使 guard 可跨 spawn_blocking/流任务持有（'static + Send）
     pub inflight: Arc<AtomicU64>,
+    /// 网关活动事件发射器（设计 §6.5）：网关层无 AppHandle，由启动方注入闭包；
+    /// None = 未注入（单测 / 未启用），不产生任何联动事件
+    pub activity_tx: Option<ActivityEmitter>,
+    /// 累计 token（prompt+completion，仅在记账咽喉点累加）：milestone 事件阈值判定（§6.5）
+    pub activity_tokens: AtomicU64,
     pub active_uid: Mutex<Option<String>>,
     pub last_error: Mutex<Option<String>>,
     pub logger: ApiLogger,
@@ -184,8 +193,74 @@ pub struct ApiSharedState {
 impl ApiSharedState {
     /// 进入业务端点时获取并发 guard（§4.5）：inflight +1，Drop 时 -1。
     /// panic 展开 / 客户端断连（axum 丢弃 handler future）/ 流异常终止均兜底释放
+    ///
+    /// 并发 0→1 = 一段网关活跃开始：顺带下发 `active` 边沿（设计 §6.5）。
+    /// 只在真正开始一段活跃时发一次，**不逐请求发**——结束由前端 5s 静默窗判定，
+    /// 避免高频 IPC 与桌宠刷屏。
     pub fn inflight_guard(&self) -> InflightGuard {
-        InflightGuard::acquire(&self.inflight)
+        // 先窥探当前并发：0 = 本次请求开启一段新的网关活跃（随后 acquire 置 1）。
+        // 极窄竞态下两个同时到达的请求可能各发一次 active——只影响"多播一次边沿"，
+        // 前端按 5s 静默窗聚合，无副作用。
+        let starting = self
+            .inflight
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0;
+        let guard = InflightGuard::acquire(&self.inflight);
+        if starting {
+            self.emit_activity(serde_json::json!({ "kind": "active" }));
+        }
+        guard
+    }
+
+    /// 发送一条网关活动事件（设计 §6.5）。未注入发射器时静默（单测 / 未启用）。
+    pub fn emit_activity(&self, payload: serde_json::Value) {
+        if let Some(tx) = &self.activity_tx {
+            tx("gateway-activity", payload);
+        }
+    }
+
+    /// 记账咽喉点的联动（设计 §6.5）：token 里程碑 + 失败边沿。
+    /// - `milestone`：累计 token 每跨越 100 万下发一次；
+    /// - `fail`：失败请求按 `activity-fail|model` 60s 去重（防上游故障期逐请求刷屏），
+    ///   内部流量（`internal:pet`）跳过，避免桌宠被自己的 AI 发言自激。
+    fn note_request_activity(&self, ok: bool, model: &str, key_id: &str, tokens: u64) {
+        if self.activity_tx.is_none() {
+            return;
+        }
+        if tokens > 0 {
+            const STEP: u64 = 1_000_000;
+            let prev = self
+                .activity_tokens
+                .fetch_add(tokens, std::sync::atomic::Ordering::Relaxed);
+            let total = prev + tokens;
+            if total / STEP > prev / STEP {
+                self.emit_activity(serde_json::json!({ "kind": "milestone", "tokens": total }));
+            }
+        }
+        if ok || key_id == "internal:pet" {
+            return;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let key = format!("activity-fail|{model}");
+        {
+            let mut m = self
+                .fallback_log_last_ms
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(&last) = m.get(&key) {
+                if now_ms - last < 60_000 {
+                    return;
+                }
+            }
+            if m.len() >= 256 {
+                m.clear();
+            }
+            m.insert(key, now_ms);
+        }
+        self.emit_activity(serde_json::json!({ "kind": "fail", "model": model }));
     }
 
     /// 记录一次请求用量并原子落盘；写盘失败静默忽略，不影响主流程。
@@ -241,6 +316,7 @@ impl ApiSharedState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((bucket, day));
+        self.note_request_activity(ok, model, key_id, prompt_tokens + completion_tokens);
     }
 
     /// 记录一次自定义模型请求用量（独立 custom_days 桶，与 Trae/WB 侧分账）；
@@ -271,6 +347,7 @@ impl ApiSharedState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((usage::UsageBucket::Custom, day));
+        self.note_request_activity(ok, model, key_id, prompt_tokens + completion_tokens);
     }
 
     /// 记录一次豆包上游请求用量（独立 doubao_days 桶，E-01）；uid 为豆包账号 uid，
@@ -305,6 +382,7 @@ impl ApiSharedState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((usage::UsageBucket::Doubao, day));
+        self.note_request_activity(ok, model, key_id, prompt_tokens + completion_tokens);
     }
 
     /// 记录一次上游缓存读 tokens 测量（M4 审查修复：DayStats 新增 cached_tokens
@@ -388,6 +466,7 @@ impl ApiSharedState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((usage::UsageBucket::Qoder, day));
+        self.note_request_activity(ok, model, key_id, prompt_tokens + completion_tokens);
     }
 
     /// 排空用量脏队列并落盘（flusher 线程 2s 一次 + stop 时调用）。
@@ -952,6 +1031,8 @@ mod inflight_tests {
             default_model: String::new(),
             data_dir: dir.clone(),
             total_requests: AtomicU64::new(0),
+            activity_tx: None,
+            activity_tokens: AtomicU64::new(0),
             inflight: Arc::new(AtomicU64::new(0)),
             active_uid: Mutex::new(None),
             last_error: Mutex::new(None),
@@ -1009,5 +1090,157 @@ mod inflight_tests {
         assert_eq!(acct.load(std::sync::atomic::Ordering::Relaxed), 1);
         drop(g2);
         assert_eq!(acct.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+}
+
+/// 网关活动事件（设计 §6.5）行为验证：用「采集发射器」直接断言触发条件，
+/// 不依赖前端窗口，也不产生磁盘副作用（用量只进内存，不触发 flusher）
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+
+    /// 捕获到的 (事件名, payload)
+    type Sink = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
+
+    static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn tmp_dir() -> std::path::PathBuf {
+        let n = DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("twa_activity_{}_{}", std::process::id(), n))
+    }
+
+    /// 构造一个测试态；with_emitter=false 模拟「未注入发射器」（桌宠联动关闭）
+    fn test_state(with_emitter: bool) -> (ApiSharedState, Sink) {
+        let dir = tmp_dir();
+        let sink: Sink = Arc::new(Mutex::new(Vec::new()));
+        let activity_tx: Option<ActivityEmitter> = if with_emitter {
+            let s = sink.clone();
+            Some(Arc::new(move |ev: &str, p: serde_json::Value| {
+                s.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((ev.to_string(), p));
+            }))
+        } else {
+            None
+        };
+        let state = ApiSharedState {
+            pool: pool::ApiPool::new(),
+            wb_pool: pool::ApiPool::new(),
+            wb_enabled: std::sync::atomic::AtomicBool::new(true),
+            wb_sanitize: std::sync::atomic::AtomicBool::new(true),
+            prompt_degrade_enabled: std::sync::atomic::AtomicBool::new(false),
+            wb_default_thinking: std::sync::atomic::AtomicBool::new(false),
+            wb_tool_exec: std::sync::atomic::AtomicBool::new(false),
+            wb_bg_downgrade: std::sync::atomic::AtomicBool::new(false),
+            wb_longctx_downgrade: std::sync::atomic::AtomicBool::new(false),
+            wb_hedge_threshold_ms: AtomicU64::new(0),
+            trae_hedge_threshold_ms: AtomicU64::new(0),
+            trae_pool_sticky_ttl_secs: AtomicU64::new(0),
+            wb_pool_sticky_ttl_secs: AtomicU64::new(0),
+            qoder_pool_sticky_ttl_secs: AtomicU64::new(0),
+            wb_sticky: wb_sticky::StickyStore::default(),
+            pool_sticky: Mutex::new(std::collections::HashMap::new()),
+            model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+            default_model: String::new(),
+            data_dir: dir.clone(),
+            total_requests: AtomicU64::new(0),
+            activity_tx,
+            activity_tokens: AtomicU64::new(0),
+            inflight: Arc::new(AtomicU64::new(0)),
+            active_uid: Mutex::new(None),
+            last_error: Mutex::new(None),
+            logger: ApiLogger::new(dir.join("logs")),
+            debug_enabled: std::sync::atomic::AtomicBool::new(false),
+            usage: Mutex::new(usage::UsageFile::default()),
+            usage_dirty: Mutex::new(Vec::new()),
+            wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+            wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+            fallback_log_last_ms: Mutex::new(std::collections::HashMap::new()),
+            trae_jwt_refresh: None,
+            trae_enabled: std::sync::atomic::AtomicBool::new(true),
+            qoder_pool: pool::ApiPool::new(),
+            qoder_enabled: std::sync::atomic::AtomicBool::new(true),
+            qoder_identity: None,
+            qoder_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+            qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
+            qoder_sticky: wb_sticky::StickyStore::default(),
+            trae_sticky: wb_sticky::StickyStore::default(),
+            doubao_pool: pool::ApiPool::new(),
+            doubao_enabled: std::sync::atomic::AtomicBool::new(false),
+            doubao_identity: None,
+            doubao_pool_sticky_ttl_secs: AtomicU64::new(0),
+            doubao_quota: super::doubao_route::DoubaoQuota::new(),
+            listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
+        };
+        (state, sink)
+    }
+
+    /// 事件名列表（断言用）
+    fn events(sink: &Sink) -> Vec<String> {
+        sink.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(e, _)| e.clone())
+            .collect()
+    }
+
+    /// kind 列表（断言用）
+    fn kinds(sink: &Sink) -> Vec<String> {
+        sink.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(_, p)| {
+                p.get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// 每段活跃（并发 0→1）发一次 active；并发未归零时不重复发
+    #[test]
+    fn active_once_per_burst_not_per_request() {
+        let (st, sink) = test_state(true);
+        let g1 = st.inflight_guard(); // 0→1 → active
+        let _g2 = st.inflight_guard(); // 并发未归零 → 不发
+        let _g3 = st.inflight_guard();
+        drop(g1);
+        assert_eq!(events(&sink), vec!["gateway-activity"]);
+        assert_eq!(kinds(&sink), vec!["active"]);
+
+        drop(_g2);
+        drop(_g3); // 1→0（Rust 不发 idle，结束由前端静默窗判定）
+        let _g4 = st.inflight_guard(); // 新的 0→1 → 再发一次 active
+        assert_eq!(kinds(&sink), vec!["active", "active"]);
+    }
+
+    /// 失败请求发 fail；内部流量（internal:pet）跳过（防桌宠被自己的发言自激）
+    #[test]
+    fn fail_emitted_but_internal_pet_skipped() {
+        let (st, sink) = test_state(true);
+        st.record_usage(true, "m", "uid", "key1", false, false, 5, 1, 1);
+        st.record_usage(true, "m", "uid", "internal:pet", false, false, 5, 1, 1);
+        assert_eq!(kinds(&sink), vec!["fail"]);
+    }
+
+    /// 成功请求不发 fail；累计 token 每跨越 100 万发一次 milestone
+    #[test]
+    fn milestone_on_token_step_no_fail_on_success() {
+        let (st, sink) = test_state(true);
+        st.record_usage(true, "m", "uid", "k", true, false, 1, 0, 900_000); // 90 万：未跨
+        st.record_usage(true, "m", "uid", "k", true, false, 1, 0, 200_000); // 110 万：跨
+        assert_eq!(kinds(&sink), vec!["milestone"]);
+    }
+
+    /// 未注入发射器（桌宠联动关闭）：任何挂点都不产生事件
+    #[test]
+    fn no_emitter_is_silent() {
+        let (st, sink) = test_state(false);
+        {
+            let _g = st.inflight_guard();
+        }
+        st.record_usage(true, "m", "uid", "key1", false, false, 5, 1, 1);
+        assert!(events(&sink).is_empty());
     }
 }

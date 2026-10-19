@@ -321,6 +321,19 @@ pub async fn do_start(
     wb_pool.set_log_ctx(&state.data_dir, "buddy");
     qoder_pool.set_log_ctx(&state.data_dir, "qoder");
     doubao_pool.set_log_ctx(&state.data_dir, "doubao");
+    // 网关活动发射器（设计 §6.5）：网关层无 AppHandle，这里统一构造一次——
+    // 既注入各池（note_error 的 degrade 边沿），也挂到 ApiSharedState（active/fail/…）。
+    // 事件只发给 pet 窗口；桌宠未启用时 emit_to 静默失败，不影响网关主流程
+    let activity_tx: crate::api_server::ActivityEmitter = {
+        let app = app.clone();
+        std::sync::Arc::new(move |event: &str, payload: serde_json::Value| {
+            let _ = app.emit_to(crate::commands::pet::PET_LABEL, event, payload);
+        })
+    };
+    pool.set_activity_ctx(activity_tx.clone());
+    wb_pool.set_activity_ctx(activity_tx.clone());
+    qoder_pool.set_activity_ctx(activity_tx.clone());
+    doubao_pool.set_activity_ctx(activity_tx.clone());
     // 账号保留剩余积分（issue #91）：调度策略统一配置，启动时各池应用
     //（credits=0 时无过滤；Qoder 池 credits 恒 None 不受影响，保持口径一致仍设置）
     let reserve_credits = crate::api_server::dispatch::load_policy(&state.data_dir).reserve_credits;
@@ -469,6 +482,8 @@ pub async fn do_start(
         default_model,
         data_dir: state.data_dir.clone(),
         total_requests: std::sync::atomic::AtomicU64::new(0),
+        activity_tx: Some(activity_tx.clone()),
+        activity_tokens: std::sync::atomic::AtomicU64::new(0),
         inflight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         active_uid: Mutex::new(None),
         last_error: Mutex::new(None),

@@ -141,10 +141,27 @@ pub fn start_checkin_core(
     let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
     std::thread::spawn(move || {
         let st = app2.state::<AppState>();
-        run_checkin_worker(&app2, &st, opts, notify_done, tx);
+        // issue #44 同款统一终态出口：工作线程 panic（unwrap 等）时 done 永不发射，
+        // 前端签到横幅与桌宠核心态会永久卡在「进行中」。捕获后补发一条 fatal done 复位
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_checkin_worker(&app2, &st, opts, notify_done, tx);
+        }));
+        if result.is_err() {
+            emit_fatal_done(&app2, &st.data_dir);
+        }
     });
     // 等待启动阶段结果（抢锁 + 筛选 + 候选凭据准备），通常毫秒级
     rx.recv().unwrap_or_else(|_| Err("签到工作线程异常退出".into()))
+}
+
+/// panic 兜底终态（issue #44 同款）：计数未知，按 `fatal` 标记让前端走错误收尾。
+/// 关键是**保证 `done` 一定发出**——前端横幅与桌宠核心态都依赖它复位
+fn emit_fatal_done(app: &AppHandle, data_dir: &std::path::Path) {
+    let payload = serde_json::json!({
+        "type": "done", "ok": 0, "already": 0, "failed": 0, "total": 0, "fatal": true
+    });
+    let _ = app.emit("checkin-progress", &payload);
+    crate::events::emit_logged(app, "checkin-done", payload, Some(data_dir));
 }
 
 /// 发送最终汇总 done 事件（checkin-progress + checkin-done），并按需发系统通知

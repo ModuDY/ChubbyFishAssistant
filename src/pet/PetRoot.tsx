@@ -26,6 +26,7 @@ import { usePetEvents } from './usePetEvents';
 import type { PetSignal } from './usePetEvents';
 import { usePetSay, type SayState } from './usePetSay';
 import { usePetAutoSay, AUTO_TRIGGER_TYPES } from './usePetAutoSay';
+import { usePetGatewayEvents } from './usePetGatewayEvents';
 import type { PetAiMode } from '../types';
 import './pet.css';
 
@@ -67,6 +68,8 @@ type PetUpdatePayload = {
    * 用于让**已打开的**右键菜单立即改写「启动 / 停止」文案，避免两侧菜单状态不一致。
    */
   gatewayRunning?: boolean;
+  /** P5：网关活动联动开关（设置页改完即时下发；设计 §6.5） */
+  gatewayLink?: boolean;
 };
 
 /**
@@ -118,6 +121,8 @@ export default function PetRoot() {
    * 两个菜单（托盘 + 桌宠）因此始终显示同一状态，不会各写各的。
    */
   const [gatewayRunning, setGatewayRunning] = useState(false);
+  /** P5：网关活动联动开关（默认关；来自 Rust pet-update / pet_status，设计 §6.5） */
+  const [gatewayLink, setGatewayLink] = useState(false);
   const [bubbleEnabled, setBubbleEnabled] = useState(true);
   const [opacity, setOpacity] = useState(1);
   const [sleepMinutes, setSleepMinutes] = useState(5);
@@ -269,7 +274,13 @@ export default function PetRoot() {
   });
 
   /* ------------------------- 业务事件 → 状态 ------------------------- */
-  usePetEvents((signal: PetSignal) => {
+  /**
+   * 业务事件与网关活动（P5）共用的信号处理：两者都产出 `PetSignal`，走同一状态机
+   * （`raise` 优先级聚合）与同一套气泡/瞬态逻辑。
+   * 用普通箭头函数（每次渲染新引用无妨）：两个 hook 内部都以 ref 持有最新回调，
+   * 不会因它换引用而重订阅。
+   */
+  const handleSignal = (signal: PetSignal) => {
     lastEventRef.current = Date.now();
     stallFiredRef.current = false;
     // 记录最近事件摘要，供 AI 回复当"背景"（只含状态文案，不含账号/金额）
@@ -326,6 +337,20 @@ export default function PetRoot() {
     if (aiMode === 'auto' && AUTO_TRIGGER_TYPES.has(signal.type) && signal.text) {
       autoSay(buildSayPrompt(signal.text), signal.text);
     }
+  };
+
+  /** 业务流（签到 / 切换 / 积分）是否进行中：网关 burst 结束时据此避让核心态回落 */
+  const businessActiveRef = useRef(false);
+  usePetEvents((signal) => {
+    // working/thinking = 一笔业务流进行中；idle = 业务流收尾（done / exit）
+    if (signal.type === 'working' || signal.type === 'thinking') businessActiveRef.current = true;
+    else if (signal.type === 'idle') businessActiveRef.current = false;
+    handleSignal(signal);
+  });
+  // 网关活动联动（P5，设计 §6.5）：仅在设置项开启时订阅 `gateway-activity`；
+  // 一段活跃结束时若业务流进行中则避让（不强降核心态、不叠庆祝），避免打断 working/sad
+  usePetGatewayEvents(handleSignal, gatewayLink, {
+    isBusinessBusy: () => businessActiveRef.current || coreRef.current === 'sad',
   });
 
   /* --------------------- 隐藏即停（窗口不可见） --------------------- */
@@ -352,6 +377,10 @@ export default function PetRoot() {
       if (typeof patch.gatewayRunning === 'boolean') {
         setGatewayRunning(patch.gatewayRunning);
       }
+      // P5：网关活动联动开关（默认关）
+      if (typeof patch.gatewayLink === 'boolean') {
+        setGatewayLink(patch.gatewayLink);
+      }
       // P4-3：素材包切换 → 重新装载动作表（包里缺的动作回落内置；加载失败也回落内置）
       if (typeof patch.pack === 'string') {
         void applyPetPack(patch.pack);
@@ -368,6 +397,7 @@ export default function PetRoot() {
           sleepMinutes: s.sleepMinutes,
           aiMode: s.aiMode,
           pack: s.pack,
+          gatewayLink: s.gatewayLink,
         });
       })
       .catch(() => {

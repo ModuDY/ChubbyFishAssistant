@@ -64,12 +64,16 @@ where
 {
     std::thread::spawn(move || {
         let _guard = round;
-        f(&app, &state);
+        // issue #44 同款统一终态出口：f 内部 panic 时下面的 exit 会漏发，前端运行态与
+        // 桌宠核心态永久卡在「进行中」。捕获后仍发 exit（ok=false 标记异常终止）
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            f(&app, &state);
+        }));
         // 终态事件（前端据 "type":"exit" 复位运行态）：emit 失败落日志（issue #44 遗留项）。
         // 注意：wb-checkin-progress 前端契约是 NDJSON **字符串**（listen<string> 后
         // JSON.parse）——payload 必须序列化为 String，传对象会破坏 parseLine 导致
         // exit 事件被静默丢弃、前端运行态永挂
-        let line = serde_json::json!({ "type": "exit", "ok": true }).to_string();
+        let line = serde_json::json!({ "type": "exit", "ok": result.is_ok() }).to_string();
         crate::events::emit_logged(
             &app,
             "wb-checkin-progress",

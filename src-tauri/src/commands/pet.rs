@@ -168,6 +168,8 @@ pub fn apply_settings(app: &AppHandle) {
             "persona": settings.pet_persona.clone().unwrap_or_else(|| "whale".into()),
         // 素材包：切换形象时前端据此重新装载动作表（builtin = 内置素材）
         "pack": settings.pet_pack.clone().unwrap_or_else(|| "builtin".into()),
+        // 网关活动联动开关（设计 §6.5）：默认关
+        "gatewayLink": settings.pet_gateway_link,
         }),
     );
 }
@@ -246,6 +248,8 @@ pub fn pet_status(app: AppHandle) -> serde_json::Value {
         "persona": settings.pet_persona.clone().unwrap_or_else(|| "whale".into()),
         // 素材包：切换形象时前端据此重新装载动作表（builtin = 内置素材）
         "pack": settings.pet_pack.clone().unwrap_or_else(|| "builtin".into()),
+        // 网关活动联动开关（设计 §6.5）：默认关
+        "gatewayLink": settings.pet_gateway_link,
     })
 }
 

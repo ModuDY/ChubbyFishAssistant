@@ -497,6 +497,8 @@ export interface Settings {
   pet_sleep_minutes?: number | null;
   /** 素材包（P4 预留） */
   pet_pack?: string | null;
+  /** 网关活动联动（设计 §6.5，默认关） */
+  pet_gateway_link?: boolean;
 }
 
 /**
@@ -525,6 +527,8 @@ export interface PetStatus {
   persona?: string;
   /** P4-3：当前素材包（builtin = 内置素材） */
   pack?: string;
+  /** P5：网关活动联动开关（pet_status / pet-update 下发） */
+  gatewayLink?: boolean;
 }
 
 /** F-74：会话域（WorkBuddy = ~/.workbuddy，CodeBuddy = ~/.codebuddy） */

@@ -357,6 +357,48 @@ fn log_fallback(state: &ApiSharedState, model: &str, preferred: TargetPool, actu
             reason.as_str(),
         ),
     );
+    // 网关活动联动（设计 §6.5）：跨池回退 → switch 边沿。复用本函数的 60s 节流，
+    // 只在真正落盘这条 warn 的同时下发，避免上游故障期逐请求刷屏
+    state.emit_activity(serde_json::json!({
+        "kind": "switch",
+        "model": model,
+        "pool": actual.as_str(),
+        "from": preferred.as_str(),
+        "reason": reason.as_str(),
+    }));
+}
+
+/// 全池无可用账号 → `no-healthy` 边沿（设计 §6.5）。
+/// 60s 按 model 去重（复用 fallback_log_last_ms 命名空间），防上游故障期逐请求刷屏
+fn emit_no_healthy(state: &ApiSharedState, model: &str, pool: TargetPool) {
+    if state.activity_tx.is_none() {
+        return;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let key = format!("nohealth|{model}");
+    {
+        let mut m = state
+            .fallback_log_last_ms
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(&last) = m.get(&key) {
+            if now_ms - last < 60_000 {
+                return;
+            }
+        }
+        if m.len() >= 256 {
+            m.clear();
+        }
+        m.insert(key, now_ms);
+    }
+    state.emit_activity(serde_json::json!({
+        "kind": "no-healthy",
+        "model": model,
+        "pool": pool.as_str(),
+    }));
 }
 
 /// 统一调度分流点（§4.1 ②~⑥）：替代原 `resolve_wb_target` 单向判定。
@@ -706,7 +748,10 @@ pub fn resolve_target(
                             .unwrap_or(0) as i64;
                             DispatchError::ModelCooling(secs)
                         }
-                        (p, _) => DispatchError::NoHealthy(p),
+                        (p, _) => {
+                            emit_no_healthy(state, model, p);
+                            DispatchError::NoHealthy(p)
+                        }
                     });
                 }
                 if fallback_from.is_none() {
@@ -732,6 +777,11 @@ pub fn resolve_target(
             ),
         );
     }
+    emit_no_healthy(
+        state,
+        model,
+        forced_pool.or(preferred).unwrap_or(TargetPool::Trae),
+    );
     Err(DispatchError::NoHealthy(
         // issue #90 修复③a：前缀锁定池不可用时错误指向该池（而非兜底 Trae，
         // 否则「qoder/xxx 但 qoder 池耗尽」报成 Trae 无健康账号，误导排障）
@@ -1045,6 +1095,8 @@ mod tests {
             default_model: "deepseek-v4-flash".into(),
             data_dir: dir.clone(),
             total_requests: std::sync::atomic::AtomicU64::new(0),
+            activity_tx: None,
+            activity_tokens: std::sync::atomic::AtomicU64::new(0),
             inflight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             active_uid: std::sync::Mutex::new(None),
             last_error: std::sync::Mutex::new(None),

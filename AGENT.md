@@ -61,6 +61,7 @@ ai-work-assistant/
 │   │                             #   dashboard/ 积分看板（platform 参数化：credits 视图=Trae 页、buddy-credits 视图=Buddy 页、qoder-credits 视图=Qoder 页替换旧 QoderCredits；KpiRow/CreditsTab/TokensTab/ExpiryTab/adapters）
 │   │                             #   buddy/（BuddyOverview/BuddyAccounts/BuddyCheckin/BuddyApiService/BuddySettings）
 ├── scripts/                      # dev-tauri.mjs(tauri 脚本入口) / sync_version.mjs / rename_release.mjs / package_portable.mjs / gen_asset_base64.mjs
+├── tools/pet-pipeline/           # 桌宠素材处理链（开发期工具，不进安装包）：build-asset.mjs(编排) / check-asset.mjs(校验) / vendor/(上游 4 步脚本逐字复制，MIT)。前置依赖 Python+numpy/scipy+带 libvpx 的便携 ffmpeg（见该目录 README）
 ├── src-tauri/
 │   ├── tauri.conf.json           # 无装饰窗 / 无外部资源（Python 与 PS 桥均已移除，全 Rust）
 │   └── src/
@@ -289,6 +290,7 @@ ai-work-assistant/
 - **首启空白（2026-10-19 修复）**：窗口按 `visible:false` 建好后 show，首启时页面仍被判 hidden、`play()` 被拒，原实现只试一次就放弃 → 窗口在而画面整块空。现 `paused` 只认 Rust 下发的 `visible`（不再叠加 `document.hidden`），`play()` 失败按 250ms×(n+1) 退避重试，恢复显示时 `readyState<2` 且已有 src 则重新 `load()`，`onCanPlay` 再补一次。
 - **素材 alpha 底噪（2026-10-19）**：webm 背景残留 alpha ≈ 8%（20/255），浅色窗口上可见淡灰矩形。素材层改不了（本机无 libvpx，VP9+alpha 只有硬件编码、不支持 yuva420p），故由 `PetRoot` 内联 SVG 定义 `feComponentTransfer/feFuncA`（`a'=(a-0.1)/0.9`），`pet.css` 给 `.pet-video` 挂 `filter: url(#pet-alpha-floor)`。`ALPHA_FLOOR` 常量可调：调大更干净、角色边缘更硬。**若将来能重编码素材，应优先在素材层清零（一次处理、零运行时开销）。**
 - **动作接线对齐上游（2026-10-19）**：动作语义以上游 `PC2005-cloud/dsh-pet` 的 `dsh-pet/assets/config.jsonc` 为准——`animations.events.workStatus` 按索引=档位（0=thinking 回合开始 / 1=working 工具调用 / 2=result / 3=waiting / 4=success / 5=error），故签到/切换在 `start` 阶段先发 `thinking`（播 work-think）、首个 `account` 事件再升 `working`（work-busy）；`深度思考碎碎念` 在上游属 `animations.categories` 的「文字」随机池（weight 10），不是 thinking 专用，故并入 idle 彩蛋池。收尾（`done`/`exit`/`switch-done`）必须 `emit(idle, force=true)` 显式降核心态，否则会卡在 thinking/working 的循环动作。
+- **网关活动联动（P5，2026-10-19，设计 §6.5）**：`pet_gateway_link`（**默认关**）开启后，网关（`api_server`）的活动驱动桌宠反应——把「外部 AI 工具正用本机账号池干活」变成实时状态。网关层无 AppHandle，故在 `do_start` 统一构造一个发射闭包（`ActivityEmitter`）注入各池（`set_activity_ctx`）与 `ApiSharedState`（`activity_tx`）；事件 `gateway-activity` 只发给 pet 窗口。挂点：并发 0→1（`inflight_guard`）发 `active`；`record_usage*` 记账咽喉发 `fail`（`internal:pet` 过滤防自激 + 按 model 60s 去重）与 `milestone`（累计 token 每 100 万）；`dispatch::log_fallback` 发 `switch`；`dispatch` 全池耗尽发 `no-healthy`；`pool::note_error` 熔断/积分耗尽发 `degrade`。一段活跃的**结束**由前端 `usePetGatewayEvents` 的 5s 静默窗判定（Rust 不逐请求发，避免刷屏）。前端复用既有 `PetSignal` 状态机，不新增状态；burst 结束时若业务流进行中（`PetRoot` 的 `businessActiveRef`）或处于 `sad` 停留，则**避让**不回落核心态，避免打断签到/切换的 `working` 与失败表情。
 - **窗口宽度 = 角色舞台 + 右侧菜单留白（2026-10-19）**：`pet.rs` 的 `MENU_SPACE=160` 与 `pet.css` 的 `--pet-menu-space:160px` 必须同步改；`.pet-video` 只铺满舞台（`calc(100% - var(--pet-menu-space))`）、左对齐，角色视觉位置不变，右侧留白全透明（走点击穿透放行鼠标）。右键菜单以角色 alpha 包围盒右缘为锚点、垂直居中，故能在角色右侧完整展开而不被窗口裁剪；气泡锚点同样扣掉这段留白，才会居中对准角色。
 
 ## 6. Tauri 事件（Rust → 前端）
@@ -297,7 +299,7 @@ ai-work-assistant/
 |---|---|
 | `proxy-log` | `string`（代理 stdout 逐行） |
 | `account-captured` | `string`（新捕获的 userId） |
-| `checkin-progress` | `{type:'start',total}` / `{type:'account',...}` / `{type:'done',ok,already,failed}` |
+| `checkin-progress` | `{type:'start',total}` / `{type:'account',...}` / `{type:'done',ok,already,failed,fatal?}`（`fatal:true` = 工作线程 panic 兜底终态，计数缺省，仅用于复位横幅与桌宠核心态） |
 | `switch-progress` | `string`（switcher NDJSON 单行） |
 | `switch-done` | `{ success: boolean, raw: string }` |
 | `save-login-progress` | `string`（switcher NDJSON 单行） |
@@ -310,11 +312,12 @@ ai-work-assistant/
 | `qoder-checkin-progress` | `{"type":"start",total}` / `{"type":"account",index,user_id,name,status,message,reward?,campaigns?}` / `{"type":"done",ok,already,failed,failed_empty_campaigns,skipped_busy?}`（Qoder 签到管线，与 wb-checkin-progress 前端组件同构；`failed_empty_campaigns` 为活动未开始/不可用类失败计数，启动补签推送按 `failed - failed_empty_campaigns` 判定；`campaigns` 为 F-80-余 v2 逐活动明细 `[{id,name,kind,reward?}]`，档期日历数据源；`skipped_busy=true` 表示跨进程锁占用本轮跳过——调度稍后自动重试，前端专项提示**不计入**成功/失败统计；**疑点⑦ store 化**：监听与归约在前端 store 层 setupListeners/`applyQoderCheckinLine`（qoderCheckin.running/lines/done/doneRev），页面切走/卸载不丢事件，QoderCheckin 页按 doneRev 联动刷新） |
 | `qoder-oauth-progress` | `{stage:'init'\|'browser'\|'polling'\|'success'\|'error', message, auth_url?}`（Qoder 设备流登录进度；auth_url 仅 browser 阶段携带） |
 | `qoder-oauth-done` | `{ok, id?, nickname?, message}`（设备流结果；成功已入池，凭证不出 Rust） |
-| `pet-update` | `{visible,bubble,opacity,scale,sleepMinutes,aiMode,persona,gatewayRunning}`（Rust → pet 窗口；窗口显隐、`pet_*` 设置变化、API 网关启停时发送；桌宠据此暂停/续播视频、同步气泡配置与右键菜单文案） |
+| `pet-update` | `{visible,bubble,opacity,scale,sleepMinutes,aiMode,persona,gatewayRunning,gatewayLink}`（Rust → pet 窗口；窗口显隐、`pet_*` 设置变化、API 网关启停时发送；桌宠据此暂停/续播视频、同步气泡配置、右键菜单文案与网关活动联动开关） |
 | `pet-say-start` | `{sessionId,trigger:"user"\|"auto",model}`（桌宠 AI 发言已开始下流，前端据此进入流式态） |
 | `pet-say-delta` | `{sessionId,kind:"text"\|"reasoning",delta}`（流式增量逐块下发；reasoning 为思考链，前端小字显示并在首个 delta 点亮 mumble-deep） |
 | `pet-say-done` | `{sessionId,ok,text,reasoning,model,ms}`（终态；text/reasoning 为累计全文） |
 | `pet-say-error` | `{sessionId,code:"gateway_down"\|"no_healthy"\|"upstream"\|"timeout"\|"empty"\|"cancelled"\|"busy",message}`（终态；前端据此清空占位并回落本地台词池） |
+| `gateway-activity` | `{kind:"active"\|"idle"\|"fail"\|"switch"\|"degrade"\|"no-healthy"\|"milestone",pool?,from?,reason?,model?,tokens?,requests?}`（P5 网关活动事件，设计 §6.5；`api_server` → pet 窗口）：`active` 于并发 0→1 发一次（一段活跃的**结束**由前端 5s 静默窗判定，Rust 不逐请求发）；`fail`/`switch`/`degrade`/`no-healthy` 为上游健康边沿（60s 去重）；`milestone` 累计 token 每跨越 100 万。内部流量（`internal:pet`）已过滤防自激 |
 
 ## 7. 数据文件
 
@@ -324,7 +327,7 @@ ai-work-assistant/
 %APPDATA%\AIWorkAssistant\
 ├── conf/
 │   ├── app_settings.json         # Settings 全字段（snake_case）——UI 可编辑配置保留文件形态
-│   │                             #   含 pet_*（桌宠开关/位置/缩放/透明度/气泡/人格档位 pet_persona/AI 对话档位 pet_ai_mode；均 serde(default) 兼容老配置）
+│   │                             #   含 pet_*（桌宠开关/位置/缩放/透明度/气泡/人格档位 pet_persona/AI 对话档位 pet_ai_mode/网关联动 pet_gateway_link；均 serde(default) 兼容老配置）
 │   ├── vault.stronghold          # jwt/refresh_token 权威加密存储（Stronghold）
 │   └── vault_key.bin             # vault 主密码（DPAPI 加密）
 ├── data/

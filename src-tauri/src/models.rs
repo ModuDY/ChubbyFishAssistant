@@ -402,6 +402,10 @@ pub struct Settings {
     /// 素材包名（P4 换装预留；None = 内置）
     #[serde(default)]
     pub pet_pack: Option<String>,
+    /// 网关活动联动（设计 §6.5）：开启后网关的请求活动 / 上游健康事件驱动桌宠反应。
+    /// 默认关（不打扰存量用户）
+    #[serde(default)]
+    pub pet_gateway_link: bool,
 }
 
 fn default_api_port() -> u16 {

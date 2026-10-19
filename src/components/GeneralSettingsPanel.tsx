@@ -409,6 +409,14 @@ export default function GeneralSettingsPanel() {
               />
               显示气泡台词
             </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.pet_gateway_link ?? false}
+                onChange={(e) => update('pet_gateway_link', e.target.checked)}
+              />
+              联动 API 网关活动
+            </label>
             <div>
               <label className="label">大小</label>
               <div className="flex items-center gap-2">

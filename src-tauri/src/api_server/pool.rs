@@ -193,6 +193,10 @@ pub struct ApiPool {
     /// 冷却/禁用标记的 app.log 观测上下文：(data_dir, 池标签)。
     /// do_start 装配三池（trae/buddy/qoder）时注入；None（测试/未启动）不落日志
     log_ctx: Mutex<Option<(std::path::PathBuf, String)>>,
+    /// 网关活动事件发射器（设计 §6.5）：与 log_ctx 同款注入模式；
+    /// note_error 命中熔断 / 积分耗尽时下发 `degrade` 边沿。
+    /// None（测试 / 未启用桌宠联动）时静默
+    activity: Mutex<Option<super::ActivityEmitter>>,
     /// 暂停选号的 uid 集合（账号级运维态）。
     ///
     /// 与 `disabled` 的区别：disabled 是终态（session/授权判死，需人工解冻），
@@ -218,6 +222,7 @@ impl ApiPool {
             concurrency_limit: std::sync::atomic::AtomicU32::new(1),
             reserve_credits: std::sync::atomic::AtomicU64::new(0.0f64.to_bits()),
             log_ctx: Mutex::new(None),
+            activity: Mutex::new(None),
             paused: Mutex::new(HashSet::new()),
         }
     }
@@ -257,6 +262,12 @@ impl ApiPool {
     /// 未装配（测试/未启动网关）时 note_error 不落 app.log，无副作用
     pub fn set_log_ctx(&self, data_dir: &std::path::Path, label: &str) {
         *safe_lock(&self.log_ctx) = Some((data_dir.to_path_buf(), label.to_string()));
+    }
+
+    /// 装配网关活动发射器（设计 §6.5）：与 `set_log_ctx` 同款注入模式，
+    /// do_start 启动时给各池注入同一闭包；未装配（测试 / 未启用）时 note_error 不发事件
+    pub fn set_activity_ctx(&self, tx: super::ActivityEmitter) {
+        *safe_lock(&self.activity) = Some(tx);
     }
 
     /// 设置账号并发上限（F-77，pool_set 热应用；0 = 不限）
@@ -926,6 +937,9 @@ impl ApiPool {
     pub fn note_error(&self, uid: &str, kind: ErrKind) {
         let mut entries = safe_lock(&self.entries);
         let mut cooldown_ev: Option<(String, String)> = None;
+        // 网关活动联动（设计 §6.5）：只在熔断 / 积分耗尽这类"上游真出状况"的
+        // 边沿置位；软限流 / 短冷却不置位，避免桌宠被短暂抖动刷屏
+        let mut degrade: Option<&'static str> = None;
         if let Some(e) = entries.get_mut(uid) {
             e.failures = e.failures.saturating_add(1);
             let mut action: Option<String> = None;
@@ -946,6 +960,7 @@ impl ApiPool {
                         "action=hard_cooldown until={} (下个04:00)",
                         fmt_local_ts(until)
                     ));
+                    degrade = Some("hard_credit");
                 }
                 ErrKind::PlanLimit | ErrKind::SoftRate | ErrKind::NotFound => {
                     let secs = kind.cooldown_duration().as_secs() as i64;
@@ -975,6 +990,7 @@ impl ApiPool {
                             "action=circuit_breaker secs={capped} until={}",
                             fmt_local_ts(until)
                         ));
+                        degrade = Some("circuit_breaker");
                     }
                 }
             }
@@ -983,6 +999,15 @@ impl ApiPool {
             }
         }
         drop(entries);
+        // 网关活动联动（设计 §6.5）：熔断 / 积分耗尽下发 degrade 边沿
+        if let Some(kind) = degrade {
+            if let Some(tx) = safe_lock(&self.activity).clone() {
+                tx(
+                    "gateway-activity",
+                    serde_json::json!({ "kind": "degrade", "reason": kind }),
+                );
+            }
+        }
         // F-80：log_ctx 未装配（测试/未启动）时静默跳过，不产生日志副作用
         if let Some((name, ev)) = cooldown_ev {
             let ctx = safe_lock(&self.log_ctx).clone();
