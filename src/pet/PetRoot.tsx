@@ -77,12 +77,15 @@ function buildSayPrompt(context?: string): string {
   const now = new Date();
   const h = now.getHours();
   const greet = h < 6 ? '凌晨' : h < 12 ? '早上' : h < 14 ? '中午' : h < 18 ? '下午' : '晚上';
-  const clock = `${String(h).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+  // 口语化时间（「晚上 7 点 47」而不是「19:47」）：给 24 小时制时模型会说成
+  // 「都七点四十七啦」，在晚上语境里读着别扭
+  const hour12 = h % 12 === 0 ? 12 : h % 12;
+  const clock = `${greet}${hour12}点${String(now.getMinutes()).padStart(2, '0')}分`;
   const angle = SAY_ANGLES[Math.floor(Math.random() * SAY_ANGLES.length)];
   // 给「情境」而不是「要求」：知道现在几点、刚发生了什么，才有话可说
   return context
-    ? `现在是${greet} ${clock}。刚发生：${context}。${angle}，就着这件事。`
-    : `现在是${greet} ${clock}，我正对着电脑。${angle}。`;
+    ? `现在是${clock}。刚发生：${context}。${angle}，就着这件事。`
+    : `现在是${clock}，我正对着电脑。${angle}。`;
 }
 
 export default function PetRoot() {
