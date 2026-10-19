@@ -35,6 +35,6 @@ export const PET_ATTRIBUTION =
   '桌宠素材来自 PC2005-cloud/dsh-pet (MIT) · 工程实现参考 MerZlin/dsh-pet-indesktop (MIT)';
 
 export const LINK_GITHUB = 'https://github.com/ModuDY';
-export const LINK_REPO = 'https://github.com/ModuDY/DY-Work';
+export const LINK_REPO = 'https://github.com/ModuDY/ChubbyFishAssistant';
 
 export { promoBanner, donateQr };
