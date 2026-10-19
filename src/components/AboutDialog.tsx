@@ -26,6 +26,7 @@ import {
   LINK_GITHUB,
   LINK_REPO,
   promoBanner,
+  donateQr,
 } from '../lib/about';
 
 type UpdateState =
@@ -290,6 +291,21 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
             alt="大肥鱼助手 — 多账号签到与管理一站式工作台"
             className="w-full"
           />
+        </div>
+
+        {/* 赞赏码：与 README「赞赏」段同一张图（base64 内嵌，不依赖静态服务器） */}
+        <div className="rounded-xl border border-slate-200 p-3 text-center dark:border-zinc-700">
+          <div className="mb-2 text-xs font-bold uppercase tracking-wide text-slate-400 dark:text-zinc-500">
+            赞赏
+          </div>
+          <img
+            src={donateQr}
+            alt="赞赏码"
+            className="mx-auto w-40 rounded-lg"
+          />
+          <p className="mt-2 text-[11px] leading-relaxed text-slate-400 dark:text-zinc-500">
+            如果这个项目对你有帮助，欢迎请作者喝杯快乐水 ☕
+          </p>
         </div>
 
         {/* 作者与版权 */}

@@ -119,7 +119,7 @@ node scripts/package_portable.mjs   # 便携版 zip（大肥鱼助手_<版本>_x
 如果这个项目对你有帮助，欢迎请作者喝杯快乐水 ☕
 
 <div align="center">
-<img src="src/assets/donate-qr.jpg" alt="赞赏码" width="220" />
+<img src="src/assets/donate-qr.png" alt="赞赏码" width="220" />
 </div>
 
 ## 素材与致谢

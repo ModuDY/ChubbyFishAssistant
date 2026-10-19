@@ -1,6 +1,8 @@
 // 软件宣传图 base64 内嵌（由 scripts/gen_asset_base64.mjs 从 promo_banner.jpg 生成）：
 // dev server 关闭后弹窗图片仍可显示，不依赖运行中的静态服务器
 import { promo_banner_base64 as promoBanner } from '../assets/promo-banner.base64';
+// 赞赏码 base64 内嵌（同款原因：关于页在静态服务器不可用时也要能看到二维码）
+import { donate_qr_base64 as donateQr } from '../assets/donate-qr.base64';
 
 /** 应用品牌与关于信息（集中管理，改名只改这里；版本号不再硬编码——运行时经 getVersion() 读 Cargo.toml 单一来源） */
 export const APP_NAME = '大肥鱼助手';
@@ -35,4 +37,4 @@ export const PET_ATTRIBUTION =
 export const LINK_GITHUB = 'https://github.com/ModuDY';
 export const LINK_REPO = 'https://github.com/ModuDY/DY-Work';
 
-export { promoBanner };
+export { promoBanner, donateQr };

@@ -5,7 +5,7 @@
  *   node scripts/gen_asset_base64.mjs <输入图片> <输出.ts> [mime]
  *
  * 示例:
- *   node scripts/gen_asset_base64.mjs src/assets/donate-qr.jpg src/assets/donate-qr.base64.ts
+ *   node scripts/gen_asset_base64.mjs src/assets/donate-qr.png src/assets/donate-qr.base64.ts
  *
  * mime 缺省按扩展名推断（jpg->image/jpeg, png->image/png, svg->image/svg+xml, webp->image/webp）。
  */
