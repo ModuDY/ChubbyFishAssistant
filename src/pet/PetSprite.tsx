@@ -117,6 +117,34 @@ export default function PetSprite({
   const url = actionUrl(actionId);
   const loop = isLoopAction(actionId);
 
+  /** 最新 paused 值：播放重试与事件回调里避免读到闭包旧值 */
+  const pausedRef = useRef(paused);
+  pausedRef.current = paused;
+  const playTimerRef = useRef<number | null>(null);
+
+  /**
+   * 播放（失败退避重试）。
+   *
+   * 为什么不能只 play() 一次：窗口按 `visible:false` 建好后才 show，首启时页面
+   * 往往仍被判定为 hidden / 合成器未就绪，`play()` 会被拒绝；只试一次且无人重试，
+   * 画面就一直是空的——这正是「桌宠首启整块透明」的根因。
+   */
+  const playWithRetry = useCallback((retry = 0) => {
+    if (playTimerRef.current) {
+      window.clearTimeout(playTimerRef.current);
+      playTimerRef.current = null;
+    }
+    const video = videoRef.current;
+    if (!video || pausedRef.current) return;
+    void video.play().catch(() => {
+      if (retry >= 6 || pausedRef.current) return;
+      playTimerRef.current = window.setTimeout(
+        () => playWithRetry(retry + 1),
+        250 * (retry + 1),
+      );
+    });
+  }, []);
+
   const measure = useCallback(
     (retry = 0) => {
       const video = videoRef.current;
@@ -124,8 +152,10 @@ export default function PetSprite({
 
       const rect = video.getBoundingClientRect();
       const sample = sampleFrame(video, window.innerWidth || 1, window.innerHeight || 1);
-      // 首帧可能还没出画面（窗口隐藏/解码未完成）或布局为 0：退避重试几次
+      // 首帧可能还没出画面（窗口隐藏/解码未完成）或布局为 0：退避重试几次；
+      // 采样为空通常意味着视频没在播，顺带重试一次播放
       if (!sample || rect.width < 1 || rect.height < 1) {
+        playWithRetry();
         if (retry < 4) window.setTimeout(() => measure(retry + 1), 300);
         return;
       }
@@ -146,7 +176,7 @@ export default function PetSprite({
         height: ((box.bottom - box.top) * rect.height / winH) * 100,
       });
     },
-    [onMeasure, onMask],
+    [onMeasure, onMask, playWithRetry],
   );
 
   useEffect(() => {
@@ -169,19 +199,34 @@ export default function PetSprite({
     if (paused) {
       video.pause();
     } else {
-      // 自动播放被拒（策略/时机）时静默忽略：下一次 effect 还会重试
-      void video.play().catch(() => {});
+      playWithRetry();
     }
-  }, [actionId, url, loop, playKey, paused]);
+  }, [actionId, url, loop, playKey, paused, playWithRetry]);
 
   // 隐藏窗口时立刻停解码；恢复时由上面的 effect 续播
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
-    if (paused) video.pause();
+    if (paused) {
+      video.pause();
+      return;
+    }
+    // 隐藏期间 Chromium 会挂起媒体加载：恢复显示时可能连首帧都没有
+    // （窗口可见、画面整块空的直接原因），此时重新触发一次加载再播。
+    // 加 currentSrc 判断：首次挂载时 src 还没设上，免得和上面的效应抢着 load()
+    if (video.readyState < 2 && video.currentSrc) video.load();
+    playWithRetry();
     // 窗口隐藏时首帧可能取不到（抽帧失败）：显示后补测一次
-    else measure();
-  }, [paused, measure]);
+    measure();
+  }, [paused, measure, playWithRetry]);
+
+  // 卸载时清掉待执行的播放重试
+  useEffect(
+    () => () => {
+      if (playTimerRef.current) window.clearTimeout(playTimerRef.current);
+    },
+    [],
+  );
 
   return (
     <video
@@ -192,6 +237,8 @@ export default function PetSprite({
       preload="auto"
       // 首帧常是淡入/起手式（角色还没站定），等 400ms 取稳定姿态再量包围盒
       onLoadedData={() => window.setTimeout(() => measure(), 400)}
+      // 缓冲够了再试一次播放：首启时 play() 常被拒，等到 canplay 才有机会成功
+      onCanPlay={() => playWithRetry()}
       onEnded={onEnded}
       // 素材缺失/解码失败不该白屏卡死：保留上一帧，仅记录一次
       onError={() => {

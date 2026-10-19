@@ -48,7 +48,15 @@ export default function PetRoot() {
   const [core, setCore] = useState<PetCoreState>('idle');
   const [transient, setTransient] = useState<PetTransient | null>(null);
   const [dragging, setDragging] = useState(false);
-  const [paused, setPaused] = useState(() => document.hidden);
+  /**
+   * 是否暂停解码。
+   *
+   * 初值取 false 而不是 `document.hidden`：窗口是 `visible:false` 建好后才 show，
+   * 首启时 WebView2 常仍把页面报成 hidden，若据此置 true 且之后没有正确的
+   * visibilitychange，画面就会一直空着（首启整块透明的另一半原因）。
+   * 窗口真隐藏时 Rust 会发 pet-update(visible:false) 兜住。
+   */
+  const [paused, setPaused] = useState(false);
   const [idleTick, setIdleTick] = useState(0);
   const [playKey, setPlayKey] = useState(0);
   const [bubble, setBubble] = useState<{ seq: number; text: string } | null>(null);
@@ -169,8 +177,10 @@ export default function PetRoot() {
     let unlisten: UnlistenFn | undefined;
 
     const apply = (patch: PetUpdatePayload) => {
+      // 窗口可见性以 Rust 下发为准：不再叠加 `document.hidden`——
+      // 首启时 WebView2 可能一直把页面报成 hidden，叠加就会永远停在这儿
       if (patch.visible === false) setPaused(true);
-      else if (patch.visible === true) setPaused(document.hidden);
+      else if (patch.visible === true) setPaused(false);
       if (typeof patch.bubble === 'boolean') setBubbleEnabled(patch.bubble);
       if (typeof patch.opacity === 'number') {
         setOpacity(Math.min(1, Math.max(0.3, patch.opacity)));
@@ -191,7 +201,8 @@ export default function PetRoot() {
         });
       })
       .catch(() => {
-        /* 状态读取失败按默认值运行，不影响显示 */
+        // 状态读取失败按「显示中」运行：宁可多播一段，也不要整块空白
+        setPaused(false);
       });
 
     void listen<PetUpdatePayload>('pet-update', (event) => {
@@ -201,7 +212,11 @@ export default function PetRoot() {
       else unlisten = un;
     });
 
-    const onVisibility = () => setPaused(document.hidden);
+    // 只在「页面变隐藏」时补暂停；恢复一律交给 pet-update(visible:true)，
+    // 避免页面误报 hidden 后再也没人把它恢复回来
+    const onVisibility = () => {
+      if (document.hidden) setPaused(true);
+    };
     document.addEventListener('visibilitychange', onVisibility);
 
     return () => {
