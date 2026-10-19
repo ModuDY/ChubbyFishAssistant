@@ -97,6 +97,7 @@ import type {
   QoderResetItem,
   QoderResetResult,
   QoderSettings,
+  EvolutionMetrics,
 } from '../types';
 
 // ---- F1/F11：invoke 统一超时 + 错误源头翻译 ----
@@ -947,6 +948,13 @@ export const api = {
       invoke<void>('wb_template_map_set', {
         map: { templates, updated_at: Math.floor(Date.now() / 1000) },
       }),
+  },
+  /**
+   * 自我进化 P1：网关观测快照（只读）。
+   * 目前只有观测，不参与任何路由决策——决策层（P2）要等真实数据积累后再做。
+   */
+  evolution: {
+    metrics: () => invoke<EvolutionMetrics>('evolution_metrics'),
   },
   updater: {
     check: () => invoke<UpdateCheckResult>('update_check'),

@@ -13,6 +13,7 @@ pub mod doubao_sse;
 pub mod doubao_upstream;
 pub mod efforts;
 pub mod gateway_settings;
+pub mod metrics;
 pub mod models_sync;
 pub mod org_index;
 pub mod pool;
@@ -114,6 +115,9 @@ pub struct ApiSharedState {
     pub activity_tx: Option<ActivityEmitter>,
     /// 累计 token（prompt+completion，仅在记账咽喉点累加）：milestone 事件阈值判定（§6.5）
     pub activity_tokens: AtomicU64,
+    /// 观测层（自我进化 P1）：按池累计成功/失败/耗时/token，只读快照给设置页，
+    /// 不参与任何路由决策（见 docs/pending/自我进化方案.md）
+    pub metrics: metrics::Metrics,
     pub active_uid: Mutex<Option<String>>,
     pub last_error: Mutex<Option<String>>,
     pub logger: ApiLogger,
@@ -300,6 +304,13 @@ impl ApiSharedState {
         completion_tokens: u64,
         ttfb_ms: Option<u64>,
     ) {
+        // 自我进化 P1：观测层采样（纯累加，不参与任何路由决策）
+        self.metrics.record(
+            if is_wb { "wb" } else { "trae" },
+            ok,
+            duration_ms,
+            prompt_tokens + completion_tokens,
+        );
         let mut guard = self
             .usage
             .lock()
@@ -332,6 +343,8 @@ impl ApiSharedState {
         prompt_tokens: u64,
         completion_tokens: u64,
     ) {
+        self.metrics
+            .record("custom", ok, duration_ms, prompt_tokens + completion_tokens);
         let mut guard = self
             .usage
             .lock()
@@ -365,6 +378,8 @@ impl ApiSharedState {
         completion_tokens: u64,
         ttfb_ms: Option<u64>,
     ) {
+        self.metrics
+            .record("doubao", ok, duration_ms, prompt_tokens + completion_tokens);
         let day = usage::today_key();
         let mut guard = self
             .usage
@@ -430,6 +445,8 @@ impl ApiSharedState {
         original_credits: Option<f64>,
         session: &usage::QoderSessionCtx,
     ) {
+        self.metrics
+            .record("qoder", ok, duration_ms, prompt_tokens + completion_tokens);
         let day = usage::today_key();
         let mut guard = self
             .usage
@@ -1033,6 +1050,7 @@ mod inflight_tests {
             total_requests: AtomicU64::new(0),
             activity_tx: None,
             activity_tokens: AtomicU64::new(0),
+            metrics: Default::default(),
             inflight: Arc::new(AtomicU64::new(0)),
             active_uid: Mutex::new(None),
             last_error: Mutex::new(None),
@@ -1146,6 +1164,7 @@ mod activity_tests {
             total_requests: AtomicU64::new(0),
             activity_tx,
             activity_tokens: AtomicU64::new(0),
+            metrics: Default::default(),
             inflight: Arc::new(AtomicU64::new(0)),
             active_uid: Mutex::new(None),
             last_error: Mutex::new(None),

@@ -4,6 +4,7 @@ pub mod api_server;
 pub mod cert;
 pub mod ccswitch;
 pub mod checkin;
+pub mod evolution;
 pub mod doubao;
 pub mod env;
 pub mod misc;

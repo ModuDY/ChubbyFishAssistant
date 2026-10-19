@@ -621,6 +621,31 @@ export interface ApiServiceStatus {
   inflight?: number;
 }
 
+// ---- 自我进化 P1：网关观测快照（只读，见 docs/pending/自我进化方案.md）----
+/** 单个池的观测指标（统计算法与口径见 src-tauri/src/api_server/metrics.rs） */
+export interface EvolutionPoolMetrics {
+  ok: number;
+  fail: number;
+  total: number;
+  /** 累计成功率 0~1（三位小数） */
+  successRate: number;
+  /** 指数滑动成功率 0~1（α=0.05，抗尖峰） */
+  ewmaSuccess: number;
+  /** 指数滑动平均耗时（ms） */
+  ewmaLatencyMs: number;
+  lastDurationMs: number;
+  tokens: number;
+  /** 末次更新时间戳（ms） */
+  updatedAt: number;
+}
+
+/** 网关观测快照：网关未运行时 running=false 且 pools 为空 */
+export interface EvolutionMetrics {
+  running: boolean;
+  pools: Record<string, EvolutionPoolMetrics>;
+  total: { ok: number; fail: number; tokens: number };
+}
+
 // ---- 统一网关（unified-api-gateway-design §3.1/§8.1）----
 /** 统一模型目录来源池标记（enabled 为运行时派生，不落盘） */
 export interface UnifiedModelSource {

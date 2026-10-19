@@ -484,6 +484,7 @@ pub async fn do_start(
         total_requests: std::sync::atomic::AtomicU64::new(0),
         activity_tx: Some(activity_tx.clone()),
         activity_tokens: std::sync::atomic::AtomicU64::new(0),
+            metrics: Default::default(),
         inflight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         active_uid: Mutex::new(None),
         last_error: Mutex::new(None),

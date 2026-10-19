@@ -2992,6 +2992,7 @@ mod tests {
             total_requests: std::sync::atomic::AtomicU64::new(0),
             activity_tx: None,
             activity_tokens: std::sync::atomic::AtomicU64::new(0),
+            metrics: Default::default(),
             inflight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             active_uid: std::sync::Mutex::new(None),
             last_error: std::sync::Mutex::new(None),

@@ -279,6 +279,7 @@ fn main() {
             commands::api_server::api_server_start,
             commands::api_server::api_server_stop,
             commands::api_server::api_server_status,
+            commands::evolution::evolution_metrics,
             commands::api_server::pool_list,
             commands::api_server::pool_set,
             commands::api_server::pool_status,

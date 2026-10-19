@@ -6,7 +6,12 @@ import { api } from '../lib/tauri';
 import { THEMES } from '../lib/themes';
 import { APP_TABS } from './Sidebar';
 import { ICON_CHOICES, resolveAppIcon, DEFAULT_APP_ICONS } from '../lib/appIcons';
-import type { AppKey, Settings as SettingsType, PetAiMode } from '../types';
+import type {
+  AppKey,
+  Settings as SettingsType,
+  PetAiMode,
+  EvolutionMetrics,
+} from '../types';
 
 /**
  * 通用设置面板：外观 / 语言 / 通用与通知 / 代理相关配置。
@@ -30,12 +35,26 @@ export default function GeneralSettingsPanel() {
   const [iconPickerFor, setIconPickerFor] = useState<AppKey | null>(null);
   // P4-3：可用的桌宠素材包（用户目录 pets/<id>/，不含内置）
   const [packs, setPacks] = useState<Array<{ id: string; name: string; action_count: number }>>([]);
+  // 自我进化 P1：网关观测快照（只读，10s 轮询；网关未运行时不显示）
+  const [metrics, setMetrics] = useState<EvolutionMetrics | null>(null);
 
   useEffect(() => {
     void api.pet
       .packList()
       .then((list) => setPacks(Array.isArray(list) ? list : []))
       .catch(() => setPacks([]));
+  }, []);
+
+  useEffect(() => {
+    const load = () => {
+      void api.evolution
+        .metrics()
+        .then((m) => setMetrics(m?.running ? m : null))
+        .catch(() => setMetrics(null));
+    };
+    load();
+    const timer = window.setInterval(load, 10_000);
+    return () => window.clearInterval(timer);
   }, []);
 
   const sendTest = async () => {
@@ -692,6 +711,42 @@ export default function GeneralSettingsPanel() {
           </div>
         </div>
       </section>
+
+      {/* 自我进化 P1：网关观测（只读）——目前只观测、不参与任何路由决策 */}
+      {metrics && (
+        <section className="card p-4">
+          <h3 className="mb-1 font-medium">网关观测</h3>
+          <p className="mb-3 text-xs text-slate-400">
+            本次启动以来各上游的成功率与延迟（10 秒刷新）。指数滑动值 EWMA 抗尖峰，样本太少时参考意义有限。
+          </p>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="text-slate-400">
+                <tr>
+                  <th className="py-1 pr-3 font-normal">上游</th>
+                  <th className="py-1 pr-3 font-normal">累计成功率</th>
+                  <th className="py-1 pr-3 font-normal">近期成功率</th>
+                  <th className="py-1 pr-3 font-normal">平均耗时</th>
+                  <th className="py-1 pr-3 font-normal">请求数</th>
+                  <th className="py-1 font-normal">Tokens</th>
+                </tr>
+              </thead>
+              <tbody>
+                {Object.entries(metrics.pools).map(([name, p]) => (
+                  <tr key={name} className="border-t border-slate-200/60 dark:border-zinc-700/60">
+                    <td className="py-1.5 pr-3">{name}</td>
+                    <td className="py-1.5 pr-3">{(p.successRate * 100).toFixed(0)}%</td>
+                    <td className="py-1.5 pr-3">{(p.ewmaSuccess * 100).toFixed(0)}%</td>
+                    <td className="py-1.5 pr-3">{Math.round(p.ewmaLatencyMs)} ms</td>
+                    <td className="py-1.5 pr-3">{p.total}</td>
+                    <td className="py-1.5">{p.tokens.toLocaleString()}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
 
       {/* 保存条 */}
       <div className="flex items-center justify-end gap-2 pb-1">
