@@ -44,6 +44,18 @@ body.pet-window {
   width: 100%;
   height: auto;
   pointer-events: none;
+  /* 素材背景残留 alpha ≈ 8%：由 PetRoot 注入的 feComponentTransfer 压掉，
+     否则浅色窗口上能看出一个淡灰矩形（详见 PetRoot 的 ALPHA_FLOOR） */
+  filter: url(#pet-alpha-floor);
+}
+
+/* 滤镜定义容器：不参与布局、不接收事件 */
+.pet-filter-defs {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  pointer-events: none;
 }
 
 /* 角色热区：几何由 PetRoot 按首帧 alpha 包围盒注入（left/top/width/height 百分比） */

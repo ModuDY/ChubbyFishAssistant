@@ -35,6 +35,12 @@ const SAD_HOLD_MS = 9000;
 const IDLE_SWAP_MS = 24_000;
 /** 打盹检测轮询间隔 */
 const SLEEP_CHECK_MS = 20_000;
+/**
+ * 素材背景残留 alpha 的底噪（约 8% = 20/255）。
+ * 渲染时把 ≤ 该值的 alpha 压成 0，否则在浅色窗口上会看出一个淡灰矩形。
+ * 调大 → 背景更干净、角色边缘更硬；调小 → 边缘更柔、可能残留一点灰边。
+ */
+const ALPHA_FLOOR = 0.1;
 
 type PetUpdatePayload = {
   visible?: boolean;
@@ -380,6 +386,25 @@ export default function PetRoot() {
 
   return (
     <div className={`pet-root ${dragging ? 'dragging' : ''}`} style={{ opacity }}>
+      {/*
+        素材背景残留 alpha（约 8%，浅色背景上能看出淡灰矩形）在渲染层压掉：
+        feComponentTransfer 把 A 通道整体下移一个底噪再线性拉伸回 0~1，
+        等价于 a' = (a - FLOOR) / (1 - FLOOR)。编码层改不了（本机无 libvpx，
+        VP9+alpha 只能硬件编码、不支持 yuva420p），所以在合成阶段处理。
+      */}
+      <svg className="pet-filter-defs" aria-hidden="true" focusable="false">
+        <defs>
+          <filter id="pet-alpha-floor" colorInterpolationFilters="sRGB">
+            <feComponentTransfer>
+              <feFuncA
+                type="linear"
+                slope={1 / (1 - ALPHA_FLOOR)}
+                intercept={-ALPHA_FLOOR / (1 - ALPHA_FLOOR)}
+              />
+            </feComponentTransfer>
+          </filter>
+        </defs>
+      </svg>
       <PetSprite
         actionId={actionId}
         playKey={playKey}
