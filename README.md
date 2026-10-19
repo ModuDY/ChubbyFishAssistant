@@ -6,7 +6,7 @@
 
 Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 18 + Rust
 
-**GitHub**：[github.com/ModuDY](https://github.com/ModuDY) · **个人博客**：[blog.sopenai.cn](https://blog.sopenai.cn/)
+**GitHub**：[github.com/ModuDY](https://github.com/ModuDY)
 
 </div>
 

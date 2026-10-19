@@ -6,7 +6,6 @@ import {
   CheckCircle2,
   Download,
   Github,
-  Globe,
   Loader2,
   RefreshCw,
 } from 'lucide-react';
@@ -25,7 +24,6 @@ import {
   APP_DISCLAIMER,
   PET_ATTRIBUTION,
   LINK_GITHUB,
-  LINK_BLOG,
   LINK_REPO,
   promoBanner,
 } from '../lib/about';
@@ -276,12 +274,6 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
             className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium transition hover:bg-slate-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
           >
             <Github size={14} /> GitHub
-          </button>
-          <button
-            onClick={() => void openUrl(LINK_BLOG)}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium transition hover:bg-slate-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
-          >
-            <Globe size={14} /> 个人博客
           </button>
           <button
             onClick={() => void openUrl(LINK_REPO)}

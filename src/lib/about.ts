@@ -21,7 +21,7 @@ export const APP_AUTHOR = '刘冬阳';
  */
 export const UPSTREAM_AUTHOR = '朱天伟';
 /** 二次开发说明（关于页展示，紧跟作者一行） */
-export const APP_BASED_ON = `基于 ${UPSTREAM_AUTHOR} 的开源版本二次开发，原版权归其所有`;
+export const APP_BASED_ON = `API网关模块基于 ${UPSTREAM_AUTHOR} 的开源版本二次开发，原版权归其所有`;
 export const APP_COPYRIGHT = `Copyright © 2026 ${APP_AUTHOR} · MIT License`;
 export const APP_DISCLAIMER =
   '本工具与 Trae / WorkBuddy / 豆包等官方均无关联，仅供学习研究，请仅管理本人合法持有的账号，风险自担。';
@@ -33,7 +33,6 @@ export const PET_ATTRIBUTION =
   '桌宠素材来自 PC2005-cloud/dsh-pet (MIT) · 工程实现参考 MerZlin/dsh-pet-indesktop (MIT)';
 
 export const LINK_GITHUB = 'https://github.com/ModuDY';
-export const LINK_BLOG = 'https://blog.sopenai.cn/';
 export const LINK_REPO = 'https://github.com/ModuDY/DY-Work';
 
 export { promoBanner };
