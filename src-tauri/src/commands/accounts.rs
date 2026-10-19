@@ -1334,10 +1334,11 @@ pub fn fetch_remaining_credits(state: State<AppState>, user_id: String) -> Resul
 /// 同时执行自动解冻：签到成功且有积分（credits > 0）且冷却类型非 SessionDead → 清除冷却。
 #[tauri::command(async)]
 pub fn refresh_remaining_credits(
+    app: tauri::AppHandle,
     state: State<AppState>,
     runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
 ) -> Result<usize, String> {
-    refresh_remaining_credits_impl(&state, Some(runtime.inner()))
+    refresh_remaining_credits_impl_with(&state, Some(runtime.inner()), Some(&app))
 }
 
 /// 刷新实现（供 Tauri 命令与 `--task-run refresh-credits` CLI 任务共用）：
@@ -1348,6 +1349,16 @@ pub fn refresh_remaining_credits(
 pub fn refresh_remaining_credits_impl(
     state: &AppState,
     runtime: Option<&std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+) -> Result<usize, String> {
+    // 非 GUI 场景（CLI / 调度 / 网关保鲜）不播报，保持原签名，避免牵动其它调用点
+    refresh_remaining_credits_impl_with(state, runtime, None)
+}
+
+/// 带桌宠播报的刷新实现：GUI 命令走这里。
+pub fn refresh_remaining_credits_impl_with(
+    state: &AppState,
+    runtime: Option<&std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+    app: Option<&tauri::AppHandle>,
 ) -> Result<usize, String> {
     let accounts = crate::vault::load_accounts(state);
     let mut rc: RemainingCreditsFile = crate::store::docs::remaining_credits_load(&crate::store::db(&state.data_dir));
@@ -1482,6 +1493,18 @@ pub fn refresh_remaining_credits_impl(
         }
         cd.updated_at = Some(fs_utils::now_iso());
         crate::store::docs::account_cooldowns_save(&crate::store::db(&state.data_dir), &cd)?;
+    }
+    // 桌宠播报：刷新积分是个纯数据操作，原先不发任何事件，桌宠完全感知不到
+    // （用户在 Trae 页点「刷新」→ 主窗口数字变了，肥鱼一声不吭）。
+    // 这里把本轮总积分推给前端，用量/成功数与 Buddy 的 wb-credits-updated 对齐。
+    if let Some(app) = app {
+        let total: f64 = rc.credits.values().copied().filter(|v| v.is_finite()).sum();
+        let payload = serde_json::json!({
+            "total": total,
+            "accounts": rc.credits.len(),
+            "ok": ok_count,
+        });
+        crate::events::emit_logged(app, "trae-credits-updated", payload, Some(&state.data_dir));
     }
     Ok(ok_count)
 }

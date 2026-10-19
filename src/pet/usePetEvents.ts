@@ -48,6 +48,8 @@ type CheckinPayload = {
   round?: number;
   /** 失败分类（与 Rust classify_error 返回值同名） */
   error_type?: string;
+  /** 工作线程 panic 的兜底终态（issue #44 同款）：计数缺省，仅用于复位并提示异常 */
+  fatal?: boolean;
 };
 
 type BuddyPayload = {
@@ -172,6 +174,8 @@ export function usePetEvents(onSignal: (signal: PetSignal) => void): void {
     let switchStarted = false;
     // Trae 本轮失败分类计数：done 时汇总成「服务端错误 2、登录失效 1」
     const traeReasons = new Map<string, number>();
+    // Trae 上一次刷新到的总积分：用于判断「涨了/没变/见底」
+    let lastTraeCredits: number | null = null;
 
     const emit = (signal: PetSignal, force = false) => {
       if (disposed) return;
@@ -242,6 +246,12 @@ export function usePetEvents(onSignal: (signal: PetSignal) => void): void {
         case 'done': {
           // 收尾先把核心态降回 idle：walking/thinking 的循环动作不降下来会一直转
           emit({ type: 'idle' }, true);
+          // panic 兜底终态（issue #44 同款）：计数缺省，给一句异常提示而非伪装成正常完成
+          if (p.fatal) {
+            traeReasons.clear();
+            emit({ type: 'sad', text: '签到异常终止，请查看日志' }, true);
+            break;
+          }
           // 总结：新签几个 / 几个已签 / 失败几个 + 失败原因（force，别被同类节流吞掉）
           const summary = describeDone(p.ok ?? 0, p.already ?? 0, p.failed ?? 0, traeReasons);
           traeReasons.clear();
@@ -315,6 +325,30 @@ export function usePetEvents(onSignal: (signal: PetSignal) => void): void {
       } else {
         emit({ type: 'rich', text: `Buddy 余额 ${formatAmount(total)}` });
       }
+    });
+
+    // ── Trae 积分刷新（对象载荷：total / accounts / ok） ──
+    // 管理页「刷新」按钮走 refresh_remaining_credits：它只回写数据文件、原先不发事件，
+    // 所以桌宠对「手动刷新积分」完全无感。现在刷新结束会推一条总积分过来。
+    on<{ total?: number; accounts?: number }>('trae-credits-updated', (p) => {
+      if (!p || typeof p.total !== 'number' || !Number.isFinite(p.total)) return;
+      const total = p.total;
+      const prev = lastTraeCredits;
+      lastTraeCredits = total;
+      if (total <= 0) {
+        emit({ type: 'broke', text: 'Trae 积分见底了' });
+        return;
+      }
+      const diff = prev === null ? 0 : total - prev;
+      if (prev !== null && Math.abs(diff) < 1) {
+        emit({ type: 'neutral', text: 'Trae 积分没有变化' });
+        return;
+      }
+      const suffix =
+        prev === null || Math.abs(diff) < 1
+          ? ''
+          : `（${diff > 0 ? '+' : '-'}${formatAmount(Math.abs(diff))}）`;
+      emit({ type: 'rich', text: `Trae 积分 ${formatAmount(total)}${suffix}` });
     });
 
     // ── 账号切换/保存登录态（NDJSON 字符串 + 终态对象） ──
