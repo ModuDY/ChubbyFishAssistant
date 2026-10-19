@@ -32,6 +32,8 @@ body.pet-window {
   background: transparent;
   touch-action: none;
   pointer-events: none;
+  /* 窗口右侧留白（右键菜单浮在角色右边用）——必须与 pet.rs 的 MENU_SPACE 一致 */
+  --pet-menu-space: 160px;
 }
 
 /* 视频按窗口宽度铺满、贴底对齐：素材 640×360，角色脚底在 y=330，
@@ -39,9 +41,11 @@ body.pet-window {
 .pet-video {
   position: absolute;
   left: 0;
-  right: 0;
+  /* 视频只铺满"角色舞台"（窗口宽度 − 右侧菜单留白），
+     角色视觉位置保持不变，右侧多出的透明区专门给右键菜单 */
+  right: auto;
   bottom: 0;
-  width: 100%;
+  width: calc(100% - var(--pet-menu-space));
   height: auto;
   pointer-events: none;
   /* 素材背景残留 alpha ≈ 8%：由 PetRoot 注入的 feComponentTransfer 压掉，
@@ -74,7 +78,8 @@ body.pet-window {
 .pet-bubble-anchor {
   position: absolute;
   left: 8px;
-  right: 8px;
+  /* 右侧要扣掉菜单留白，气泡才会居中在角色头顶而不是整窗中心 */
+  right: calc(8px + var(--pet-menu-space));
   display: flex;
   justify-content: center;
   pointer-events: none;

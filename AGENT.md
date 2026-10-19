@@ -286,6 +286,7 @@ ai-work-assistant/
 - **首启空白（2026-10-19 修复）**：窗口按 `visible:false` 建好后 show，首启时页面仍被判 hidden、`play()` 被拒，原实现只试一次就放弃 → 窗口在而画面整块空。现 `paused` 只认 Rust 下发的 `visible`（不再叠加 `document.hidden`），`play()` 失败按 250ms×(n+1) 退避重试，恢复显示时 `readyState<2` 且已有 src 则重新 `load()`，`onCanPlay` 再补一次。
 - **素材 alpha 底噪（2026-10-19）**：webm 背景残留 alpha ≈ 8%（20/255），浅色窗口上可见淡灰矩形。素材层改不了（本机无 libvpx，VP9+alpha 只有硬件编码、不支持 yuva420p），故由 `PetRoot` 内联 SVG 定义 `feComponentTransfer/feFuncA`（`a'=(a-0.1)/0.9`），`pet.css` 给 `.pet-video` 挂 `filter: url(#pet-alpha-floor)`。`ALPHA_FLOOR` 常量可调：调大更干净、角色边缘更硬。**若将来能重编码素材，应优先在素材层清零（一次处理、零运行时开销）。**
 - **动作接线对齐上游（2026-10-19）**：动作语义以上游 `PC2005-cloud/dsh-pet` 的 `dsh-pet/assets/config.jsonc` 为准——`animations.events.workStatus` 按索引=档位（0=thinking 回合开始 / 1=working 工具调用 / 2=result / 3=waiting / 4=success / 5=error），故签到/切换在 `start` 阶段先发 `thinking`（播 work-think）、首个 `account` 事件再升 `working`（work-busy）；`深度思考碎碎念` 在上游属 `animations.categories` 的「文字」随机池（weight 10），不是 thinking 专用，故并入 idle 彩蛋池。收尾（`done`/`exit`/`switch-done`）必须 `emit(idle, force=true)` 显式降核心态，否则会卡在 thinking/working 的循环动作。
+- **窗口宽度 = 角色舞台 + 右侧菜单留白（2026-10-19）**：`pet.rs` 的 `MENU_SPACE=160` 与 `pet.css` 的 `--pet-menu-space:160px` 必须同步改；`.pet-video` 只铺满舞台（`calc(100% - var(--pet-menu-space))`）、左对齐，角色视觉位置不变，右侧留白全透明（走点击穿透放行鼠标）。右键菜单以角色 alpha 包围盒右缘为锚点、垂直居中，故能在角色右侧完整展开而不被窗口裁剪；气泡锚点同样扣掉这段留白，才会居中对准角色。
 
 ## 6. Tauri 事件（Rust → 前端）
 

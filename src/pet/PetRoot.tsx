@@ -518,20 +518,24 @@ export default function PetRoot() {
   // 气泡底边贴在角色头顶上方 8px（距底部 = 100 - top%）
   const bubbleBottom = hitBox ? `calc(${(100 - hitBox.top).toFixed(2)}% + 8px)` : '48%';
 
-  // 菜单落位：角色在窗口下半部，若仍从光标处向下展开会盖住角色。
-  // 故优先把菜单「翻到角色上方」悬浮（不遮挡桌宠）；上方确实放不下时，再回落为向下展开。
+  // 菜单落位：贴着角色**右侧**、垂直居中悬浮。
+  // 窗口宽度 = 角色舞台 + 右侧 160px 留白（pet.css 的 --pet-menu-space），
+  // 所以菜单能完整画在角色右边而不遮挡角色、也不被窗口裁掉。
   const MENU_W = 148;
   const MENU_H = 146;
-  const charTopPct = hitBox ? Math.max(0, hitBox.top - 3) : 52;
-  const spaceAbovePx = (charTopPct / 100) * window.innerHeight;
-  const menuLeft = menu ? Math.max(4, Math.min(menu.x - 12, window.innerWidth - MENU_W)) : 4;
-  const menuStyle: CSSProperties =
-    spaceAbovePx >= MENU_H
-      ? { left: menuLeft, bottom: `calc(${(100 - charTopPct).toFixed(2)}% + 6px)` }
-      : {
-          left: menuLeft,
-          top: menu ? Math.max(4, Math.min(menu.y, window.innerHeight - MENU_H)) : 4,
-        };
+  const MENU_GAP = 6;
+  const box = hitBox ?? { left: 14, top: 52, width: 72, height: 48 };
+  const charRightPx = ((box.left + box.width) / 100) * window.innerWidth;
+  const charMidPx = ((box.top + box.height / 2) / 100) * window.innerHeight;
+  const menuLeft = Math.max(
+    4,
+    Math.min(charRightPx + MENU_GAP, window.innerWidth - MENU_W - 4),
+  );
+  const menuTop = Math.max(
+    4,
+    Math.min(charMidPx - MENU_H / 2, window.innerHeight - MENU_H - 4),
+  );
+  const menuStyle: CSSProperties = { left: menuLeft, top: menuTop };
 
   return (
     <div className={`pet-root ${dragging ? 'dragging' : ''}`} style={{ opacity }}>

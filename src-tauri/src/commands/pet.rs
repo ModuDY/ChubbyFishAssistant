@@ -21,6 +21,10 @@ pub const PET_LABEL: &str = "pet";
 /// 基准逻辑尺寸（素材 640×360，窗口按 1:1 逻辑像素装下角色）
 const BASE_W: f64 = 300.0;
 const BASE_H: f64 = 360.0;
+/// 窗口右侧额外留白：右键菜单要浮在角色**右边**且不被窗口裁剪，
+/// 而这部分区域全透明——点击穿透（start_hit_watcher）会让它正常放行鼠标。
+/// 必须与 `pet.css` 的 `--pet-menu-space` 保持一致。
+const MENU_SPACE: f64 = 160.0;
 /// 默认位置距屏幕右下角的间距（给任务栏与视觉留白）
 const EDGE_RIGHT: f64 = 24.0;
 const EDGE_BOTTOM: f64 = 64.0;
@@ -106,10 +110,12 @@ pub fn apply_settings(app: &AppHandle) {
     let st = app.state::<AppState>();
     let settings = st.settings();
     let scale = scale_of(&settings);
+    // w = 角色舞台宽度（视频按它铺满），窗口再额外加一段右侧留白给菜单
     let w = BASE_W * scale;
     let h = BASE_H * scale;
+    let win_w = w + MENU_SPACE;
 
-    if let Err(e) = window.set_size(LogicalSize::new(w, h)) {
+    if let Err(e) = window.set_size(LogicalSize::new(win_w, h)) {
         crate::fs_utils::app_log(&st.data_dir, &format!("桌宠设置尺寸失败: {e}"));
     }
 
@@ -119,7 +125,7 @@ pub fn apply_settings(app: &AppHandle) {
             let _ = window.set_position(PhysicalPosition::new(x, y));
         }
         _ => {
-            if let Some(pos) = default_position(&window, w, h) {
+            if let Some(pos) = default_position(&window, win_w, h) {
                 let _ = window.set_position(pos);
             }
         }
