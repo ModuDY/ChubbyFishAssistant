@@ -20,8 +20,10 @@ import {
   APP_TAGLINE,
   APP_OVERVIEW,
   APP_AUTHOR,
+  APP_BASED_ON,
   APP_COPYRIGHT,
   APP_DISCLAIMER,
+  PET_ATTRIBUTION,
   LINK_GITHUB,
   LINK_BLOG,
   LINK_REPO,
@@ -301,7 +303,11 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
         {/* 作者与版权 */}
         <div className="space-y-0.5 text-xs text-slate-500 dark:text-zinc-400">
           <div>作者：{APP_AUTHOR}</div>
+          <div className="text-[11px] leading-relaxed text-slate-400 dark:text-zinc-500">
+            {APP_BASED_ON}
+          </div>
           <div>{APP_COPYRIGHT}</div>
+          <div className="pt-1 text-[11px] leading-relaxed text-slate-400 dark:text-zinc-500">{PET_ATTRIBUTION}</div>
           <div className="pt-1 text-[11px] leading-relaxed text-slate-400 dark:text-zinc-500">{APP_DISCLAIMER}</div>
         </div>
       </div>
