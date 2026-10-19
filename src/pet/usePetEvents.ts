@@ -46,6 +46,8 @@ type CheckinPayload = {
   delta?: number | null;
   credits?: number | null;
   round?: number;
+  /** 失败分类（与 Rust classify_error 返回值同名） */
+  error_type?: string;
 };
 
 type BuddyPayload = {
@@ -94,6 +96,62 @@ function short(text: string | undefined, limit = 42): string | undefined {
 /** 积分增量达到该阈值即视为「里程碑」，改用更夸张的 jump-grab 动作 */
 const MILESTONE_DELTA = 500;
 
+/** 失败分类 → 中文短标签（与 Rust `classify_error` 的返回值对齐） */
+const ERROR_LABELS: Record<string, string> = {
+  PlanLimit: '套餐上限',
+  SoftRate: '触发限流',
+  SessionDead: '登录失效',
+  NotFound: '接口异常',
+  Server: '服务端错误',
+  Client: '请求被拒',
+  BusinessError: '业务失败',
+  Unknown: '未知原因',
+};
+
+/** 没有失败分类时用（Buddy 的 account 事件不带 error_type） */
+const NO_REASONS = new Map<string, number>();
+
+/** 取出现最多的 1~2 类失败原因，拼成「登录失效 2、触发限流」 */
+function topReasons(reasons: Map<string, number>, max = 2): string {
+  return [...reasons.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, max)
+    .map(([key, n]) => {
+      const label = ERROR_LABELS[key] ?? key;
+      return n > 1 ? `${label} ${n}` : label;
+    })
+    .join('、');
+}
+
+/**
+ * 一轮结束的总结：签了几个 / 几个已签 / 几个失败 + 主要原因。
+ *
+ * 之前的文案只有「成功 X / 失败 Y」或一句「签到完成」，用户看不出
+ * 「今天到底为什么没签上」——失败原因只有逐账号事件里有。
+ */
+function describeDone(
+  ok: number,
+  already: number,
+  failed: number,
+  reasons: Map<string, number>,
+): { type: PetSignalType; text: string } {
+  const counts: string[] = [];
+  if (ok > 0) counts.push(`新签 ${ok}`);
+  if (already > 0) counts.push(`已签 ${already}`);
+  if (failed > 0) counts.push(`失败 ${failed}`);
+
+  if (failed > 0) {
+    const why = topReasons(reasons);
+    if (ok + already === 0) {
+      return { type: 'sad', text: `${failed} 个都没签上${why ? `：${why}` : ''}` };
+    }
+    return { type: 'archive', text: `${counts.join(' · ')}${why ? `（${why}）` : ''}` };
+  }
+  if (ok > 0) return { type: 'happy', text: counts.join(' · ') };
+  if (already > 0) return { type: 'idle', text: `${already} 个今天都签过了` };
+  return { type: 'idle', text: '今天没有要签的账号' };
+}
+
 /**
  * 订阅全部业务事件。
  *
@@ -112,6 +170,8 @@ export function usePetEvents(onSignal: (signal: PetSignal) => void): void {
     let lastCredits: number | null = null;
     // 切换流程是否已跨过「回合开始」阶段（首行 thinking → 后续 working）
     let switchStarted = false;
+    // Trae 本轮失败分类计数：done 时汇总成「服务端错误 2、登录失效 1」
+    const traeReasons = new Map<string, number>();
 
     const emit = (signal: PetSignal, force = false) => {
       if (disposed) return;
@@ -140,6 +200,7 @@ export function usePetEvents(onSignal: (signal: PetSignal) => void): void {
         case 'start':
           // 回合刚开始、还没进实际处理 → thinking（work-think）。
           // 对齐上游 workStatus[0]=thinking（turn/start）、[1]=working（tool/call）
+          traeReasons.clear();
           emit({
             type: 'thinking',
             text: p.total ? `开工啦，本轮 ${p.total} 个账号` : '没有要签的账号',
@@ -166,6 +227,10 @@ export function usePetEvents(onSignal: (signal: PetSignal) => void): void {
             // 今天已签：给个反馈，别让桌宠像没收到消息
             emit({ type: 'neutral', text: '今天签过啦' });
           } else if (p.status === 'fail') {
+            // 记下失败分类：done 时要汇总成「服务端错误 2、登录失效 1」
+            if (p.error_type) {
+              traeReasons.set(p.error_type, (traeReasons.get(p.error_type) ?? 0) + 1);
+            }
             emit({ type: 'sad', text: short(p.message) ?? '这个账号没签上' });
           }
           break;
@@ -174,18 +239,15 @@ export function usePetEvents(onSignal: (signal: PetSignal) => void): void {
           emit({ type: 'working' });
           emit({ type: 'pace', text: p.round ? `第 ${p.round} 轮重试…` : '稍等，重试中' });
           break;
-        case 'done':
+        case 'done': {
           // 收尾先把核心态降回 idle：walking/thinking 的循环动作不降下来会一直转
-          emit({ type: 'idle', text: p.empty ? '今天都签过了' : '本轮结束' }, true);
-          if ((p.failed ?? 0) > 0 && (p.ok ?? 0) > 0) {
-            // 有成有败 → 清点归档（work-archive）
-            emit({ type: 'archive', text: `收尾：成功 ${p.ok} / 失败 ${p.failed}` });
-          } else if ((p.failed ?? 0) > 0) {
-            emit({ type: 'sad', text: `${p.failed} 个账号未成功` });
-          } else if ((p.ok ?? 0) > 0) {
-            emit({ type: 'happy', text: `签到完成，新签 ${p.ok} 个` });
-          }
+          emit({ type: 'idle' }, true);
+          // 总结：新签几个 / 几个已签 / 失败几个 + 失败原因（force，别被同类节流吞掉）
+          const summary = describeDone(p.ok ?? 0, p.already ?? 0, p.failed ?? 0, traeReasons);
+          traeReasons.clear();
+          emit(summary, true);
           break;
+        }
         default:
           break;
       }
@@ -217,17 +279,15 @@ export function usePetEvents(onSignal: (signal: PetSignal) => void): void {
             emit({ type: 'sad', text: short(p.message) ?? '有个账号没签上' });
           }
           break;
-        case 'done':
-          // 同 Trae：收尾先降核心态，再叠加收尾瞬态
+        case 'done': {
+          // 同 Trae：收尾先降核心态，再叠加总结（Buddy 事件里没有 error_type，只报计数）
           emit({ type: 'idle' }, true);
-          if ((p.failed ?? 0) > 0 && (p.ok ?? 0) > 0) {
-            emit({ type: 'archive', text: `Buddy 收尾：成功 ${p.ok} / 失败 ${p.failed}` });
-          } else if ((p.failed ?? 0) > 0) {
-            emit({ type: 'sad', text: `${p.failed} 个账号未成功` });
-          } else if ((p.ok ?? 0) > 0) {
-            emit({ type: 'happy', text: `Buddy 签到完成，新签 ${p.ok} 个` });
-          }
+          emit(
+            describeDone(p.ok ?? 0, p.already ?? 0, p.failed ?? 0, NO_REASONS),
+            true,
+          );
           break;
+        }
         case 'exit':
           // 轮次退出：无论成败都该回落，否则宠物会一直「忙碌」
           emit({ type: 'idle' }, true);
