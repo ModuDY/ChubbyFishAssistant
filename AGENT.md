@@ -8,6 +8,7 @@
 > **以下标识属于持久化契约，改名时必须保持原样**（改了就断数据/断升级）：`identifier`（`com.aiwork.assistant`）、数据目录 `%APPDATA%\AIWorkAssistant`、`mainBinaryName`（`ai-work-assistant`）、计划任务名 `AIWorkAssistant_DailyCheckin`、通知分组 `AIWorkAssistant`、CC Switch 条目 id `aiwork-*`、备份文件扩展名 `.aiwbak`。
 >
 > **图标素材**：`src-tauri/icons/` 由 `npx tauri icon <1024 png>` 生成（当前源图为透明底角色头部特写，取自桌宠素材首帧）；前端标题栏/关于页头像为 `src/assets/brand/pet-avatar.png`（同一构图 256px）。**改图标后必须 `touch src-tauri/build.rs` 再 build**——tauri-build 的 rerun-if-changed 不监听 icons 目录，否则 exe 内嵌的仍是旧图标。
+> **任务栏图标（勿删 `apply_taskbar_icon`）**：tao 建窗只写 `WM_SETICON` 的 ICON_SMALL，ICON_BIG 为空——任务栏按钮取不到图标，表现为「换了图标但任务栏仍是旧图/空白」。`main.rs::apply_taskbar_icon` 在 setup 里按 32/16 两档从 exe 内嵌图标资源写回 BIG/SMALL。
 
 ## 1. 一句话
 
@@ -276,11 +277,12 @@ ai-work-assistant/
 ### 5.5 桌宠窗口（P0，`commands/pet.rs`）
 
 - **窗口**：`tauri.conf.json` 声明式创建 `label="pet"`（透明/无边框/置顶/skipTaskbar/`visible:false`）；前端复用 `index.html` 的 `?pet=1` 分流（`?pet=1&probe=1` → 渲染诊断页），**不新增 Vite 入口**。
-- **命令**：`pet_show` / `pet_hide` / `pet_toggle`（写 `pet_enabled` 并立即作用窗口）· `pet_status`（enabled/visible/x/y/scale/opacity/bubble/sleepMinutes）· `pet_save_position`（无参：Rust 读 `outer_position` 物理坐标落盘，前端 `moved` 去抖 500ms 调用）· `pet_focus_main`（双击桌宠呼出主窗口）。诊断命令 `pet_probe_ready` / `pet_probe_hide_and_restore` / `pet_probe_report` 仅探针页使用。
+- **命令**：`pet_show` / `pet_hide` / `pet_toggle`（写 `pet_enabled` 并立即作用窗口）· `pet_status`（enabled/visible/x/y/scale/opacity/bubble/sleepMinutes）· `pet_save_position`（无参：Rust 读 `outer_position` 物理坐标落盘，前端 `moved` 去抖 500ms 调用）· `pet_focus_main`（双击桌宠呼出主窗口）· `pet_set_hit_mask`（前端上报点击穿透掩码网格，见下）。诊断命令 `pet_probe_ready` / `pet_probe_hide_and_restore` / `pet_probe_report` 仅探针页使用。
 - **生命周期**：`pet_enabled=false` 时必须**真正 hide**（透明窗口留着仍会截点击）；`CloseRequested` 一律 `prevent_close` + hide（窗口销毁后无重建路径，托盘开关会变死按钮）。
 - **设置联动**：`settings_set` 命中 `pet_*` 键即调 `pet::apply_settings`（尺寸/位置/置顶/显隐）并 emit `pet-update`，改完立即生效、无需重启。
 - **红线**：桌宠只**读**前端事件、只写 `pet_*` 设置，不碰账号/签到/积分数据，不新增网络外发（P3 台词走本机 127.0.0.1 网关）。
 - **前端几何（2026-10-19 修正）**：视频画布 640×360 而角色只占中间一块 → 根节点 `pointer-events:none`，点击/拖拽热区是独立的 `.pet-hit`，几何由首帧 alpha 包围盒（160×90 采样、alpha 阈值 64、延迟 400ms 取稳定帧，窗口显示后补测）反算成窗口百分比注入；气泡锚点底边 = 角色头顶 + 8px。窗口顶部/左右空白不再触发任何动作。
+- **透明区点击穿透（2026-10-19）**：窗口是矩形而角色只占底部一块，空白区域虽 alpha=0 仍整块接收鼠标消息（表现为「角色周围有一层看不见的遮罩挡住下层窗口的点击」）。前端每次换动作按 alpha 采样出 24×28「可点击格子」并集，经 `pet_set_hit_mask` 上报；Rust `start_hit_watcher` 线程 24ms 跟随光标，落在透明格子即 `set_ignore_cursor_events(true)`（`WS_EX_TRANSPARENT`），回到角色格子再撤掉（连续两帧一致才切，防 `WS_EX_LAYERED` 反复增删闪烁；左键按住/拖拽期间不切）。不用 `SetWindowRgn`——会连渲染一起裁剪，切掉头顶气泡。掩码未就绪/全透明一律不穿透（宁可多挡，不能让角色点不到）。
 
 ## 6. Tauri 事件（Rust → 前端）
 

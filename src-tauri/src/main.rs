@@ -77,6 +77,43 @@ pub(crate) fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+/// 显式写入任务栏大图标（Windows）。
+///
+/// tao（Tauri 的窗口层）建窗时只把窗口图标写进 `ICON_SMALL`（`WM_SETICON` 的 0），
+/// `ICON_BIG`（任务栏 / Alt+Tab 用）始终为空——任务栏按钮于是取不到图标，
+/// 只能显示空白占位或历史图标缓存。这正是「桌面图标已换新、任务栏却是旧图/空白」的根因。
+/// 这里按 32（ICON_BIG）/ 16（ICON_SMALL）两档直接从 exe 内嵌图标资源提取，
+/// 与「桌面快捷方式 / 安装包」用同一份 `icons/icon.ico`，保证三处图标一致。
+#[cfg(windows)]
+fn apply_taskbar_icon(window: &tauri::WebviewWindow) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        PrivateExtractIconsW, SendMessageW, ICON_BIG, ICON_SMALL, WM_SETICON,
+    };
+
+    let Ok(hwnd) = window.hwnd() else { return };
+    let hwnd = hwnd.0 as *mut std::ffi::c_void;
+    let Ok(exe) = std::env::current_exe() else { return };
+    let exe_w: Vec<u16> = exe
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    for (size, icon_type) in [(32i32, ICON_BIG), (16i32, ICON_SMALL)] {
+        let mut hicon: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut icon_id: u32 = 0;
+        let extracted = unsafe {
+            PrivateExtractIconsW(exe_w.as_ptr(), 0, size, size, &mut hicon, &mut icon_id, 1, 0)
+        };
+        if extracted == 0 || hicon.is_null() {
+            continue;
+        }
+        // 句柄交由窗口持有，不 DestroyIcon：销毁后窗口图标会回退为空白
+        unsafe { SendMessageW(hwnd, WM_SETICON, icon_type as usize, hicon as isize) };
+    }
+}
+
 fn main() {
     // 品牌迁移（老版本 Trae Work Assistant → AI Work 助手，现更名为「大肥鱼助手」；数据目录沿用旧名）：
     // 必须在 AppState::new 创建新数据目录之前执行；迁移为「复制」语义，
@@ -154,6 +191,7 @@ fn main() {
             commands::pet::pet_status,
             commands::pet::pet_save_position,
             commands::pet::pet_focus_main,
+            commands::pet::pet_set_hit_mask,
             commands::pet::pet_probe_ready,
             commands::pet::pet_probe_hide_and_restore,
             commands::pet::pet_probe_report,
@@ -475,6 +513,9 @@ fn main() {
                 if !window.is_maximized().unwrap_or(false) {
                     let _ = window.maximize();
                 }
+                // 任务栏图标：tao 只写 ICON_SMALL，任务栏（ICON_BIG）为空会显示空白/旧缓存
+                #[cfg(windows)]
+                apply_taskbar_icon(&window);
             }
 
             // 创建系统托盘（始终启用，支持最小化到托盘；失败不阻断启动）
@@ -740,6 +781,10 @@ fn main() {
             // 桌宠初始状态（P0）：按 pet_enabled 决定显隐，并应用缩放与位置记忆。
             // 窗口在配置里声明为 visible:false，这里 show 之前不会闪白
             commands::pet::apply_settings(app.handle());
+
+            // 透明区域点击穿透：光标落在角色以外的空白格子时让窗口放行鼠标消息，
+            // 避免 300×360 的矩形窗口挡住下层窗口的点击（掩码由前端采样后上报）
+            commands::pet::start_hit_watcher(app.handle().clone());
 
             Ok(())
         })

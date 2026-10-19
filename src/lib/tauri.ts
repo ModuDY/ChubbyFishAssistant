@@ -288,6 +288,12 @@ export const api = {
     savePosition: () => invoke('pet_save_position'),
     /** 双击桌宠 → 呼出并聚焦主窗口 */
     focusMain: () => invoke('pet_focus_main'),
+    /**
+     * 上报「可点击格子」掩码（窗口百分比网格，1=角色 0=透明）。
+     * Rust 侧据此让角色以外的区域放行鼠标消息，避免透明窗口挡住下层窗口的点击。
+     */
+    setHitMask: (cols: number, rows: number, cells: number[]) =>
+      invoke('pet_set_hit_mask', { cols, rows, cells }),
   },
   misc: {
     storageHealth: () => invoke<StorageHealth>('storage_health'),

@@ -17,7 +17,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { api } from '../lib/tauri';
 import PetBubble from './PetBubble';
-import PetSprite, { type SpriteBox } from './PetSprite';
+import PetSprite, { MASK_COLS, MASK_ROWS, type SpriteBox } from './PetSprite';
 import { coreAction, makeTransient, raise } from './petState';
 import type { PetCoreState, PetTransient } from './petState';
 import { pickLine } from './lines';
@@ -69,6 +69,8 @@ export default function PetRoot() {
   const sadTimerRef = useRef<number | null>(null);
   const clickTimerRef = useRef<number | null>(null);
   const dragRef = useRef<{ x: number; y: number; started: boolean } | null>(null);
+  /** 已上报 Rust 的点击穿透掩码（并集，见 handleMask） */
+  const maskRef = useRef<Uint8Array | null>(null);
 
   // 透明窗口要求 html/body 无背景：class 只在本页挂载期间存在
   useEffect(() => {
@@ -265,6 +267,30 @@ export default function PetRoot() {
 
   const handleMeasure = useCallback((box: SpriteBox) => setHitBox(box), []);
 
+  /**
+   * 点击穿透掩码：把每次采样的格子并集后上报 Rust（只增不减）。
+   *
+   * 为什么取并集而不是直接覆盖：动作切换后首帧可能还没稳定（起手式角色偏一点），
+   * 覆盖式掩码会让角色刚露出来的部分被当成透明区，出现「点不到」。并集偏保守，
+   * 最多是角色边缘多挡一点，不会漏点。
+   */
+  const handleMask = useCallback((cells: Uint8Array) => {
+    const prev = maskRef.current;
+    const next = prev && prev.length === cells.length ? prev : new Uint8Array(cells.length);
+    let changed = !prev || prev.length !== cells.length;
+    for (let i = 0; i < cells.length; i += 1) {
+      if (cells[i] && !next[i]) {
+        next[i] = 1;
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    maskRef.current = next;
+    void api.pet.setHitMask(MASK_COLS, MASK_ROWS, Array.from(next)).catch(() => {
+      /* 上报失败只影响点击穿透，不影响显示，静默忽略 */
+    });
+  }, []);
+
   const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
     dragRef.current = { x: e.clientX, y: e.clientY, started: false };
@@ -345,6 +371,7 @@ export default function PetRoot() {
         paused={paused}
         onEnded={onSpriteEnded}
         onMeasure={handleMeasure}
+        onMask={handleMask}
       />
       {/* 气泡锚点：底边贴在角色头顶上方，而不是窗口顶部 */}
       {bubbleEnabled && bubble ? (

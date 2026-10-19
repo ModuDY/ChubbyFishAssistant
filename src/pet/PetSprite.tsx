@@ -32,6 +32,8 @@ type Props = {
   onEnded: () => void;
   /** 首帧角色包围盒（只上报一次；测量失败时父组件用保守默认值） */
   onMeasure?: (box: SpriteBox) => void;
+  /** 当前帧的「可点击格子」掩码（每次换动作重新采样，供 Rust 侧做透明区点击穿透） */
+  onMask?: (cells: Uint8Array) => void;
 };
 
 /** 采样分辨率：160×90 足够定位包围盒，又不会在读回像素上花时间 */
@@ -39,13 +41,18 @@ const SAMPLE_W = 160;
 const SAMPLE_H = 90;
 /** alpha 阈值：素材背景残留 alpha 集中在 1~50，取 64 把背景彻底排除 */
 const ALPHA_THRESHOLD = 64;
+/** 点击穿透掩码的网格尺寸（窗口百分比网格）：格子越细贴合越好，代价是 IPC 字节数 */
+export const MASK_COLS = 24;
+export const MASK_ROWS = 28;
 
-function measureAlphaBox(video: HTMLVideoElement): {
-  left: number;
-  right: number;
-  top: number;
-  bottom: number;
-} | null {
+/**
+ * 逐帧采样：一次 drawImage 同时算出「角色包围盒」（给气泡锚点/热区用）
+ * 与「可点击格子掩码」（给 Rust 侧点击穿透用）。
+ *
+ * 掩码规则：任一不透明采样点落在某格子内，该格子即算角色区域（宁大勿小）——
+ * 掩码偏大只会让角色边缘多挡一点点，偏小则会让用户点不到角色。
+ */
+function sampleFrame(video: HTMLVideoElement, winW: number, winH: number) {
   try {
     const canvas = document.createElement('canvas');
     canvas.width = SAMPLE_W;
@@ -59,21 +66,37 @@ function measureAlphaBox(video: HTMLVideoElement): {
     let minY = SAMPLE_H;
     let maxX = -1;
     let maxY = -1;
+
+    const cells = new Uint8Array(MASK_COLS * MASK_ROWS);
+    const rect = video.getBoundingClientRect();
+
     for (let y = 0; y < SAMPLE_H; y += 1) {
+      // 采样点在窗口坐标系中的位置（CSS px）：视频按宽铺满、贴底对齐
+      const wy = rect.top + ((y + 0.5) / SAMPLE_H) * rect.height;
+      const cy = Math.floor((wy / winH) * MASK_ROWS);
       for (let x = 0; x < SAMPLE_W; x += 1) {
         if (data[(y * SAMPLE_W + x) * 4 + 3] <= ALPHA_THRESHOLD) continue;
         if (x < minX) minX = x;
         if (x > maxX) maxX = x;
         if (y < minY) minY = y;
         if (y > maxY) maxY = y;
+        if (cy < 0 || cy >= MASK_ROWS) continue;
+        const wx = rect.left + ((x + 0.5) / SAMPLE_W) * rect.width;
+        const cx = Math.floor((wx / winW) * MASK_COLS);
+        if (cx < 0 || cx >= MASK_COLS) continue;
+        cells[cy * MASK_COLS + cx] = 1;
       }
     }
+
     if (maxX < 0) return null;
     return {
-      left: minX / SAMPLE_W,
-      right: (maxX + 1) / SAMPLE_W,
-      top: minY / SAMPLE_H,
-      bottom: (maxY + 1) / SAMPLE_H,
+      box: {
+        left: minX / SAMPLE_W,
+        right: (maxX + 1) / SAMPLE_W,
+        top: minY / SAMPLE_H,
+        bottom: (maxY + 1) / SAMPLE_H,
+      },
+      cells,
     };
   } catch {
     // 读回像素被拒（理论上同源不会发生）按失败处理，父组件用默认热区
@@ -87,6 +110,7 @@ export default function PetSprite({
   paused,
   onEnded,
   onMeasure,
+  onMask,
 }: Props) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const measuredRef = useRef(false);
@@ -95,21 +119,26 @@ export default function PetSprite({
 
   const measure = useCallback(
     (retry = 0) => {
-      if (measuredRef.current || !onMeasure) return;
       const video = videoRef.current;
       if (!video) return;
 
       const rect = video.getBoundingClientRect();
-      const box = measureAlphaBox(video);
+      const sample = sampleFrame(video, window.innerWidth || 1, window.innerHeight || 1);
       // 首帧可能还没出画面（窗口隐藏/解码未完成）或布局为 0：退避重试几次
-      if (!box || rect.width < 1 || rect.height < 1) {
+      if (!sample || rect.width < 1 || rect.height < 1) {
         if (retry < 4) window.setTimeout(() => measure(retry + 1), 300);
         return;
       }
 
+      // 掩码每次换动作都重采样（不同动作角色姿态/位置不同，穿透区域要跟着变）
+      onMask?.(sample.cells);
+
+      // 包围盒只在首帧量一次：气泡锚点/点击热区用，姿态变化不需要跟着抖
+      if (measuredRef.current || !onMeasure) return;
       measuredRef.current = true;
       const winW = window.innerWidth || 1;
       const winH = window.innerHeight || 1;
+      const box = sample.box;
       onMeasure({
         left: ((rect.left + box.left * rect.width) / winW) * 100,
         width: ((box.right - box.left) * rect.width / winW) * 100,
@@ -117,7 +146,7 @@ export default function PetSprite({
         height: ((box.bottom - box.top) * rect.height / winH) * 100,
       });
     },
-    [onMeasure],
+    [onMeasure, onMask],
   );
 
   useEffect(() => {

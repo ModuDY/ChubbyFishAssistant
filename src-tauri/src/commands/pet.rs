@@ -283,6 +283,150 @@ pub fn pet_probe_ready(window: WebviewWindow) -> Result<serde_json::Value, Strin
     }))
 }
 
+// ───────────────── 透明区域点击穿透（Windows） ─────────────────
+//
+// 问题：窗口是「视频宽 × 气泡留白」的矩形，角色只占底部一块，其余区域 alpha=0
+// 视觉上不存在，但原生窗口仍然**整块接收鼠标消息**——点在角色旁边的空白上不会落到
+// 下层窗口，表现为「角色周围有一层看不见的遮罩挡住点击」（用户实测反馈）。
+//
+// 方案：前端按当前画面 alpha 采样出「可点击格子」（PetSprite 的 mask 上报），
+// Rust 侧用一个轻量后台线程跟随光标：光标落在透明格子时给窗口加 WS_EX_TRANSPARENT
+// （Tauri 的 set_ignore_cursor_events），鼠标消息即穿透到下层窗口；回到角色格子再撤掉。
+//
+// 为什么不用 SetWindowRgn：窗口区域会**连同渲染一起裁剪**，角色头顶的气泡会被切掉。
+
+/// 前端上报的「可点击格子」掩码（窗口百分比网格，1=角色 0=透明）
+#[cfg(windows)]
+struct HitMask {
+    cols: u16,
+    rows: u16,
+    /// 行优先排列，长度 = cols × rows
+    cells: Vec<u8>,
+}
+
+#[cfg(windows)]
+static HIT_MASK: std::sync::Mutex<Option<HitMask>> = std::sync::Mutex::new(None);
+
+/// 上报「可点击格子」掩码：角色换动作/重新采样时由前端调用（幂等，覆盖旧值）。
+#[tauri::command]
+#[cfg_attr(not(windows), allow(unused_variables))]
+pub fn pet_set_hit_mask(cols: u16, rows: u16, cells: Vec<u8>) {
+    #[cfg(windows)]
+    {
+        if cols == 0 || rows == 0 || cells.len() != cols as usize * rows as usize {
+            return;
+        }
+        // 全透明（采样失败/首帧未解码）一律不采用：否则整窗穿透，用户再也点不到角色
+        if !cells.iter().any(|c| *c != 0) {
+            return;
+        }
+        if let Ok(mut slot) = HIT_MASK.lock() {
+            *slot = Some(HitMask { cols, rows, cells });
+        }
+    }
+}
+
+/// 启动光标跟随线程（只需调用一次；重复调用为空操作）。
+pub fn start_hit_watcher(app: AppHandle) {
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        if STARTED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        std::thread::spawn(move || {
+            let mut ignoring = false;
+            // 光标贴着角色边缘时逐帧可能反复横跳；状态需连续两帧一致才切换，
+            // 避免 WS_EX_LAYERED 反复增删引起的闪烁
+            let mut pending: Option<bool> = None;
+            loop {
+                // 24ms ≈ 40Hz：足够跟手，单次只有一次 GetCursorPos + 一次查表
+                std::thread::sleep(std::time::Duration::from_millis(24));
+
+                let Some(window) = pet_window(&app) else {
+                    continue;
+                };
+                if !window.is_visible().unwrap_or(false) {
+                    if ignoring {
+                        let _ = window.set_ignore_cursor_events(false);
+                        ignoring = false;
+                    }
+                    pending = None;
+                    continue;
+                }
+                // 左键按住期间（拖拽中/点住角色）一律不切换：
+                // 切到穿透会打断 startDragging 的原生拖拽循环
+                if left_button_down() {
+                    pending = None;
+                    continue;
+                }
+
+                let want = transparent_under_cursor(&window);
+                if want == ignoring {
+                    pending = None;
+                    continue;
+                }
+                if pending == Some(want) {
+                    if window.set_ignore_cursor_events(want).is_ok() {
+                        ignoring = want;
+                    }
+                    pending = None;
+                } else {
+                    pending = Some(want);
+                }
+            }
+        });
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+    }
+}
+
+#[cfg(windows)]
+fn left_button_down() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+    unsafe { (GetAsyncKeyState(VK_LBUTTON as i32) as u16 & 0x8000) != 0 }
+}
+
+/// 光标是否落在角色的**透明**区域上。
+///
+/// 一切异常（不在窗口内、掩码未就绪、坐标越界）都返回 false，即保持窗口可交互——
+/// 宁可多挡一下，也不能让用户点不到角色。
+#[cfg(windows)]
+fn transparent_under_cursor(window: &WebviewWindow) -> bool {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let (Ok(origin), Ok(size)) = (window.inner_position(), window.inner_size()) else {
+        return false;
+    };
+    let mut point = POINT { x: 0, y: 0 };
+    if unsafe { GetCursorPos(&mut point) } == 0 {
+        return false;
+    }
+    // inner_position/inner_size 均为物理像素，与 GetCursorPos 同一坐标系
+    let lx = point.x - origin.x;
+    let ly = point.y - origin.y;
+    if lx < 0 || ly < 0 || lx >= size.width as i32 || ly >= size.height as i32 {
+        return false;
+    }
+
+    let Ok(guard) = HIT_MASK.lock() else {
+        return false;
+    };
+    let Some(mask) = guard.as_ref() else {
+        return false;
+    };
+    let cols = mask.cols as u32;
+    let rows = mask.rows as u32;
+    let cx = (lx as u32 * cols / size.width.max(1)).min(cols - 1);
+    let cy = (ly as u32 * rows / size.height.max(1)).min(rows - 1);
+    mask.cells[(cy * cols + cx) as usize] == 0
+}
+
 /// 【诊断】隐藏 pet 窗口 1.5 秒后由 Rust 强制 show + 还原置顶。
 ///
 /// 保留原因：HTML5 允许窗口不可见时暂停 rAF/定时器，该行为一旦发生，前端**无法自行恢复**
