@@ -191,6 +191,8 @@ fn main() {
             commands::pet::pet_status,
             commands::pet::pet_save_position,
             commands::pet::pet_focus_main,
+            commands::pet::pet_reset_position,
+            commands::pet::pet_reload,
             commands::pet::pet_set_hit_mask,
             commands::pet_pack::pet_pack_list,
             commands::pet_pack::pet_pack_manifest,

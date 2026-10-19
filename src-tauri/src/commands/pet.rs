@@ -270,6 +270,43 @@ pub fn pet_save_position(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// 回到初始位置（主屏右下角）：桌宠被拖到屏幕外、拖歪时的兜底。
+///
+/// 与 `apply_settings` 的兜底分支同源（都走 `default_position`），并把该位置写回
+/// `pet_x/pet_y`，下次启动直接回到这里（用户拖动后也是这么记忆的）。
+#[tauri::command]
+pub fn pet_reset_position(app: AppHandle) -> Result<(), String> {
+    let Some(window) = pet_window(&app) else {
+        return Ok(());
+    };
+    let size = window.inner_size().map_err(|e| e.to_string())?;
+    let sf = window.scale_factor().unwrap_or(1.0);
+    let Some(pos) =
+        default_position(&window, size.width as f64 / sf, size.height as f64 / sf)
+    else {
+        return Ok(());
+    };
+    window.set_position(pos).map_err(|e| e.to_string())?;
+    // 落盘以窗口真实位置为准，不用 pos×sf 换算：
+    // 实测换算值和 outer_position 对不上（点了「回到初始位置」停在 A，重启却回到 B），
+    // 改成读回实际坐标后，就与 pet_save_position 完全同口径，重启必定停在刚才的位置。
+    let (x, y) = match window.outer_position() {
+        Ok(p) => (p.x, p.y),
+        Err(_) => ((pos.x * sf) as i32, (pos.y * sf) as i32),
+    };
+    patch_settings(&app, serde_json::json!({ "pet_x": x, "pet_y": y }));
+    Ok(())
+}
+
+/// 重新加载桌宠窗口：画面空白 / 动画卡住时的一键自愈，比结束进程重新拉起温和得多。
+#[tauri::command]
+pub fn pet_reload(app: AppHandle) -> Result<(), String> {
+    let Some(window) = pet_window(&app) else {
+        return Ok(());
+    };
+    window.reload().map_err(|e| e.to_string())
+}
+
 /// 双击桌宠：呼出并聚焦主窗口（复用 main.rs 的最大化兜底逻辑）。
 #[tauri::command]
 pub fn pet_focus_main(app: AppHandle) {

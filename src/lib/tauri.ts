@@ -291,6 +291,10 @@ export const api = {
     savePosition: () => invoke('pet_save_position'),
     /** 双击桌宠 → 呼出并聚焦主窗口 */
     focusMain: () => invoke('pet_focus_main'),
+    /** 回到初始位置（主屏右下角）：桌宠被拖出屏幕时的兜底，落盘为记忆位置 */
+    resetPosition: () => invoke('pet_reset_position'),
+    /** 重新加载桌宠窗口：画面空白 / 动画卡住时的一键自愈 */
+    reload: () => invoke('pet_reload'),
     /**
      * 让桌宠说一句 AI 话（P3）。命令立即返回 sessionId；流式结果经
      * `pet-say-start` / `pet-say-delta` / `pet-say-done` / `pet-say-error` 事件下发。
