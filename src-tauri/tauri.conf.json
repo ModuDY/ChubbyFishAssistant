@@ -27,7 +27,7 @@
         "label": "pet",
         "title": "大肥鱼桌宠",
         "url": "index.html?pet=1",
-        "width": 300,
+        "width": 460,
         "height": 360,
         "resizable": false,
         "decorations": false,
@@ -41,7 +41,11 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset: http://asset.localhost; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'self'; form-action 'self'",
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset: http://asset.localhost; media-src 'self' asset: http://asset.localhost blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'self'; form-action 'self'",
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$APPDATA/AIWorkAssistant/pets/**"]
+      },
       "devCsp": null
     }
   },

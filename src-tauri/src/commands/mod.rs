@@ -10,6 +10,7 @@ pub mod misc;
 pub mod oauth;
 pub mod oauth_loopback;
 pub mod pet;
+pub mod pet_pack;
 pub mod process;
 pub mod profile;
 pub mod proxy;

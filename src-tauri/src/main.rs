@@ -192,6 +192,8 @@ fn main() {
             commands::pet::pet_save_position,
             commands::pet::pet_focus_main,
             commands::pet::pet_set_hit_mask,
+            commands::pet_pack::pet_pack_list,
+            commands::pet_pack::pet_pack_manifest,
             // 桌宠 AI 对话（P3）：进程内复用 API 网关，流式事件 pet-say-*
             commands::pet::pet_say,
             commands::pet::pet_probe_ready,

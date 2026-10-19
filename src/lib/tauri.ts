@@ -303,6 +303,22 @@ export const api = {
      */
     setHitMask: (cols: number, rows: number, cells: number[]) =>
       invoke('pet_set_hit_mask', { cols, rows, cells }),
+    /** 可用素材包（用户放在 %APPDATA%\AIWorkAssistant\pets\<id>\ 下的形象） */
+    packList: () =>
+      invoke<Array<{ id: string; name: string; action_count: number }>>('pet_pack_list'),
+    /** 某个素材包的清单：只返回文件确实存在的动作，缺失的由前端回落内置 */
+    packManifest: (id: string) =>
+      invoke<{
+        id: string;
+        canvas: unknown;
+        actions: Array<{
+          id: string;
+          label: string;
+          group: string;
+          loop: boolean;
+          path: string;
+        }>;
+      }>('pet_pack_manifest', { id }),
   },
   misc: {
     storageHealth: () => invoke<StorageHealth>('storage_health'),

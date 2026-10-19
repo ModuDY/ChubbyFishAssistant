@@ -166,6 +166,8 @@ pub fn apply_settings(app: &AppHandle) {
             // P3：AI 档位与人格随设置即时下发（改完不必重启）
             "aiMode": settings.pet_ai_mode.clone().unwrap_or_else(|| "off".into()),
             "persona": settings.pet_persona.clone().unwrap_or_else(|| "whale".into()),
+        // 素材包：切换形象时前端据此重新装载动作表（builtin = 内置素材）
+        "pack": settings.pet_pack.clone().unwrap_or_else(|| "builtin".into()),
         }),
     );
 }
@@ -242,6 +244,8 @@ pub fn pet_status(app: AppHandle) -> serde_json::Value {
         // P3：AI 档位/人格（首启桌宠窗口读一次，避免只依赖 pet-update 事件）
         "aiMode": settings.pet_ai_mode.clone().unwrap_or_else(|| "off".into()),
         "persona": settings.pet_persona.clone().unwrap_or_else(|| "whale".into()),
+        // 素材包：切换形象时前端据此重新装载动作表（builtin = 内置素材）
+        "pack": settings.pet_pack.clone().unwrap_or_else(|| "builtin".into()),
     })
 }
 

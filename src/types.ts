@@ -523,6 +523,8 @@ export interface PetStatus {
   aiMode?: PetAiMode;
   /** P3：人格档位 */
   persona?: string;
+  /** P4-3：当前素材包（builtin = 内置素材） */
+  pack?: string;
 }
 
 /** F-74：会话域（WorkBuddy = ~/.workbuddy，CodeBuddy = ~/.codebuddy） */

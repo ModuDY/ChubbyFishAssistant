@@ -28,6 +28,15 @@ export default function GeneralSettingsPanel() {
   const [testing, setTesting] = useState(false);
   // 应用图标选择器：当前展开替换哪个应用的图标（null = 全部收起）
   const [iconPickerFor, setIconPickerFor] = useState<AppKey | null>(null);
+  // P4-3：可用的桌宠素材包（用户目录 pets/<id>/，不含内置）
+  const [packs, setPacks] = useState<Array<{ id: string; name: string; action_count: number }>>([]);
+
+  useEffect(() => {
+    void api.pet
+      .packList()
+      .then((list) => setPacks(Array.isArray(list) ? list : []))
+      .catch(() => setPacks([]));
+  }, []);
 
   const sendTest = async () => {
     setTesting(true);
@@ -471,6 +480,25 @@ export default function GeneralSettingsPanel() {
                 <option value="butler">正经管家</option>
                 <option value="zen">禅意</option>
               </select>
+            </div>
+            <div>
+              <label className="label">形象（素材包）</label>
+              <select
+                value={form.pet_pack ?? 'builtin'}
+                onChange={(e) => update('pet_pack', e.target.value)}
+                className="input w-56"
+              >
+                <option value="builtin">内置形象</option>
+                {packs.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}（{p.action_count} 个动作）
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-slate-400 mt-1">
+                自定义形象放在 <code>%APPDATA%\AIWorkAssistant\pets\&lt;id&gt;\</code>
+                （manifest.json + videos），包里缺少的动作自动回落内置素材。
+              </p>
             </div>
             <p className="text-xs text-amber-600 dark:text-amber-500">
               AI 对话经本机 API 网关生成，会真实消耗账号额度（每日上限 200 次；自动点评 2 分钟节流）。

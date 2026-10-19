@@ -20,6 +20,7 @@ import PetBubble from './PetBubble';
 import PetSprite, { MASK_COLS, MASK_ROWS, type SpriteBox } from './PetSprite';
 import { coreAction, makeTransient, pickTransientAction, raise } from './petState';
 import type { PetCoreState, PetTransient } from './petState';
+import { applyPetPack } from './actions';
 import { pickLine } from './lines';
 import { usePetEvents } from './usePetEvents';
 import type { PetSignal } from './usePetEvents';
@@ -59,6 +60,8 @@ type PetUpdatePayload = {
   aiMode?: string;
   /** P3：人格档位 */
   persona?: string;
+  /** P4-3：当前素材包（builtin = 内置素材） */
+  pack?: string;
   /**
    * API 网关运行态（Rust 在每次启停时推送）。
    * 用于让**已打开的**右键菜单立即改写「启动 / 停止」文案，避免两侧菜单状态不一致。
@@ -349,6 +352,10 @@ export default function PetRoot() {
       if (typeof patch.gatewayRunning === 'boolean') {
         setGatewayRunning(patch.gatewayRunning);
       }
+      // P4-3：素材包切换 → 重新装载动作表（包里缺的动作回落内置；加载失败也回落内置）
+      if (typeof patch.pack === 'string') {
+        void applyPetPack(patch.pack);
+      }
     };
 
     void api.pet
@@ -360,6 +367,7 @@ export default function PetRoot() {
           opacity: s.opacity,
           sleepMinutes: s.sleepMinutes,
           aiMode: s.aiMode,
+          pack: s.pack,
         });
       })
       .catch(() => {
