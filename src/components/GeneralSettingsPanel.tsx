@@ -436,6 +436,22 @@ export default function GeneralSettingsPanel() {
               />
               联动 API 网关活动
             </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.pet_anniversary ?? true}
+                onChange={(e) => update('pet_anniversary', e.target.checked)}
+              />
+              节日与时段动作（节令 / 饭点自动播）
+            </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.pet_easter_egg ?? true}
+                onChange={(e) => update('pet_easter_egg', e.target.checked)}
+              />
+              待机随机彩蛋（生活 / 才艺 / 特效）
+            </label>
             <div>
               <label className="label">大小</label>
               <div className="flex items-center gap-2">
@@ -465,6 +481,23 @@ export default function GeneralSettingsPanel() {
                 }
                 className="input w-24"
               />
+            </div>
+            <div>
+              <label className="label">彩蛋触发间隔（分钟）</label>
+              <input
+                type="number"
+                min={1}
+                max={30}
+                value={form.pet_easter_egg_minutes ?? 1}
+                onChange={(e) =>
+                  update(
+                    'pet_easter_egg_minutes',
+                    Math.min(30, Math.max(1, Number(e.target.value) || 1)),
+                  )
+                }
+                className="input w-24"
+              />
+              <p className="text-xs text-slate-400 mt-1">节日 / 时段 / 随机彩蛋共用此间隔（1~30）。</p>
             </div>
             <div>
               <label className="label">透明度</label>

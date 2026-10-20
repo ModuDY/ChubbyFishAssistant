@@ -292,6 +292,7 @@ ai-work-assistant/
 - **动作接线对齐上游（2026-10-19）**：动作语义以上游 `PC2005-cloud/dsh-pet` 的 `dsh-pet/assets/config.jsonc` 为准——`animations.events.workStatus` 按索引=档位（0=thinking 回合开始 / 1=working 工具调用 / 2=result / 3=waiting / 4=success / 5=error），故签到/切换在 `start` 阶段先发 `thinking`（播 work-think）、首个 `account` 事件再升 `working`（work-busy）；`深度思考碎碎念` 在上游属 `animations.categories` 的「文字」随机池（weight 10），不是 thinking 专用，故并入 idle 彩蛋池。收尾（`done`/`exit`/`switch-done`）必须 `emit(idle, force=true)` 显式降核心态，否则会卡在 thinking/working 的循环动作。
 - **网关活动联动（P5，2026-10-19，设计 §6.5）**：`pet_gateway_link`（**默认关**）开启后，网关（`api_server`）的活动驱动桌宠反应——把「外部 AI 工具正用本机账号池干活」变成实时状态。网关层无 AppHandle，故在 `do_start` 统一构造一个发射闭包（`ActivityEmitter`）注入各池（`set_activity_ctx`）与 `ApiSharedState`（`activity_tx`）；事件 `gateway-activity` 只发给 pet 窗口。挂点：并发 0→1（`inflight_guard`）发 `active`；`record_usage*` 记账咽喉发 `fail`（`internal:pet` 过滤防自激 + 按 model 60s 去重）与 `milestone`（累计 token 每 100 万）；`dispatch::log_fallback` 发 `switch`；`dispatch` 全池耗尽发 `no-healthy`；`pool::note_error` 熔断/积分耗尽发 `degrade`。一段活跃的**结束**由前端 `usePetGatewayEvents` 的 5s 静默窗判定（Rust 不逐请求发，避免刷屏）。前端复用既有 `PetSignal` 状态机，不新增状态；burst 结束时若业务流进行中（`PetRoot` 的 `businessActiveRef`）或处于 `sad` 停留，则**避让**不回落核心态，避免打断签到/切换的 `working` 与失败表情。
 - **窗口宽度 = 角色舞台 + 右侧菜单留白（2026-10-19）**：`pet.rs` 的 `MENU_SPACE=160` 与 `pet.css` 的 `--pet-menu-space:160px` 必须同步改；`.pet-video` 只铺满舞台（`calc(100% - var(--pet-menu-space))`）、左对齐，角色视觉位置不变，右侧留白全透明（走点击穿透放行鼠标）。右键菜单以角色 alpha 包围盒右缘为锚点、垂直居中，故能在角色右侧完整展开而不被窗口裁剪；气泡锚点同样扣掉这段留白，才会居中对准角色。
+- **全量彩蛋与时间触发（P6，2026-10-20，设计 §6.6）**：上游 106 个动作全量内嵌（`src/assets/pet/videos/`，51.8 MB，`manifest.json` 106 条、`selected:106`）。新增 4 个 group（`festival` / `life` / `talent` / `sfx`），`PetAction['group']` 联合类型须同步扩展，未知值回落显示原值。三类触发共用**同一个彩蛋定时器**与同一套护栏（纯 idle + 无瞬态 + 非拖拽），优先级 **节日 > 时段 > 随机彩蛋**、命中即 `return`，全部走既有 `playTransient`（**不新增状态机状态**）：① 节日由 `src/pet/festivals.ts` 按日期判定（`SOLAR_RULES` 公历固定 + `LUNAR_BY_YEAR` 农历/节气 2026–2030 静态表，**不引入历法库**；2030 后静默跳过、DEV 期 warn），当天只播一次（内存键，不落盘）；② 时段由 `src/pet/flavor.ts` 的 `timeSlot()` 判定（早 5–10 / 午 11–13 / 晚 17–20），每时段每天一次；③ 随机池用 `FLAVOR_BUCKETS` 四桶轮转 + `pushRecent` 最近 8 个去重（池子 50+ 时纯 random 会让单动作近乎不可见）。节日类不进随机池（避免「七月放烟花」），两个 `loop:true` 展示类动作也不进池（循环动作进瞬态会被兜底时长硬切）。设置项 `pet_anniversary` / `pet_easter_egg` / `pet_easter_egg_minutes`（默认开 / 开 / 1 分钟，范围 1–30）；Rust 侧用 `Option<bool>` + 消费点 `unwrap_or(true)` 表达「默认开」。素材批量补充用 `tools/pet-pipeline/fetch-webm.mjs`（内部 `CATALOG` 是中文名→ASCII 别名的唯一事实来源，未登记的上游文件报错退出防漏挂），随后 `check-asset.mjs --pixels` 全量校验（106/106 通过；容差按全量包络校准：脚底 35px、中心 60px——中心偏差只能粗检，节日/特效动作会把道具画在角色旁边）。
 
 ## 6. Tauri 事件（Rust → 前端）
 
@@ -327,7 +328,7 @@ ai-work-assistant/
 %APPDATA%\AIWorkAssistant\
 ├── conf/
 │   ├── app_settings.json         # Settings 全字段（snake_case）——UI 可编辑配置保留文件形态
-│   │                             #   含 pet_*（桌宠开关/位置/缩放/透明度/气泡/人格档位 pet_persona/AI 对话档位 pet_ai_mode/网关联动 pet_gateway_link；均 serde(default) 兼容老配置）
+│   │                             #   含 pet_*（桌宠开关/位置/缩放/透明度/气泡/人格档位 pet_persona/AI 对话档位 pet_ai_mode/网关联动 pet_gateway_link/节日与时段 pet_anniversary/空闲彩蛋 pet_easter_egg/彩蛋间隔 pet_easter_egg_minutes；均 serde(default) 兼容老配置）
 │   ├── vault.stronghold          # jwt/refresh_token 权威加密存储（Stronghold）
 │   └── vault_key.bin             # vault 主密码（DPAPI 加密）
 ├── data/

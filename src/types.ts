@@ -499,6 +499,12 @@ export interface Settings {
   pet_pack?: string | null;
   /** 网关活动联动（设计 §6.5，默认关） */
   pet_gateway_link?: boolean;
+  /** 节日 / 时段触发（P6；null = 默认开） */
+  pet_anniversary?: boolean | null;
+  /** 空闲随机彩蛋（P6；null = 默认开） */
+  pet_easter_egg?: boolean | null;
+  /** 彩蛋 / 节日 / 时段触发间隔（分钟；null = 1） */
+  pet_easter_egg_minutes?: number | null;
 }
 
 /**
@@ -529,6 +535,12 @@ export interface PetStatus {
   pack?: string;
   /** P5：网关活动联动开关（pet_status / pet-update 下发） */
   gatewayLink?: boolean;
+  /** P6：节日 + 时段触发开关（默认开） */
+  anniversary?: boolean;
+  /** P6：空闲随机彩蛋开关（默认开） */
+  easterEgg?: boolean;
+  /** P6：彩蛋 / 节日 / 时段触发间隔（分钟，默认 1） */
+  easterEggMinutes?: number;
 }
 
 /** F-74：会话域（WorkBuddy = ~/.workbuddy，CodeBuddy = ~/.codebuddy） */

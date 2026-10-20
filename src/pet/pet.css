@@ -222,11 +222,38 @@ body.pet-window {
   color: #e2e8f0;
 }
 
-/* 分组标题：不可点，仅作分隔 */
+/* 分组标题现在是可点击的折叠按钮（106 个动作默认收起），故要抹掉按钮默认外观 */
 .pet-menu-group {
+  display: block;
+  width: 100%;
   padding: 6px 8px 2px;
   font-size: 11px;
   color: #94a3b8;
+  text-align: left;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+.pet-menu-group:hover {
+  color: #cbd5e1;
+}
+
+/* 随机点播入口：置于动作列表最上方，样式与普通动作项一致但略带强调 */
+.pet-menu-random {
+  display: block;
+  width: 100%;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: #93c5fd;
+  text-align: left;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+.pet-menu-random:hover {
+  background: rgba(148, 163, 184, 0.18);
 }
 
 .pet-menu-hint {

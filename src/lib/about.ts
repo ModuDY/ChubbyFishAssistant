@@ -32,7 +32,7 @@ export const APP_DISCLAIMER =
  * 素材与实现均为 MIT；形象为社区二创，与 DeepSeek 官方无关。详见 src/assets/pet/THIRD_PARTY_NOTICES.md。
  */
 export const PET_ATTRIBUTION =
-  '桌宠素材来自 PC2005-cloud/dsh-pet (MIT) · 工程实现参考 MerZlin/dsh-pet-indesktop (MIT)';
+  '桌宠素材来自 PC2005-cloud/dsh-pet (MIT，106 个动作全量收录) · 工程实现参考 MerZlin/dsh-pet-indesktop (MIT)';
 
 export const LINK_GITHUB = 'https://github.com/ModuDY';
 export const LINK_REPO = 'https://github.com/ModuDY/ChubbyFishAssistant';

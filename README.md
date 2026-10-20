@@ -126,7 +126,7 @@ node scripts/package_portable.mjs   # 便携版 zip（大肥鱼助手_<版本>_x
 
 桌宠（大肥鱼）素材与相关实现来自以下开源仓库，均为 MIT 许可：
 
-- **素材**：[PC2005-cloud/dsh-pet](https://github.com/PC2005-cloud/dsh-pet) (MIT) —— 桌宠动作 WebM 素材
+- **素材**：[PC2005-cloud/dsh-pet](https://github.com/PC2005-cloud/dsh-pet) (MIT) —— 桌宠动作 WebM 素材（上游 106 个动作已全量收录，约 51.8 MB）
 - **实现参考**：[MerZlin/dsh-pet-indesktop](https://github.com/MerZlin/dsh-pet-indesktop) (MIT) —— 状态聚合 / 隐藏即停 / 点击穿透等工程经验
 
 详见 [`src/assets/pet/THIRD_PARTY_NOTICES.md`](src/assets/pet/THIRD_PARTY_NOTICES.md) 与 [`LICENSE-dsh-pet.txt`](src/assets/pet/LICENSE-dsh-pet.txt)。桌宠形象为社区二创，与 DeepSeek 官方无关。

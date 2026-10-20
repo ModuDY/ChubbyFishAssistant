@@ -20,8 +20,10 @@ import PetBubble from './PetBubble';
 import PetSprite, { MASK_COLS, MASK_ROWS, type SpriteBox } from './PetSprite';
 import { coreAction, makeTransient, pickTransientAction, raise } from './petState';
 import type { PetCoreState, PetTransient } from './petState';
-import { applyPetPack, ACTION_LIST } from './actions';
+import { applyPetPack, ACTION_LIST, ACTIONS } from './actions';
 import { pickLine } from './lines';
+import { localDateKey, getTodaysFestivalPlan } from './festivals';
+import { pickFlavorAction, pickSlotAction, pushRecent, timeSlot } from './flavor';
 import { usePetEvents } from './usePetEvents';
 import type { PetSignal } from './usePetEvents';
 import { usePetSay, type SayState } from './usePetSay';
@@ -40,8 +42,13 @@ const SAD_HOLD_MS = 9000;
 const IDLE_SWAP_MS = 24_000;
 /** 打盹检测轮询间隔 */
 const SLEEP_CHECK_MS = 20_000;
-/** 空闲彩蛋间隔：长时间纯 idle 时偶尔来一发东张西望 / 发呆碎碎念 */
-const IDLE_FLAVOR_MS = 45_000;
+/**
+ * 空闲彩蛋 / 节日 / 时段的默认间隔（分钟）。
+ * 实际间隔由设置项 `pet_easter_egg_minutes` 决定（默认 1 分钟）；这里只是默认值的兜底。
+ * 全量入库上游 75 个彩蛋后，池子从 3 个动作变成 50+，靠分桶轮转保证每类都能轮到，
+ * 间隔比原来的固定 45s 略放宽，避免连续动作把待机画面刷得太忙。
+ */
+const DEFAULT_EASTER_EGG_MINUTES = 1;
 /** working 无进度判定：超过该时长没有新事件就播 mumble-screen（对屏碎碎念） */
 const WORK_MUMBLE_MS = 45_000;
 /**
@@ -63,6 +70,12 @@ type PetUpdatePayload = {
   persona?: string;
   /** P4-3：当前素材包（builtin = 内置素材） */
   pack?: string;
+  /** P6：节日 + 时段触发开关（默认开） */
+  anniversary?: boolean;
+  /** P6：空闲随机彩蛋开关（默认开） */
+  easterEgg?: boolean;
+  /** P6：彩蛋 / 节日 / 时段的触发间隔（分钟，默认 1） */
+  easterEggMinutes?: number;
   /**
    * API 网关运行态（Rust 在每次启停时推送）。
    * 用于让**已打开的**右键菜单立即改写「启动 / 停止」文案，避免两侧菜单状态不一致。
@@ -125,6 +138,8 @@ export default function PetRoot() {
   } | null>(null);
   /** 切换形象：进入 packs 视图时才拉取，避免每次右键都扫一遍用户目录 */
   const [packs, setPacks] = useState<Array<{ id: string; name: string }>>([]);
+  /** 动作点播视图里已展开的分组名（默认全部收起，见 toggleGroup） */
+  const [openGroups, setOpenGroups] = useState<Set<string>>(new Set());
   /**
    * API 网关运行态（全局单一来源）：
    * - 初始 / 打开菜单时经 `apiServer.status()` 探测；
@@ -136,6 +151,12 @@ export default function PetRoot() {
   const [currentPack, setCurrentPack] = useState('builtin');
   /** P5：网关活动联动开关（默认关；来自 Rust pet-update / pet_status，设计 §6.5） */
   const [gatewayLink, setGatewayLink] = useState(false);
+  /** P6：节日 + 时段触发（默认开；来自 Rust pet-update / pet_status） */
+  const [anniversaryEnabled, setAnniversaryEnabled] = useState(true);
+  /** P6：空闲随机彩蛋（默认开） */
+  const [easterEggEnabled, setEasterEggEnabled] = useState(true);
+  /** P6：彩蛋 / 节日 / 时段触发间隔（分钟，默认 1） */
+  const [easterEggMinutes, setEasterEggMinutes] = useState(DEFAULT_EASTER_EGG_MINUTES);
   const [bubbleEnabled, setBubbleEnabled] = useState(true);
   const [opacity, setOpacity] = useState(1);
   const [sleepMinutes, setSleepMinutes] = useState(5);
@@ -162,6 +183,14 @@ export default function PetRoot() {
   transientRef.current = transient;
   /** 各动作实测时长（ms）缓存：key = actionId，用于瞬态兜底计时 */
   const durationRef = useRef<Record<string, number>>({});
+  /** P6：已播过的节日（键 `YYYY-MM-DD#festival`；纯内存，重启后当天可再播一次） */
+  const festivalFiredRef = useRef<Set<string>>(new Set());
+  /** P6：已播过的时段（键 `YYYY-MM-DD#slot`；每个时段每天只播一次） */
+  const slotFiredRef = useRef<Set<string>>(new Set());
+  /** P6：彩蛋分桶轮次（每触发一次 +1，用于依次轮换 4 个桶） */
+  const flavorTickRef = useRef(0);
+  /** P6：最近播过的彩蛋动作（新→旧，避免短期内重复） */
+  const recentFlavorRef = useRef<string[]>([]);
   /** 当前正在播的动作 id（onDuration 回调里需要知道是哪个动作） */
   const actionIdRef = useRef('');
   /** 拖拽中：拖拽期间不插播彩蛋 */
@@ -399,6 +428,12 @@ export default function PetRoot() {
         setCurrentPack(patch.pack || 'builtin');
         void applyPetPack(patch.pack);
       }
+      // P6：节日 / 时段 / 彩蛋三个开关与间隔
+      if (typeof patch.anniversary === 'boolean') setAnniversaryEnabled(patch.anniversary);
+      if (typeof patch.easterEgg === 'boolean') setEasterEggEnabled(patch.easterEgg);
+      if (typeof patch.easterEggMinutes === 'number' && patch.easterEggMinutes > 0) {
+        setEasterEggMinutes(Math.min(30, Math.max(1, Math.round(patch.easterEggMinutes))));
+      }
     };
 
     void api.pet
@@ -412,6 +447,9 @@ export default function PetRoot() {
           aiMode: s.aiMode,
           pack: s.pack,
           gatewayLink: s.gatewayLink,
+          anniversary: s.anniversary,
+          easterEgg: s.easterEgg,
+          easterEggMinutes: s.easterEggMinutes,
         });
       })
       .catch(() => {
@@ -508,16 +546,66 @@ export default function PetRoot() {
     return () => window.clearInterval(timer);
   }, []);
 
-  /* ----------------------- 空闲彩蛋（低频） ----------------------- */
+  /* --------------- 节日 / 时段 / 空闲彩蛋 调度（P6 全量彩蛋） --------------- */
+  /**
+   * 优先级：**节日 > 时段 > 空闲随机彩蛋**（命中即 return，同一轮只播一个）。
+   *
+   * 三个触发源共用本定时器与同一套护栏（纯 idle + 无瞬态 + 非拖拽），因此：
+   * - 节日当天：待机后第一次轮到即播（内存去重，当天只播一次）；
+   * - 时段：早/午/晚各自当天只播一次（避免"一顿饭吃十遍"）；
+   * - 彩蛋：每轮都播，靠 `pickFlavorAction` 的**分桶轮转**保证 4 类都能轮到。
+   *
+   * 均只读事件、只播动作，不写任何业务数据（红线）。
+   */
   useEffect(() => {
+    const intervalMs = Math.max(1, Math.min(30, easterEggMinutes)) * 60_000;
     const timer = window.setInterval(() => {
       if (coreRef.current !== 'idle') return;
       if (transientRef.current || draggingRef.current) return;
-      // 纯 idle 长时间无事件：偶尔东张西望 / 发呆碎碎念（idle-look / mumble-daze 随机）
-      playTransient('idle', pickLine('idle', lastLineRef.current));
-    }, IDLE_FLAVOR_MS);
+      const now = new Date();
+      const today = localDateKey(now);
+
+      // 1) 节日（含农历节日与节气；当天只播一次）
+      if (anniversaryEnabled) {
+        const plan = getTodaysFestivalPlan(now);
+        if (plan && !festivalFiredRef.current.has(plan.key)) {
+          const action = plan.actions.find((id) => ACTIONS[id]?.url);
+          if (action) {
+            festivalFiredRef.current.add(plan.key);
+            playTransient('idle', `${plan.label}到了`, action);
+            return;
+          }
+        }
+      }
+
+      // 2) 时段（刷牙 / 早餐 / 午餐 / 晚餐；每个时段每天只播一次）
+      if (anniversaryEnabled) {
+        const slot = timeSlot(now.getHours());
+        if (slot) {
+          const slotKey = `${today}#${slot}`;
+          if (!slotFiredRef.current.has(slotKey)) {
+            const action = pickSlotAction(slot);
+            if (ACTIONS[action]?.url) {
+              slotFiredRef.current.add(slotKey);
+              playTransient('idle', undefined, action);
+              return;
+            }
+          }
+        }
+      }
+
+      // 3) 空闲随机彩蛋（分桶轮转 + 避开最近播过的）
+      if (easterEggEnabled) {
+        const tick = flavorTickRef.current;
+        flavorTickRef.current += 1;
+        const action = pickFlavorAction(tick, recentFlavorRef.current);
+        if (!ACTIONS[action]?.url) return;
+        recentFlavorRef.current = pushRecent(recentFlavorRef.current, action);
+        playTransient('idle', pickLine('idle', lastLineRef.current));
+      }
+    }, intervalMs);
     return () => window.clearInterval(timer);
-  }, [playTransient]);
+  }, [anniversaryEnabled, easterEggEnabled, easterEggMinutes, playTransient]);
 
   /* ----------------------- 启动彩蛋：伸个懒腰 ----------------------- */
   useEffect(() => {
@@ -683,7 +771,7 @@ export default function PetRoot() {
 
   /* ------- 菜单扩展（2026-10-20）：动作点播 / 位置与自愈 / 切换形象 ------- */
 
-  /** 动作分组的中文标题（与 manifest 的 group 字段对应） */
+  /** 动作分组的中文标题（与 manifest 的 group 字段对应；未知 group 回落显示原值） */
   const GROUP_LABELS: Record<string, string> = {
     idle: '待机',
     work: '工作',
@@ -693,12 +781,36 @@ export default function PetRoot() {
     drag: '拖拽',
     turn: '转向',
     jump: '跳跃',
+    // P6 全量彩蛋新增的 4 组
+    festival: '节日',
+    life: '饮食起居',
+    talent: '才艺玩物',
+    sfx: '特效',
   };
 
   /** 点播一个动作：走 click 池的瞬态通道并覆写动作 id，时长按素材实测值 */
   const pet_playAction = (id: string) => {
     closeMenu();
     playTransient('click', undefined, id);
+  };
+
+  /** 随机来一个：在**有素材**的动作里随机挑一个点播（106 个动作时的省事入口） */
+  const pet_playRandom = () => {
+    closeMenu();
+    const pool = ACTION_LIST.filter((a) => a.url);
+    if (pool.length === 0) return;
+    const a = pool[Math.floor(Math.random() * pool.length)];
+    playTransient('click', `来一个：${a.label}`, a.id);
+  };
+
+  /** 动作分组展开态（默认收起：106 个动作全展开会长到滚不完） */
+  const toggleGroup = (group: string) => {
+    setOpenGroups((cur) => {
+      const next = new Set(cur);
+      if (next.has(group)) next.delete(group);
+      else next.add(group);
+      return next;
+    });
   };
 
   const openActionView = useCallback(() => {
@@ -899,6 +1011,9 @@ export default function PetRoot() {
                   <span>动作点播</span>
                 </div>
                 <div className="pet-menu-scroll">
+                  <button type="button" className="pet-menu-random" onClick={pet_playRandom}>
+                    随机来一个
+                  </button>
                   {Object.entries(
                     ACTION_LIST.reduce<Record<string, typeof ACTION_LIST>>((acc, a) => {
                       (acc[a.group] ??= []).push(a);
@@ -906,12 +1021,21 @@ export default function PetRoot() {
                     }, {}),
                   ).map(([group, list]) => (
                     <div key={group}>
-                      <div className="pet-menu-group">{GROUP_LABELS[group] ?? group}</div>
-                      {list.map((a) => (
-                        <button key={a.id} type="button" onClick={() => pet_playAction(a.id)}>
-                          {a.label}
-                        </button>
-                      ))}
+                      <button
+                        type="button"
+                        className="pet-menu-group"
+                        onClick={() => toggleGroup(group)}
+                        aria-expanded={openGroups.has(group)}
+                      >
+                        {GROUP_LABELS[group] ?? group}（{list.length}）{openGroups.has(group) ? '▾' : '▸'}
+                      </button>
+                      {openGroups.has(group)
+                        ? list.map((a) => (
+                            <button key={a.id} type="button" onClick={() => pet_playAction(a.id)}>
+                              {a.label}
+                            </button>
+                          ))
+                        : null}
                     </div>
                   ))}
                 </div>

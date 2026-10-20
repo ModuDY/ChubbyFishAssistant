@@ -28,15 +28,36 @@ export type PetAction = {
   id: string;
   /** 上游原始中文名，用于追溯与致谢 */
   label: string;
-  group: 'idle' | 'work' | 'balance' | 'click' | 'mumble' | 'drag' | 'turn' | 'jump';
+  group: PetActionGroup;
   loop: boolean;
   url: string;
 };
 
+/**
+ * 动作分组（与 manifest 的 `group` 字段一一对应）。
+ *
+ * 前 8 个是业务动作；后 4 个是 2026-10-20 全量入库上游彩蛋时新增的：
+ * 节日类按日期触发（`festivals.ts`），生活/才艺/特效类进空闲随机池（`flavor.ts`）。
+ * 三方素材包沿用旧 8 值时仍可用（组标题回落显示原值），但建议新包对齐这 12 个取值。
+ */
+export type PetActionGroup =
+  | 'idle'
+  | 'work'
+  | 'balance'
+  | 'click'
+  | 'mumble'
+  | 'drag'
+  | 'turn'
+  | 'jump'
+  | 'festival'
+  | 'life'
+  | 'talent'
+  | 'sfx';
+
 type ManifestAction = {
   id: string;
   label: string;
-  group: PetAction['group'];
+  group: PetActionGroup;
   loop: boolean;
   file: string;
 };

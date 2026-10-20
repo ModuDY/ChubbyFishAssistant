@@ -406,6 +406,17 @@ pub struct Settings {
     /// 默认关（不打扰存量用户）
     #[serde(default)]
     pub pet_gateway_link: bool,
+    /// 节日 / 时段触发（P6 全量彩蛋）：节日按日期播对应动作、早午晚播刷牙吃饭。
+    /// `Option<bool>` + 消费点 `unwrap_or(true)` = 默认开（与 `pet_bubble` 同法，
+    /// 避免 derive Default 的 false 与"默认开"矛盾）
+    #[serde(default)]
+    pub pet_anniversary: Option<bool>,
+    /// 空闲随机彩蛋（P6）：待机时按分桶轮转随机播上游生活/才艺/特效动作。默认开
+    #[serde(default)]
+    pub pet_easter_egg: Option<bool>,
+    /// 彩蛋 / 节日 / 时段共用的触发间隔（分钟，1~30；None = 1）
+    #[serde(default)]
+    pub pet_easter_egg_minutes: Option<u32>,
 }
 
 fn default_api_port() -> u16 {

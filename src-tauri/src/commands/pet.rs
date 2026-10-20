@@ -170,6 +170,10 @@ pub fn apply_settings(app: &AppHandle) {
         "pack": settings.pet_pack.clone().unwrap_or_else(|| "builtin".into()),
         // 网关活动联动开关（设计 §6.5）：默认关
         "gatewayLink": settings.pet_gateway_link,
+        // P6：节日/时段触发与空闲彩蛋（默认开）+ 触发间隔（默认 1 分钟）
+        "anniversary": settings.pet_anniversary.unwrap_or(true),
+        "easterEgg": settings.pet_easter_egg.unwrap_or(true),
+        "easterEggMinutes": settings.pet_easter_egg_minutes.unwrap_or(1),
         }),
     );
 }
@@ -250,6 +254,10 @@ pub fn pet_status(app: AppHandle) -> serde_json::Value {
         "pack": settings.pet_pack.clone().unwrap_or_else(|| "builtin".into()),
         // 网关活动联动开关（设计 §6.5）：默认关
         "gatewayLink": settings.pet_gateway_link,
+        // P6：节日/时段触发与空闲彩蛋（默认开）+ 触发间隔（默认 1 分钟）
+        "anniversary": settings.pet_anniversary.unwrap_or(true),
+        "easterEgg": settings.pet_easter_egg.unwrap_or(true),
+        "easterEggMinutes": settings.pet_easter_egg_minutes.unwrap_or(1),
     })
 }
 
