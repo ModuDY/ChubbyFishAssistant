@@ -79,11 +79,9 @@ pub fn capture_from_signed_request(path: &str) {
     }
 }
 
-/// 数据根目录：`%APPDATA%\<DATA_DIR_NAME>`（与 AppState 布局一致）
+/// 数据根目录（与 AppState 同源：`state::data_root()`，Windows 默认 D:\work\app-data）
 fn data_dir() -> Option<PathBuf> {
-    std::env::var("APPDATA")
-        .ok()
-        .map(|d| Path::new(&d).join(crate::state::DATA_DIR_NAME))
+    Some(crate::state::data_root())
 }
 
 /// 一次请求目标里摘出的待落盘信息（纯解析结果，便于单测）。

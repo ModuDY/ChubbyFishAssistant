@@ -28,6 +28,9 @@ Thumbs.db
 # 运行时数据（证书、账号状态等）
 data/
 
+# 数据目录迁移前的本地备份（含账号凭据，严禁提交）
+.data-backup/
+
 # test_proxy 抓包产物（完整体另存目录）
 proxy_bodies/
 # test_proxy 系统代理崩溃自愈恢复记录

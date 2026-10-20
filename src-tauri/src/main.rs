@@ -1,7 +1,7 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 // 亦对 debug 生效：双击 debug exe 时不再额外弹出控制台黑窗（GUI 首启体验与正式版一致）。
 // CLI 计划任务（--task-run）不受影响——GUI 子系统的 stdout 重定向与退出码均已实测正常，
-// 且所有运行日志仍写入 %APPDATA%\AIWorkAssistant\logs\app.log。
+// 且所有运行日志仍写入数据根目录（state::data_root()，Windows 默认 D:\work\app-data）\logs\app.log。
 #![windows_subsystem = "windows"]
 
 mod commands;

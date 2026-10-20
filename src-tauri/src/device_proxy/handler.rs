@@ -778,16 +778,11 @@ enum PayloadPatch {
     TailDigits(Vec<u8>),
 }
 
-/// 诊断：读取 payload 补丁（`%APPDATA%\<数据目录>\abogus_patch.json`）。用途：逐字段
+/// 诊断：读取 payload 补丁（`<数据根>/abogus_patch.json`，数据根见 `state::data_root()`）。用途：逐字段
 /// 验证服务端是否校验该字段——改了某字段仍 200 = 该字段不被校验（生成时可任意填）；
 /// 被拒 = 必须精确复现。文件不存在/解析失败一律返回 `None`（等价于只做重编码）。
 fn load_payload_patch() -> PayloadPatch {
-    let Ok(dir) = std::env::var("APPDATA") else {
-        return PayloadPatch::None;
-    };
-    let path = std::path::Path::new(&dir)
-        .join(crate::state::DATA_DIR_NAME)
-        .join("abogus_patch.json");
+    let path = crate::state::data_root().join("abogus_patch.json");
     let Ok(text) = std::fs::read_to_string(&path) else {
         return PayloadPatch::None;
     };

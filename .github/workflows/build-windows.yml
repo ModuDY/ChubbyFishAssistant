@@ -72,9 +72,9 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          # 审查 M15：产品已更名 AI Work 助手（mainBinaryName ai-work-assistant），
-          # artifact 名同步去除 trae-work-assistant 遗留
-          name: ai-work-assistant-windows
+          # 审查 M15：产品已更名为「大肥鱼助手」（mainBinaryName 与 productName 同名），
+          # artifact 名同步使用新项目标识
+          name: chubbyfish-assistant-windows
           path: |
             release/windows/*
           if-no-files-found: error

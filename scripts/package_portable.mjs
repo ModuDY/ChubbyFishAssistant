@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /** 把 release 构建产物打包为 portable zip：
- *   AI Work 助手_<version>_x64_portable.zip
+ *   大肥鱼助手_<version>_x64_portable.zip
  * 内容布局（与 Tauri 安装包一致，exe 直接读取同目录 resources/）：
- *   AI Work 助手/               ← 顶层目录用产品名（APP 显示名称）
- *     ai-work-assistant.exe     ← 主程序名取 tauri.conf.json 的 mainBinaryName
+ *   大肥鱼助手/                 ← 顶层目录用产品名（APP 显示名称）
+ *     大肥鱼助手.exe            ← 主程序名取 tauri.conf.json 的 mainBinaryName
  *     resources/ps/              (来自 src-ps/；python 资源目录已随 Rust 化移除)
  *
  * zip 由 Windows 10+ 自带 tar.exe（bsdtar）按扩展名自动生成 zip 格式
@@ -27,12 +27,6 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SRC_TAURI = resolve(ROOT, 'src-tauri');
 const CONF = resolve(SRC_TAURI, 'tauri.conf.json');
 const OUT_DIR = resolve(ROOT, 'release');
-
-// 主程序候选：优先 mainBinaryName 命名的产物，兼容旧的 cargo 包名产物
-const EXE_CANDIDATES = [
-  resolve(SRC_TAURI, 'target/release/ai-work-assistant.exe'),
-  resolve(SRC_TAURI, 'target/release/trae-work-assistant.exe'),
-];
 
 const SKIP_DIRS = new Set(['__pycache__', '.git']);
 
@@ -100,7 +94,14 @@ if (!version) {
   if (!m) die('ERROR: 无法从 Cargo.toml 读取版本号');
   version = m[1];
 }
-const binaryName = conf.mainBinaryName || 'ai-work-assistant';
+// 主程序名与候选路径：由 mainBinaryName 派生（当前为中文「大肥鱼助手」），
+// 并兼容历史 cargo 包名产物，避免主程序改名后此处硬编码失效。
+const binaryName = conf.mainBinaryName || '大肥鱼助手';
+const EXE_CANDIDATES = [
+  resolve(SRC_TAURI, `target/release/${binaryName}.exe`),
+  resolve(SRC_TAURI, 'target/release/ai-work-assistant.exe'),
+  resolve(SRC_TAURI, 'target/release/trae-work-assistant.exe'),
+];
 // resources 形如 {"../src-ps/": "ps/"}（python 资源已随 Rust 化移除）
 const resources = conf.bundle?.resources ?? {};
 

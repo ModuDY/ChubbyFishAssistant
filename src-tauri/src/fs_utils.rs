@@ -1,7 +1,7 @@
 //! 文件读写工具：原子替换 + 容错加载 + 时间辅助。
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// 读取 JSON，文件不存在或解析失败返回默认值。
 /// P1（审查）：解析前剥 UTF-8 BOM（Windows 记事本编辑过的配置带 EF BB BF 前缀，
@@ -27,14 +27,12 @@ pub fn read_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
 }
 
 /// 无 data_dir 入参场景的兜底 app_log：fs_utils 多数调用方只持文件路径，按
-/// state.rs 同源规则（%APPDATA%\AIWorkAssistant）定位数据目录；解析失败静默
-/// 放弃（日志失败不影响读取主流程）。
+/// `state::data_root()` 同源规则定位数据目录（Windows 默认 D:\work\app-data）；
+/// 解析失败静默放弃（日志失败不影响读取主流程）。
 /// 审查修复：改为公开，供无 data_dir 上下文的一次性降级观测
 /// （如 Qoder 原生风控身份解析失败时落 app.log）。
 pub fn app_log_default(msg: &str) {
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        app_log(&PathBuf::from(appdata).join(crate::state::DATA_DIR_NAME), msg);
-    }
+    app_log(&crate::state::data_root(), msg);
 }
 
 // （SQLite 化 P3：read_json_cached 解析缓存随 6 个热路径文件迁入 store 后删除；

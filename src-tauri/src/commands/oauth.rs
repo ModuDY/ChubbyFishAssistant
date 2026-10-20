@@ -73,16 +73,8 @@ fn default_exchange_url() -> String {
 pub fn oauth_client() -> &'static OAuthClientConfig {
     static CFG: std::sync::OnceLock<OAuthClientConfig> = std::sync::OnceLock::new();
     CFG.get_or_init(|| {
-        std::env::var("APPDATA")
-            .ok()
-            .map(|d| {
-                std::path::PathBuf::from(d)
-                    .join(crate::state::DATA_DIR_NAME)
-                    .join("conf")
-                    .join("oauth_client.json")
-            })
-            .map(|p| fs_utils::read_json::<OAuthClientConfig>(&p))
-            .unwrap_or_default()
+        let path = crate::state::data_root().join("conf").join("oauth_client.json");
+        fs_utils::read_json::<OAuthClientConfig>(&path)
     })
 }
 
@@ -148,19 +140,14 @@ fn exchange_agent() -> Result<ureq::Agent, String> {
     };
     // 调试代理容错（2026-09-16 实测）：设置了调试代理但尚未启动过代理（CA 未生成）
     // 时降级直连并记日志，不阻断登录闭环；只有 CA 存在但损坏才视为错误
-    let dir = std::env::var("APPDATA")
-        .ok()
-        .map(|d| std::path::PathBuf::from(d).join(crate::state::DATA_DIR_NAME));
-    let ca_path = dir.as_ref().map(|d| d.join("certs").join("ca.crt"));
-    let ca_pem = match ca_path.as_deref().and_then(|p| std::fs::read_to_string(p).ok()) {
-        Some(p) => p,
-        None => {
-            if let Some(d) = dir.as_ref() {
-                fs_utils::app_log(
-                    d,
-                    "[OAuth] AIWORK_OAUTH_DEBUG_PROXY 已设置但本地 CA 缺失/读取失败，交换请求降级直连；如需抓包请先启动一次代理生成证书",
-                );
-            }
+    let dir = crate::state::data_root();
+    let ca_pem = match std::fs::read_to_string(dir.join("certs").join("ca.crt")) {
+        Ok(p) => p,
+        Err(_) => {
+            fs_utils::app_log(
+                &dir,
+                "[OAuth] AIWORK_OAUTH_DEBUG_PROXY 已设置但本地 CA 缺失/读取失败，交换请求降级直连；如需抓包请先启动一次代理生成证书",
+            );
             return Ok(short_agent());
         }
     };

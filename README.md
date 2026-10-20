@@ -61,11 +61,14 @@ Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 1
 
 ```powershell
 npm install
-npm run tauri dev      # 开发模式
-npm run tauri build    # 打包（msi + nsis）
+npm run tauri dev      # 开发模式（热更新，带源码改动）
+npm run tauri build    # 打包安装包（NSIS）
 node scripts/rename_release.mjs     # 安装包统一输出到 release/，命名 大肥鱼助手_<版本>_x64*
 node scripts/package_portable.mjs   # 便携版 zip（大肥鱼助手_<版本>_x64_portable.zip）
 ```
+
+> **命名约定**：`productName` 与 `mainBinaryName` 同为 **大肥鱼助手** —— 安装目录、快捷方式、安装包文件名、主程序 `大肥鱼助手.exe` 全部一致。Cargo 包名仍是 `ai-work-assistant`（仅内部标识，不对外可见）。
+> **改完源码要看到效果必须重新打包或跑 dev**：`vite build` 只产出前端 `dist/`，不会更新已安装的 exe；桌面快捷方式指向的是安装目录里的旧程序。
 
 前置：Node.js 18+、Rust 1.85+（`Cargo.toml` rust-version）、WebView2 Runtime、VS Build Tools (C++)
 

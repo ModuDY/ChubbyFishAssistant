@@ -126,7 +126,62 @@ fn dir_is_empty(dir: &PathBuf) -> Option<bool> {
         .map(|mut entries| entries.next().is_none())
 }
 
-/// 应用全局状态。base_dir 指向 %APPDATA%\AIWorkAssistant；
+/// 数据目录根（**不占系统盘**）。
+///
+/// 解析优先级：
+/// 1. 环境变量 `AIWORK_DATA_DIR`（显式覆盖，排查/多实例调试用）；
+/// 2. Windows：`D:\work\app-data` —— 与程序安装目录 `D:\work\app` **平级**，
+///    刻意不放安装目录内，否则 NSIS 卸载 `RMDir /r "$INSTDIR"` 会连数据一起删；
+///    仅当 `D:\work` 存在时采用（机器没有 D 盘时自动回落，不至于启动失败）；
+/// 3. 兜底：`%APPDATA%\AIWorkAssistant`（Windows）/ `dirs::data_dir()`（macOS）。
+///
+/// 与 `AppState::new` 内的「旧目录 → 新根」一次性复制迁移配合使用：
+/// 用户从 C 盘旧版升级时，`%APPDATA%\AIWorkAssistant` 的数据会自动复制到新根。
+pub fn data_root() -> PathBuf {
+    if let Ok(v) = std::env::var("AIWORK_DATA_DIR") {
+        let v = v.trim();
+        if !v.is_empty() {
+            return PathBuf::from(v);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let preferred = PathBuf::from(r"D:\work\app-data");
+        if preferred.parent().map(|p| p.is_dir()).unwrap_or(false) {
+            return preferred;
+        }
+    }
+    data_root_fallback()
+}
+
+/// 平台默认的数据根（%APPDATA% 或 macOS 的 Application Support）
+fn data_root_fallback() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            return PathBuf::from(appdata).join(DATA_DIR_NAME);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(dir) = dirs_data_dir() {
+            return dir.join(DATA_DIR_NAME);
+        }
+    }
+    PathBuf::from(DATA_DIR_NAME)
+}
+
+#[cfg(not(windows))]
+fn dirs_data_dir() -> Option<PathBuf> {
+    // macOS: ~/Library/Application Support
+    std::env::var("HOME").ok().map(|h| {
+        PathBuf::from(h)
+            .join("Library")
+            .join("Application Support")
+    })
+}
+
+/// 应用全局状态。base_dir 指向数据根（Windows 默认 `D:\work\app-data`）；
 /// 子目录: conf/ (配置), data/ (数据), logs/ (日志)
 /// Clone 支持把状态克隆进后台工作线程（签到/任务等直调场景）。
 #[derive(Clone)]
@@ -158,16 +213,42 @@ const CONF_FILES: &[&str] = &["app_settings.json"];
 
 impl AppState {
     pub fn new() -> Result<Self, String> {
-        // 数据目录：%APPDATA%\AIWorkAssistant，不存在则创建
-        // macOS 适配预留（2026-10-03）：Qoder 账号池（qoder_pool/token store/
-        // 快照 profiles_qoder*）全部落在此目录之下。macOS 对应根 = `dirs::data_dir()`
-        // 即 ~/Library/Application Support/AIWorkAssistant；建议本函数按 cfg 分支
-        // 取根目录（Windows=APPDATA / macOS=dirs::data_dir()），下游 data_dir
-        // 拼接逻辑与 Qoder 域代码零改动
-        let appdata = std::env::var("APPDATA")
-            .map(PathBuf::from)
-            .map_err(|_| "无法读取 APPDATA 环境变量".to_string())?;
-        let data_dir = appdata.join(DATA_DIR_NAME);
+        // 数据目录：`data_root()`（Windows 默认 D:\work\app-data，见该函数注释）
+        let data_dir = data_root();
+
+        // 「旧根 → 新根」一次性复制迁移（幂等）：
+        // 用户从把数据放 %APPDATA% 的旧版本升级时，C 盘旧数据自动复制到新根，
+        // 保证「打开就是要之前的数据」。策略同 migrate_legacy_dirs：
+        // 新目录已有数据则视为已迁移、绝不覆盖；复制失败回滚半成品、下次启动重试。
+        //
+        // **排除 `logs/`**：运行日志可再生产，且在旧安装里常是体积大头
+        // （实测 477 MB / 占数据目录 65%），不迁可让迁移更快、也顺带腾出系统盘空间。
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let legacy = PathBuf::from(&appdata).join(DATA_DIR_NAME);
+            if legacy.is_dir() && legacy != data_dir && dir_is_empty(&data_dir) != Some(false) {
+                if let Some(parent) = data_dir.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match copy_dir_recursive(&legacy, &data_dir, &["logs"]) {
+                    Ok(n) => {
+                        let _ = std::fs::create_dir_all(&data_dir);
+                        let _ = crate::fs_utils::app_log(
+                            &data_dir,
+                            &format!(
+                                "数据目录迁移：已由 {} 复制到 {}（{n} 个文件；旧目录保留，可手动删除）",
+                                legacy.display(),
+                                data_dir.display()
+                            ),
+                        );
+                    }
+                    Err(_) => {
+                        // 回滚半成品，避免下次启动误判「已迁移」
+                        let _ = std::fs::remove_dir_all(&data_dir);
+                    }
+                }
+            }
+        }
+
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("创建数据目录失败: {e}"))?;
 

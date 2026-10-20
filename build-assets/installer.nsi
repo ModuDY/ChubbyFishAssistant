@@ -528,7 +528,12 @@ Function .onInit
         StrCpy $INSTDIR "$PROGRAMFILES\${PRODUCTNAME}"
       ${EndIf}
     !else if "${INSTALLMODE}" == "currentUser"
-      StrCpy $INSTDIR "$LOCALAPPDATA\${PRODUCTNAME}"
+      ; [custom 大肥鱼助手] 默认装到 D 盘而非 C 盘（%LOCALAPPDATA%）：
+      ; 用户明确要求不占用系统盘。D:\work 不存在时（无 D 盘机器）回落 LOCALAPPDATA。
+      IfFileExists "D:\work\*.*" 0 +2
+        StrCpy $INSTDIR "D:\work\app"
+      IfFileExists "D:\work\*.*" +2 0
+        StrCpy $INSTDIR "$LOCALAPPDATA\${PRODUCTNAME}"
     !endif
 
     Call RestorePreviousInstallLocation

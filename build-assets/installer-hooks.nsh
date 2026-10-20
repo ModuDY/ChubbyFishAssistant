@@ -1,4 +1,4 @@
-﻿; 大肥鱼助手（旧名 AI Work 助手）— NSIS 安装钩子（installerHooks）
+; 大肥鱼助手（旧名 AI Work 助手）— NSIS 安装钩子（installerHooks）
 ; 品牌并存策略：老品牌（Trae Work 助手）与新版本 大肥鱼助手 **并存运行、互不干扰**。
 ; 安装/升级本产品时绝不卸载老品牌应用，也绝不清理其安装目录、卸载键与快捷方式；
 ; 用户数据目录（%APPDATA%\TraeWorkAssistant → %APPDATA%\AIWorkAssistant）
@@ -22,9 +22,11 @@
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
-  ; 主程序已更名为 ai-work-assistant.exe，清理同一安装目录内旧命名的主程序残留
+  ; 主程序名已统一为「大肥鱼助手.exe」（mainBinaryName 与 productName 同名），
+  ; 清理同一安装目录内历史命名的主程序残留
   ; （仅限本产品安装目录内的历史文件，不触及老品牌独立的安装目录）
   Delete "$INSTDIR\AI Work 助手.exe"
   Delete "$INSTDIR\Trae Work 助手.exe"
   Delete "$INSTDIR\trae-work-assistant.exe"
+  Delete "$INSTDIR\ai-work-assistant.exe"
 !macroend
