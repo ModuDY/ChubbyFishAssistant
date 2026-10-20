@@ -18,6 +18,7 @@
  *   --route auto|pr     抠像路线；缺省按扩展名推断（.mov→pr，其余→auto）
  *   --watermark         先跑 step01 去水印（需自备 video/watermark_mask_v5.mkv）
  *   --keep              保留中间产物（video/ pr/ step01..04），便于排查
+ *   --python <path>     指定 python 解释器（缺省探测 PATH；也可用环境变量 PET_PIPELINE_PYTHON）
  *
  * 前置依赖见同目录 README.md（Python + numpy/scipy + 带 libvpx 的便携 ffmpeg）。
  */
@@ -60,11 +61,22 @@ function parseArgs(argv) {
 
 /* ------------------------------- 前置检查 ------------------------------- */
 
-/** 找一个可用的 python（Windows 多为 `python`，部分环境为 `python3`） */
-function findPython() {
-  for (const exe of ['python', 'python3']) {
+/**
+ * 解析 python 解释器：显式指定（--python / 环境变量）优先，否则探测 PATH。
+ * 素材链常把 Python 装在 PATH 之外（如 D:\work\agent\Environment\Python），故需要显式入口。
+ */
+function resolvePython(override) {
+  const probe = (exe) => {
     const r = spawnSync(exe, ['--version'], { encoding: 'utf8' });
-    if (!r.error && r.status === 0) return exe;
+    return !r.error && r.status === 0;
+  };
+  if (override) {
+    if (!existsSync(override)) fail(`指定的 python 不存在: ${override}`);
+    if (!probe(override)) fail(`指定的 python 不可用: ${override}`);
+    return override;
+  }
+  for (const exe of ['python', 'python3']) {
+    if (probe(exe)) return exe;
   }
   return null;
 }
@@ -94,9 +106,17 @@ function cleanWorkDirs() {
   }
 }
 
-/** 把一个文件复制成 `<alias><ext>`（上游按文件名派生后续产物名，故统一用 ASCII alias） */
-function stageSource(src, ext, alias) {
-  const dir = ext.toLowerCase() === '.mov' ? join(PIPELINE, 'pr') : join(PIPELINE, 'video');
+/**
+ * 把一个文件复制成 `<alias><ext>` 到指定工作子目录。
+ * 上游按文件名派生后续产物名，故统一用 ASCII alias。
+ *
+ * 落点与上游脚本的输入目录对应：
+ *   - `pr/`     → `pr_import_step02.py` 的输入
+ *   - `video/`  → `watermark_step01.py` 的输入（→ 输出 `step01/`）
+ *   - `step01/` → `chroma_step02.py` 的输入（**跳过 step01 时直接放这里**）
+ */
+function stageSource(src, ext, alias, dirName) {
+  const dir = join(PIPELINE, dirName);
   mkdirSync(dir, { recursive: true });
   const dst = join(dir, `${alias}${ext}`);
   copyFileSync(src, dst);
@@ -133,15 +153,21 @@ function main() {
   log(`[build-asset] 路线=${route}  落盘名=${alias}${args.label ? `  中文名=${args.label}` : ''}`);
 
   // 1) 前置检查
-  const python = findPython();
-  if (!python) fail('未找到 python / python3（素材链依赖 Python 3.9+）。');
+  const python = resolvePython(args.python ?? process.env.PET_PIPELINE_PYTHON);
+  if (!python) {
+    fail(
+      '未找到 python / python3（素材链依赖 Python 3.9+）。\n' +
+        '  可用 --python <解释器路径> 或环境变量 PET_PIPELINE_PYTHON 指定。',
+    );
+  }
   pythonCmd = python;
   preflight(python);
   log(`[build-asset] 前置检查通过（${python} + 便携 ffmpeg）`);
 
-  // 2) 清工作区 + 备料
+  // 2) 清工作区 + 备料（落点对齐上游各步的输入目录，见 stageSource 注释）
   cleanWorkDirs();
-  stageSource(src, ext, alias);
+  const stageDir = route === 'pr' ? 'pr' : args.watermark ? 'video' : 'step01';
+  stageSource(src, ext, alias, stageDir);
 
   // 3) 依序调步
   log('[build-asset] 开始处理链：');
@@ -159,8 +185,11 @@ function main() {
       : '(空)';
     fail(`未找到产物 ${produced}；step04 实际内容: ${listing}`);
   }
-  log('[build-asset] 校验产物（check-asset.mjs）：');
-  const check = spawnSync(process.execPath, [CHECK_ASSET, produced], { stdio: 'inherit' });
+  log('[build-asset] 校验产物（check-asset.mjs：容器级 + 像素级）：');
+  // `--pixels`：像素级校验（透明占比 / 脚底对齐 / 水平居中）为**强制项**——
+  // build-asset 的 preflight 已确保便携 ffmpeg 就位，故此处置为必过，缺 ffmpeg 即失败，
+  // 避免「容器规格达标但角色飘在半空 / 偏心」的产物落盘。
+  const check = spawnSync(process.execPath, [CHECK_ASSET, '--pixels', produced], { stdio: 'inherit' });
   if (check.error || check.status !== 0) {
     fail('产物未通过校验，已中止落盘（不写入 src/assets/pet/videos/）。');
   }
