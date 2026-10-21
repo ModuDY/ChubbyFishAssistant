@@ -92,66 +92,95 @@ body.pet-window {
 
 /* 气泡本体：宽度随文字收缩但不超过 230px，避免短句拉成一条横条。
  * 用 min() 跟舞台宽联动：窄缩放（scale=0.6 → 舞台 180px）下固定 230px 会溢出到菜单区，
- * 被卡片压掉右半截（设计稿 §1-P3）。 */
+ * 被卡片压掉右半截（设计稿 §1-P3）。
+ *
+ * 2026-10-21 气泡样式优化：
+ * - 去掉 `overflow: hidden`。它一直是「小尾巴画不出来」的根因——尾巴是 `::after`
+ *   定位在 bottom:-5px，属于盒子外部，被 overflow 直接裁掉，气泡与角色之间因此
+ *   没有任何视觉连接，看起来像一张悬空的卡片。
+ * - 溢出改由内层 `.pet-bubble-body` 承担（限高 + 底部渐隐），既保住限高，
+ *   又不会把最后一行硬切成半截字。 */
 .pet-bubble {
   position: relative;
-  max-width: min(230px, calc(100% - 16px));
-  /* P3 流式：AI 回复可能较长，限高防遮挡角色（超出裁掉，回复本身已限 40 字） */
-  max-height: 132px;
-  overflow: hidden;
-  padding: 6px 10px;
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.95);
+  max-width: min(232px, calc(100% - 16px));
+  padding: 7px 11px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.97);
   color: #1f2937;
   font-family: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
   font-size: 12px;
-  line-height: 1.55;
+  line-height: 1.58;
   text-align: center;
   word-break: break-word;
-  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.18);
+  /* 双层阴影：一层贴边收紧轮廓、一层扩散做悬浮感，比单层更有层次 */
+  box-shadow:
+    0 1px 2px rgba(15, 23, 42, 0.08),
+    0 6px 18px rgba(15, 23, 42, 0.16);
   pointer-events: none;
   animation: pet-bubble-in 0.18s ease-out;
+  /* 让尾巴能用 currentColor 之外的方式染色时保持主体一致 */
+  --pet-bubble-bg: rgba(255, 255, 255, 0.97);
+}
+
+/* 正文容器：限高在这里，溢出才不会被切在字形中间 */
+.pet-bubble-body {
+  max-height: 118px;
+  overflow: hidden;
+}
+
+/* 溢出提示：底部渐隐，暗示"还有下文"，比硬切一刀自然 */
+.pet-bubble-clipped {
+  -webkit-mask-image: linear-gradient(to bottom, #000 68%, transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 68%, transparent 100%);
 }
 
 /* 长答复气泡（P7 对话）：放宽限高与宽度。
-   独白档的 230px / 132px 是为"一句话"调的，对话答复会成段，
+   独白档的 232px / 118px 是为"一句话"调的，对话答复会成段，
    沿用会把文字挤成很窄的一条并很快被裁掉。左对齐更适合成段阅读。 */
 .pet-bubble-long {
   max-width: min(258px, calc(100% - 16px));
-  max-height: 190px;
   text-align: left;
   font-size: 11.5px;
-  line-height: 1.6;
+  line-height: 1.62;
 }
 
-/* 通知气泡（系统通知转气泡）：标题 + 正文两段。
-   与台词气泡的区别够用即可，整体视觉统一留到「气泡样式优化」那一轮统一调。 */
+.pet-bubble-long .pet-bubble-body {
+  max-height: 178px;
+}
+
+/* 通知气泡（系统通知转气泡）：标题 + 正文两段，左侧强调条区分于闲聊 */
 .pet-bubble-notice {
   max-width: min(258px, calc(100% - 16px));
-  max-height: 190px;
   text-align: left;
   font-size: 11.5px;
   line-height: 1.6;
-  padding: 7px 11px;
+  padding: 8px 12px 8px 10px;
+  border-left: 3px solid #38bdf8;
 }
 
 .pet-bubble-notice-title {
   font-weight: 600;
   font-size: 11.5px;
-  margin-bottom: 2px;
+  margin-bottom: 3px;
   color: #0f172a;
+  letter-spacing: 0.2px;
 }
 
 .pet-bubble-notice-body {
   color: #334155;
   white-space: pre-wrap;
   word-break: break-word;
+  max-height: 168px;
+  overflow: hidden;
 }
 
-/* 思考链小字（P3 碎碎念）：弱化展示，不喧宾夺主 */
+/* 思考链小字（P3 碎碎念）：弱化展示，不喧宾夺主。
+   加左侧竖线，读起来像"旁白"，与正文分开。 */
 .pet-bubble-think {
-  margin-bottom: 4px;
-  font-size: 11px;
+  margin-bottom: 5px;
+  padding-left: 6px;
+  border-left: 2px solid #e2e8f0;
+  font-size: 10.5px;
   font-style: italic;
   line-height: 1.45;
   color: #94a3b8;
@@ -159,18 +188,52 @@ body.pet-window {
   word-break: break-word;
 }
 
-/* 气泡小尾巴，指向角色头顶 */
+/* 等待占位：灰色斜体，明确区分"它还没说话"和"它说的话" */
+.pet-bubble-waiting {
+  color: #94a3b8;
+  font-style: italic;
+  letter-spacing: 0.2px;
+}
+
+/* 流式光标：正文右侧一个跟着打字机闪的小方块。
+   没有它时，逐字出现的长回答看不出"还在继续"，用户容易以为说完了。 */
+.pet-bubble-streaming .pet-bubble-body::after {
+  content: '';
+  display: inline-block;
+  width: 2px;
+  height: 0.95em;
+  margin-left: 2px;
+  vertical-align: -0.12em;
+  background: #38bdf8;
+  animation: pet-caret-blink 1s steps(2, start) infinite;
+}
+
+@keyframes pet-caret-blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+
+/* 气泡小尾巴，指向角色头顶。
+   必须在 .pet-bubble（不含 overflow 裁切）上，且与正文分离——
+   放在被裁的容器里就又会消失（这正是修复前的状态）。 */
 .pet-bubble::after {
   content: '';
   position: absolute;
   left: 50%;
   bottom: -5px;
-  width: 10px;
-  height: 10px;
-  margin-left: -5px;
-  background: rgba(255, 255, 255, 0.95);
+  width: 11px;
+  height: 11px;
+  margin-left: -5.5px;
+  background: var(--pet-bubble-bg);
   transform: rotate(45deg);
   border-radius: 2px;
+  /* 只给右下两条边投影，模拟三角与气泡本体同时受光 */
+  box-shadow: 2px 2px 4px rgba(15, 23, 42, 0.08);
 }
 
 @keyframes pet-bubble-in {

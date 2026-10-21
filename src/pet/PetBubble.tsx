@@ -78,6 +78,10 @@ export default function PetBubble({ seq, text, onDone, streaming, thinking, long
   // 用 ref 读最终文本长度：避免 text 逐字变化时反复重启计时器
   const lenRef = useRef(0);
   lenRef.current = text.length;
+  // 溢出处加渐隐：旧实现 overflow:hidden 会把最后一行**硬切**成半截字，
+  // 看起来像渲染坏了。用量出来的 scrollHeight 判定，短气泡不受影响。
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const [clipped, setClipped] = useState(false);
 
   // 等待反馈（P7 提速体验）：正文一个字都没到时显示「在想…」+ 已等秒数。
   // 为什么加计时：上游首字可能要几秒（重型模型/排队），静态占位看起来像卡死；
@@ -112,34 +116,64 @@ export default function PetBubble({ seq, text, onDone, streaming, thinking, long
   const think =
     !body && thinking && worthShowingThink(thinking) ? clip(thinking, MAX_THINK) : '';
 
+  // 量一下是否真的溢出（限高裁切时用渐隐提示"还有下文"）
+  useEffect(() => {
+    const el = bodyRef.current;
+    if (!el) {
+      setClipped(false);
+      return;
+    }
+    setClipped(el.scrollHeight - el.clientHeight > 1);
+  }, [body]);
+
   // 通知样式：标题 + 正文两段，不走「在想…」占位逻辑
   if (title) {
     return (
       <div key={seq} className="pet-bubble pet-bubble-notice" role="status">
         <div className="pet-bubble-notice-title">{clip(title, 40)}</div>
-        {body ? <div className="pet-bubble-notice-body">{body}</div> : null}
+        {body ? (
+          <div
+            ref={bodyRef}
+            className={`pet-bubble-notice-body${clipped ? ' pet-bubble-clipped' : ''}`}
+          >
+            {body}
+          </div>
+        ) : null}
       </div>
     );
   }
 
+  // 流式中还没出字：给"在想/在查…"+秒数的动态占位，别让气泡空着也不像卡死
+  const placeholder = streaming
+    ? hint
+      ? waited > 0
+        ? `${hint} ${waited}s`
+        : hint
+      : waited > 0
+        ? `在想… ${waited}s`
+        : '在想…'
+    : '…';
+
   return (
-    <div key={seq} className={`pet-bubble${long ? ' pet-bubble-long' : ''}`} role="status">
+    <div
+      key={seq}
+      className={`pet-bubble${long ? ' pet-bubble-long' : ''}${
+        streaming && body ? ' pet-bubble-streaming' : ''
+      }`}
+      role="status"
+    >
       {think ? (
         <div className="pet-bubble-think" aria-hidden="true">
           {think}
         </div>
       ) : null}
-      {/* 流式中还没出字：给"在想/在查…"+秒数的动态占位，别让气泡空着也不像卡死 */}
-      {body ||
-        (streaming
-          ? hint
-            ? waited > 0
-              ? `${hint} ${waited}s`
-              : hint
-            : waited > 0
-              ? `在想… ${waited}s`
-              : '在想…'
-          : '…')}
+      {body ? (
+        <div ref={bodyRef} className={`pet-bubble-body${clipped ? ' pet-bubble-clipped' : ''}`}>
+          {body}
+        </div>
+      ) : (
+        <div className={streaming ? 'pet-bubble-waiting' : undefined}>{placeholder}</div>
+      )}
     </div>
   );
 }
