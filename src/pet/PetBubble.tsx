@@ -28,6 +28,14 @@ type Props = {
    * 无限长会盖住角色，也超出窗口上方可用空间）。
    */
   long?: boolean;
+  /**
+   * 正在做的事（P9 联网检索）。
+   *
+   * 为什么需要：自主多轮检索时，模型先决定"去查"再回答，中间这几秒一个字都不出。
+   * 沿用「在想…」会让用户以为它卡住或者发呆；显示「在查『北京天气』」才说明
+   * 它正在干活。正文一到就自动让位（见下面的 `body ||` 分支）。
+   */
+  hint?: string;
 };
 
 /** 气泡正文上限：模型偶尔会啰嗦（甚至把思考写进正文），超长直接截断，别把气泡撑爆 */
@@ -51,7 +59,7 @@ function worthShowingThink(s: string): boolean {
   return cjk >= 4;
 }
 
-export default function PetBubble({ seq, text, onDone, streaming, thinking, long }: Props) {
+export default function PetBubble({ seq, text, onDone, streaming, thinking, long, hint }: Props) {
   // 用 ref 读最终文本长度：避免 text 逐字变化时反复重启计时器
   const lenRef = useRef(0);
   lenRef.current = text.length;
@@ -93,12 +101,16 @@ export default function PetBubble({ seq, text, onDone, streaming, thinking, long
           {think}
         </div>
       ) : null}
-      {/* 流式中还没出字：给"在想…"+秒数的动态占位，别让气泡空着也不像卡死 */}
+      {/* 流式中还没出字：给"在想/在查…"+秒数的动态占位，别让气泡空着也不像卡死 */}
       {body ||
         (streaming
-          ? waited > 0
-            ? `在想… ${waited}s`
-            : '在想…'
+          ? hint
+            ? waited > 0
+              ? `${hint} ${waited}s`
+              : hint
+            : waited > 0
+              ? `在想… ${waited}s`
+              : '在想…'
           : '…')}
     </div>
   );

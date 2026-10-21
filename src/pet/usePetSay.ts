@@ -20,6 +20,13 @@ export type SayState = {
   text: string;
   /** 思考链（碎碎念）累计文本 */
   thinking: string;
+  /**
+   * 当前在做的联网动作（如 `在查「北京天气」`）。
+   *
+   * 自主检索时模型先决定去查、再回答，中间几秒不出字；这个字段让气泡
+   * 显示"在查…"而不是空白/「在想…」。正文一到就由调用方让位。
+   */
+  tool?: string;
 } | null;
 
 /** 一轮上下文（P7 多轮对话；字段名与 Rust `PetSayTurn` 一致） */
@@ -27,6 +34,8 @@ export type SayTurn = { role: 'user' | 'assistant'; content: string };
 
 type StartPayload = { sessionId: number; trigger?: string; model?: string };
 type DeltaPayload = { sessionId: number; kind: 'text' | 'reasoning'; delta: string };
+/** 联网工具执行通知（P9）：query 可能为空（open_url 时是 URL） */
+type ToolPayload = { sessionId: number; tool: string; query?: string };
 type DonePayload = { sessionId: number; ok: boolean; text: string; reasoning: string };
 type ErrorPayload = { sessionId: number; code: string; message: string };
 
@@ -66,6 +75,21 @@ export function usePetSay(opts: Options) {
         text: cur?.text ?? '',
         thinking: cur?.thinking ?? '',
       }));
+    });
+
+    on<ToolPayload>('pet-say-tool', (p) => {
+      if (p.sessionId !== activeRef.current) return;
+      const q = (p.query ?? '').trim();
+      // 中文引号：气泡里直排英文双引号视觉上会"跳"，且与「」体例统一
+      const hint =
+        p.tool === 'open_url'
+          ? q
+            ? `在打开 ${q}`
+            : '在打开网页'
+          : q
+            ? `在查「${q}」`
+            : '在查资料';
+      setSay((cur) => (cur ? { ...cur, tool: hint } : cur));
     });
 
     on<DeltaPayload>('pet-say-delta', (p) => {

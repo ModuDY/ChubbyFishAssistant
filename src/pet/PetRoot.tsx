@@ -1347,6 +1347,8 @@ export default function PetRoot() {
             text={say.text}
             thinking={say.thinking}
             streaming={say.streaming}
+            // 自主检索期间显示「在查「xxx」」，正文一到自动让位（见 PetBubble 的 body ||）
+            hint={say.tool}
             // 对话档答复可能成段：放宽截断长度与容器高度（独白档仍按一句的口径）
             long={aiMode !== 'off' && chatHistoryRef.current.length > 0}
             onDone={() => {

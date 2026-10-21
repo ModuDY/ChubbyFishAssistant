@@ -907,6 +907,13 @@ const PET_SAY_FIRST_BYTE_SECS: u64 = 15;
 const PET_SAY_READ_SECS: u64 = 30;
 /// 单次回复总时长上限（秒）
 const PET_SAY_TOTAL_SECS: u64 = 60;
+/// 允许联网检索时的**整体**上限（秒）。
+///
+/// 为什么比普通档宽：一次问答可能有「搜索 → 回喂 → 再搜 → 回喂 → 出正文」
+/// 最多 `MAX_ROUNDS + 1` 轮上游请求，每轮都要等模型思考。用户明确接受
+/// 查实时信息时多等几秒，但不能无限等，故设总量闸门（单轮仍受
+/// `PET_SAY_TOTAL_SECS` 约束，两者取小）。
+const PET_TOOL_TOTAL_SECS: u64 = 120;
 /// 单次回复最大生成 token（成本闸门）
 ///
 /// 2026-10-19 从 120 调到 400：思考链与正文**共用**这个预算，120 时模型把额度
@@ -928,8 +935,49 @@ static SAY_LAST_MS: Mutex<u64> = Mutex::new(0);
 enum PetSseDelta {
     Text(String),
     Reasoning(String),
+    /// 工具调用增量（P9）：同一轮可能出现多个调用，用 `index` 归并；
+    /// 字段本身也是增量的（name 可能只来一次，arguments 分多帧拼）。
+    ToolCall {
+        index: usize,
+        id: String,
+        name: String,
+        args: String,
+    },
     Error(String),
     Done,
+}
+
+/// 按 index 归并后的工具调用（流式片段拼装结果）
+#[derive(Debug, Default, Clone)]
+struct ToolCallAcc {
+    id: String,
+    name: String,
+    args: String,
+}
+
+impl ToolCallAcc {
+    /// 拼装完成后是否成形（name 必填，arguments 可以为空对象）
+    fn is_ready(&self) -> bool {
+        !self.name.is_empty()
+    }
+}
+
+/// 往累积表里合并一个增量片段。
+///
+/// 为什么不直接覆盖：`arguments` 是逐字符流式下发的
+///（`{"qu` → `ery":"x` → `"}`），覆盖会丢掉前面所有分片。
+fn merge_tool_delta(acc: &mut Vec<ToolCallAcc>, index: usize, id: &str, name: &str, args: &str) {
+    if acc.len() <= index {
+        acc.resize(index + 1, ToolCallAcc::default());
+    }
+    let slot = &mut acc[index];
+    if !id.is_empty() && slot.id.is_empty() {
+        slot.id = id.to_string();
+    }
+    if !name.is_empty() {
+        slot.name.push_str(name);
+    }
+    slot.args.push_str(args);
 }
 
 /// 在字节缓冲里找子串位置（仅用于找 SSE 帧分隔符 `\n\n`）
@@ -988,6 +1036,35 @@ fn pump_sse(buf: &mut Vec<u8>, chunk: &[u8], out: &mut Vec<PetSseDelta>) {
             if let Some(c) = delta.get("content").and_then(|x| x.as_str()) {
                 if !c.is_empty() {
                     out.push(PetSseDelta::Text(c.to_string()));
+                }
+            }
+            // 工具调用增量（P9）：OpenAI 兼容格式为
+            // `delta.tool_calls: [{index, id?, function:{name?, arguments?}}]`
+            if let Some(tcs) = delta.get("tool_calls").and_then(|x| x.as_array()) {
+                for (pos, tc) in tcs.iter().enumerate() {
+                    // index 缺失时按数组位置兜底（部分上游不发 index）
+                    let index = tc
+                        .get("index")
+                        .and_then(|i| i.as_u64())
+                        .map(|i| i as usize)
+                        .unwrap_or(pos);
+                    let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                    let name = tc
+                        .pointer("/function/name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("");
+                    let args = tc
+                        .pointer("/function/arguments")
+                        .and_then(|a| a.as_str())
+                        .unwrap_or("");
+                    if !id.is_empty() || !name.is_empty() || !args.is_empty() {
+                        out.push(PetSseDelta::ToolCall {
+                            index,
+                            id: id.to_string(),
+                            name: name.to_string(),
+                            args: args.to_string(),
+                        });
+                    }
                 }
             }
         }
@@ -1173,17 +1250,76 @@ fn short_msg(s: &str) -> String {
     t.chars().take(80).collect()
 }
 
-/// 实际执行一次流式发言：取共享状态 → 跑补全 → 泵 SSE → 逐 delta 下发
-async fn run_say(app: AppHandle, session: u64, body_vec: Vec<u8>, trigger: String, model: String) {
-    let shared = {
-        let rt = app.state::<Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
-        let guard = rt.lock().unwrap_or_else(|e| e.into_inner());
-        guard.as_ref().map(|r| r.shared.clone())
-    };
-    let Some(shared) = shared else {
-        emit_say_error(&app, session, "gateway_down", "网关未启动");
-        return;
-    };
+/// 单轮上游结果（P9 工具循环）
+struct SayRound {
+    text: String,
+    reasoning: String,
+    tool_calls: Vec<ToolCallAcc>,
+}
+
+/// 单轮失败
+struct SayFail {
+    code: &'static str,
+    message: String,
+    /// 上游 HTTP 状态（进程内调用已有 Response，顺手带上，供「上游不认 tools」判定）
+    status: Option<u16>,
+}
+
+impl SayFail {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self { code, message: message.into(), status: None }
+    }
+}
+
+/// 把一轮的 SSE 增量落地：正文/思考**边收边下发**，工具调用只归并不下发。
+///
+/// 工具调用不下发的原因：前端没有 `tool_calls` 这个概念，混进正文会把气泡
+/// 显示成半截 JSON。
+fn consume_deltas(
+    app: &AppHandle,
+    session: u64,
+    out: &mut SayRound,
+    deltas: Vec<PetSseDelta>,
+) -> Result<bool, SayFail> {
+    let mut done = false;
+    for d in deltas {
+        match d {
+            PetSseDelta::Text(s) => {
+                out.text.push_str(&s);
+                emit_say(
+                    app,
+                    "pet-say-delta",
+                    serde_json::json!({ "sessionId": session, "kind": "text", "delta": s }),
+                );
+            }
+            PetSseDelta::Reasoning(s) => {
+                out.reasoning.push_str(&s);
+                emit_say(
+                    app,
+                    "pet-say-delta",
+                    serde_json::json!({ "sessionId": session, "kind": "reasoning", "delta": s }),
+                );
+            }
+            PetSseDelta::ToolCall { index, id, name, args } => {
+                merge_tool_delta(&mut out.tool_calls, index, &id, &name, &args);
+            }
+            PetSseDelta::Error(m) => return Err(SayFail::new("upstream", short_msg(&m))),
+            PetSseDelta::Done => done = true,
+        }
+    }
+    Ok(done)
+}
+
+/// 跑一轮：发请求 → 泵 SSE → 下发正文/思考 → 归并工具调用
+async fn run_say_round(
+    app: &AppHandle,
+    session: u64,
+    shared: std::sync::Arc<crate::api_server::ApiSharedState>,
+    body: &serde_json::Value,
+    budget: Duration,
+) -> Result<SayRound, SayFail> {
+    let body_vec = serde_json::to_vec(body)
+        .map_err(|e| SayFail::new("internal", e.to_string()))?;
 
     let resp = crate::api_server::routes::run_chat_completion(
         shared,
@@ -1195,78 +1331,51 @@ async fn run_say(app: AppHandle, session: u64, body_vec: Vec<u8>, trigger: Strin
 
     let status = resp.status();
     if !status.is_success() {
+        let code_num = status.as_u16();
         let bytes = axum::body::to_bytes(resp.into_body(), 4096)
             .await
             .unwrap_or_default();
         let raw = String::from_utf8_lossy(&bytes);
-        let code = if status.as_u16() == 503 { "no_healthy" } else { "upstream" };
-        emit_say_error(&app, session, code, &short_msg(&raw));
-        return;
+        let code = if code_num == 503 { "no_healthy" } else { "upstream" };
+        return Err(SayFail {
+            code,
+            message: short_msg(&raw),
+            status: Some(code_num),
+        });
     }
-
-    emit_say(
-        &app,
-        "pet-say-start",
-        serde_json::json!({ "sessionId": session, "trigger": trigger, "model": model }),
-    );
 
     let t0 = Instant::now();
     let mut buf: Vec<u8> = Vec::new();
-    let mut text = String::new();
-    let mut reasoning = String::new();
+    let mut out = SayRound {
+        text: String::new(),
+        reasoning: String::new(),
+        tool_calls: Vec::new(),
+    };
     let mut stream = resp.into_body().into_data_stream();
     let mut first = true;
-    let mut ended = false;
 
     loop {
-        if t0.elapsed() > Duration::from_secs(PET_SAY_TOTAL_SECS) {
-            emit_say_error(&app, session, "timeout", "回复超时");
-            return;
+        let remaining = budget.saturating_sub(t0.elapsed());
+        if remaining.is_zero() {
+            return Err(SayFail::new("timeout", "回复超时"));
         }
-        let wait = if first { PET_SAY_FIRST_BYTE_SECS } else { PET_SAY_READ_SECS };
+        let base = if first { PET_SAY_FIRST_BYTE_SECS } else { PET_SAY_READ_SECS };
+        let wait = base.min(remaining.as_secs().max(1));
+
+        let mut deltas: Vec<PetSseDelta> = Vec::new();
+        let mut done = false;
         match tokio::time::timeout(Duration::from_secs(wait), stream.next()).await {
-            Err(_) => {
-                emit_say_error(&app, session, "timeout", "回复超时");
-                return;
-            }
+            Err(_) => return Err(SayFail::new("timeout", "回复超时")),
             Ok(None) => break,
-            Ok(Some(Err(_))) => {
-                emit_say_error(&app, session, "upstream", "流读取失败");
-                return;
-            }
+            Ok(Some(Err(_))) => return Err(SayFail::new("upstream", "流读取失败")),
             Ok(Some(Ok(chunk))) => {
                 first = false;
-                let mut deltas = Vec::new();
                 pump_sse(&mut buf, &chunk, &mut deltas);
-                for d in deltas {
-                    match d {
-                        PetSseDelta::Text(s) => {
-                            text.push_str(&s);
-                            emit_say(
-                                &app,
-                                "pet-say-delta",
-                                serde_json::json!({ "sessionId": session, "kind": "text", "delta": s }),
-                            );
-                        }
-                        PetSseDelta::Reasoning(s) => {
-                            reasoning.push_str(&s);
-                            emit_say(
-                                &app,
-                                "pet-say-delta",
-                                serde_json::json!({ "sessionId": session, "kind": "reasoning", "delta": s }),
-                            );
-                        }
-                        PetSseDelta::Error(m) => {
-                            emit_say_error(&app, session, "upstream", &short_msg(&m));
-                            return;
-                        }
-                        PetSseDelta::Done => ended = true,
-                    }
-                }
-                if ended {
-                    break;
-                }
+                done = consume_deltas(app, session, &mut out, deltas)?;
             }
+        }
+        if done {
+            break;
         }
     }
 
@@ -1274,15 +1383,208 @@ async fn run_say(app: AppHandle, session: u64, body_vec: Vec<u8>, trigger: Strin
     if !buf.is_empty() {
         let mut deltas = Vec::new();
         pump_sse(&mut buf, b"\n\n", &mut deltas);
-        for d in deltas {
-            match d {
-                PetSseDelta::Text(s) => text.push_str(&s),
-                PetSseDelta::Reasoning(s) => reasoning.push_str(&s),
-                PetSseDelta::Error(m) => {
-                    emit_say_error(&app, session, "upstream", &short_msg(&m));
-                    return;
+        let _ = consume_deltas(app, session, &mut out, deltas)?;
+    }
+
+    Ok(out)
+}
+
+/// 从工具参数里取「查了什么」用于 UI 提示（query / url）
+fn tool_query(args: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(args) else {
+        return String::new();
+    };
+    v.get("query")
+        .or_else(|| v.get("url"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .chars()
+        .take(60)
+        .collect()
+}
+
+/// 去掉代理注入的工具与提示（上游不认 tools 时的降级用）
+fn strip_injected_tools(body: &mut serde_json::Value) {
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("tools");
+        obj.remove("tool_choice");
+    }
+    if let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        msgs.retain(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .map_or(true, |c| !c.starts_with("Web research tools"))
+        });
+    }
+}
+
+/// 实际执行一次发言：取共享状态 → 可能多轮「上游要查 → 代理去查 → 回喂」→ 下发
+///
+/// # 为什么是「正文优先」的两段式
+///
+/// 桌宠的定位是「一句话快点出来」，但用户要求能自主多轮检索。两者靠
+/// **正文优先**兼容：
+///
+/// - 闲聊/常识：模型直接产出正文 → 边收边下发，与改造前完全一样的秒回；
+/// - 需要实时信息：模型先发 `tool_calls`、不发正文 → 代理执行搜索/读页 →
+///   结果回喂 → 下一轮再出正文（这时才慢，属于用户预期内的等待）。
+///
+/// 反过来（先聚合再决定要不要工具）会把**所有**对话都从秒回变成等整段生成，
+/// 那是明确的体验退化，所以不采用。
+///
+/// 本轮已吐过正文又冒出工具调用时，**不执行工具**、以已有正文收尾：
+/// 否则要把已经显示的话作废重写，用户会看到内容闪回。
+async fn run_say(
+    app: AppHandle,
+    session: u64,
+    mut body: serde_json::Value,
+    trigger: String,
+    model: String,
+) {
+    let shared = {
+        let rt = app.state::<Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
+        let guard = rt.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(|r| r.shared.clone())
+    };
+    let Some(shared) = shared else {
+        emit_say_error(&app, session, "gateway_down", "网关未启动");
+        return;
+    };
+
+    let tools_on = body
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    let max_rounds = if tools_on {
+        crate::api_server::wb_toolexec::MAX_ROUNDS
+    } else {
+        0
+    };
+    let global = Duration::from_secs(if tools_on {
+        PET_TOOL_TOTAL_SECS
+    } else {
+        PET_SAY_TOTAL_SECS
+    });
+
+    emit_say(
+        &app,
+        "pet-say-start",
+        serde_json::json!({ "sessionId": session, "trigger": trigger, "model": model }),
+    );
+
+    let t_all = Instant::now();
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut tools_used = 0usize;
+    let mut tools_disabled = false;
+
+    for round in 0..=max_rounds {
+        let remaining = global.saturating_sub(t_all.elapsed());
+        if remaining.is_zero() {
+            emit_say_error(&app, session, "timeout", "回复超时");
+            return;
+        }
+
+        let outcome = match run_say_round(&app, session, shared.clone(), &body, remaining).await {
+            Ok(o) => o,
+            Err(e) if round == 0 && tools_on && !tools_disabled
+                && matches!(e.status, Some(400) | Some(422)) =>
+            {
+                // 上游不认 tools（参数校验失败）：去掉工具再试一次。
+                // 否则整轮对话直接失败——比「不能联网」更糟，属于功能倒退。
+                // 只对 400/422 降级：5xx/限流重试一次没意义，还会翻倍消耗配额。
+                eprintln!("[pet] 上游拒绝 tools（{}），降级为无工具重试", e.message);
+                tools_disabled = true;
+                strip_injected_tools(&mut body);
+                match run_say_round(&app, session, shared.clone(), &body, remaining).await {
+                    Ok(o) => o,
+                    Err(e2) => {
+                        emit_say_error(&app, session, e2.code, &e2.message);
+                        return;
+                    }
                 }
-                PetSseDelta::Done => {}
+            }
+            Err(e) => {
+                emit_say_error(&app, session, e.code, &e.message);
+                return;
+            }
+        };
+
+        text.push_str(&outcome.text);
+        reasoning.push_str(&outcome.reasoning);
+
+        let ready: Vec<ToolCallAcc> = outcome
+            .tool_calls
+            .iter()
+            .filter(|c| c.is_ready())
+            .cloned()
+            .collect();
+        if ready.is_empty() {
+            break; // 终答
+        }
+        if !outcome.text.trim().is_empty() {
+            break; // 正文优先：已经说出口的不作废
+        }
+        if round >= max_rounds {
+            emit_say_error(&app, session, "too_many_tools", "查得有点多，先说到这");
+            return;
+        }
+
+        // 执行代理工具（ureq 是阻塞 IO，必须离开 async 线程）
+        let mut call_objs: Vec<serde_json::Value> = Vec::new();
+        let mut tool_msgs: Vec<serde_json::Value> = Vec::new();
+        for c in &ready {
+            let name = c.name.clone();
+            let args = c.args.clone();
+            emit_say(
+                &app,
+                "pet-say-tool",
+                serde_json::json!({
+                    "sessionId": session,
+                    "tool": name,
+                    "query": tool_query(&args),
+                }),
+            );
+            let ran = tauri::async_runtime::spawn_blocking(move || {
+                crate::api_server::wb_toolexec::execute(&name, &args)
+            })
+            .await;
+            let (output, _ok) = match ran {
+                Ok(v) => v,
+                Err(e) => (format!("error: 工具执行失败 {e}"), false),
+            };
+            tools_used += 1;
+            // 上游完全可能不给 id；缺了就补一个，否则回喂时配对不上会被拒
+            let id = if c.id.is_empty() {
+                format!("call_pet_{tools_used}")
+            } else {
+                c.id.clone()
+            };
+            call_objs.push(serde_json::json!({
+                "id": id,
+                "type": "function",
+                "function": {
+                    "name": c.name,
+                    "arguments": if c.args.trim().is_empty() { "{}" } else { c.args.as_str() },
+                }
+            }));
+            tool_msgs.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": id,
+                "content": output,
+            }));
+        }
+
+        // 回喂：assistant(tool_calls) 必须**先于** tool 结果，缺任一上游会 400
+        if let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+            msgs.push(serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": call_objs,
+            }));
+            for m in tool_msgs {
+                msgs.push(m);
             }
         }
     }
@@ -1301,7 +1603,8 @@ async fn run_say(app: AppHandle, session: u64, body_vec: Vec<u8>, trigger: Strin
             "text": text,
             "reasoning": reasoning,
             "model": model,
-            "ms": t0.elapsed().as_millis() as u64,
+            "tools": tools_used,
+            "ms": t_all.elapsed().as_millis() as u64,
         }),
     );
 }
@@ -1459,7 +1762,7 @@ pub async fn pet_say(
     };
     messages.push(serde_json::json!({ "role": "user", "content": user }));
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": &model,
         "stream": true,
         "max_tokens": if is_chat { PET_CHAT_MAX_TOKENS } else { PET_SAY_MAX_TOKENS },
@@ -1468,7 +1771,38 @@ pub async fn pet_say(
         "reasoning_effort": if is_chat { "medium" } else { "low" },
         "messages": messages,
     });
-    let body_vec = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+
+    // 联网工具（P9）：只给对话档挂 web_search / open_url，让模型自己决定
+    // 要不要查、查几次。独白档不挂——那是"自顾自说一句"，不该发起网络请求。
+    //
+    // 复用网关既有的注入函数（`wb_toolexec::inject_proxy_tools`）：
+    // 工具描述、system 提示、以及"同名工具不劫持"的红线都在那里维护，
+    // 桌宠另写一份必然漂移。
+    let tools_on = is_chat
+        && online
+        && crate::api_server::wb_toolexec::inject_proxy_tools(&mut body);
+    if tools_on {
+        // 告诉模型「这些工具由代理执行、不要自己编结果」。
+        // 与天气不同：这里不预先塞数据，模型没查就答，仍会受
+        // 「不编造没给过你的数据」约束，表现是"不知道"而不是"瞎编"。
+        if let Some(sys) = body
+            .get_mut("messages")
+            .and_then(|m| m.as_array_mut())
+            .and_then(|msgs| {
+                msgs.iter_mut()
+                    .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+            })
+        {
+            let cur = sys.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            let merged = format!(
+                "{cur}\n遇到你不确定、或需要最新信息的事（新闻、股价、赛事、政策、某人近况等），\
+先用 web_search 查一下再答；需要看某个网页正文就用 open_url。\
+这两个工具由运行你的程序代执行，你只要发起调用并等待结果即可，不要自己编造查询结果。\
+不需要查的闲聊就直接回答，别硬查。"
+            );
+            sys["content"] = serde_json::Value::String(merged);
+        }
+    }
 
     // 新的盖旧的：abort 上一轮流，避免并发占用账号并发位
     if let Some(old) = SAY_TASK.lock().unwrap_or_else(|e| e.into_inner()).take() {
@@ -1477,7 +1811,9 @@ pub async fn pet_say(
     let session = SAY_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     let app2 = app.clone();
     let task = tauri::async_runtime::spawn(async move {
-        run_say(app2, session, body_vec, trig, model).await;
+        // 传 Value 而非序列化后的字节：工具轮要把 assistant/tool 消息回喂进
+        // `messages`，每轮重新序列化；提前 to_vec 会丢掉可变性
+        run_say(app2, session, body, trig, model).await;
     });
     *SAY_TASK.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
 
@@ -1487,6 +1823,93 @@ pub async fn pet_say(
 #[cfg(test)]
 mod say_tests {
     use super::*;
+
+    /// 流式工具调用：`arguments` 分多帧下发，必须逐段拼接而不是覆盖。
+    /// 这是 OpenAI 兼容流式的真实形态（实测 char-by-char 分片）。
+    #[test]
+    fn tool_call_args_accumulate_across_frames() {
+        let mut acc: Vec<ToolCallAcc> = Vec::new();
+        // 第 1 帧：只有 id + name，参数刚开始
+        let f1 = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"qu\"}}]}}]}\n\n";
+        let mut buf = Vec::new();
+        let mut out = Vec::new();
+        pump_sse(&mut buf, f1.as_bytes(), &mut out);
+        for d in out.drain(..) {
+            if let PetSseDelta::ToolCall { index, id, name, args } = d {
+                merge_tool_delta(&mut acc, index, &id, &name, &args);
+            }
+        }
+        // 第 2 帧：只带参数增量，且**没有** id/name
+        let f2 = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ery\\\":\\\"北京天气\\\"}\"}}]}}]}\n\n";
+        pump_sse(&mut buf, f2.as_bytes(), &mut out);
+        for d in out.drain(..) {
+            if let PetSseDelta::ToolCall { index, id, name, args } = d {
+                merge_tool_delta(&mut acc, index, &id, &name, &args);
+            }
+        }
+        assert_eq!(acc.len(), 1);
+        assert!(acc[0].is_ready());
+        assert_eq!(acc[0].id, "call_a");
+        assert_eq!(acc[0].name, "web_search");
+        assert_eq!(acc[0].args, "{\"query\":\"北京天气\"}");
+    }
+
+    /// 同一轮多个调用按 index 分开（不能串到一起）
+    #[test]
+    fn tool_calls_are_separated_by_index() {
+        let frame = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c0\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{}\"}},{\"index\":1,\"id\":\"c1\",\"function\":{\"name\":\"open_url\",\"arguments\":\"{}\"}}]}}]}\n\n";
+        let mut buf = Vec::new();
+        let mut out = Vec::new();
+        pump_sse(&mut buf, frame.as_bytes(), &mut out);
+        let mut acc: Vec<ToolCallAcc> = Vec::new();
+        for d in out {
+            if let PetSseDelta::ToolCall { index, id, name, args } = d {
+                merge_tool_delta(&mut acc, index, &id, &name, &args);
+            }
+        }
+        assert_eq!(acc.len(), 2);
+        assert_eq!(acc[0].name, "web_search");
+        assert_eq!(acc[1].name, "open_url");
+    }
+
+    /// 普通文本回复不该被工具逻辑影响（回归：正文优先路径）
+    #[test]
+    fn plain_text_stream_has_no_tool_calls() {
+        let frame = "data: {\"choices\":[{\"delta\":{\"content\":\"今天挺好的\"}}]}\n\n";
+        let mut buf = Vec::new();
+        let mut out = Vec::new();
+        pump_sse(&mut buf, frame.as_bytes(), &mut out);
+        assert_eq!(out, vec![PetSseDelta::Text("今天挺好的".to_string())]);
+    }
+
+    #[test]
+    fn tool_query_extracts_query_or_url() {
+        assert_eq!(tool_query(r#"{"query":"北京天气"}"#), "北京天气");
+        assert_eq!(tool_query(r#"{"url":"https://a.b/c"}"#), "https://a.b/c");
+        assert_eq!(tool_query("{}"), "");
+        assert_eq!(tool_query("not json"), "");
+    }
+
+    /// 降级：上游不认 tools 时，工具与注入的提示都要清掉
+    #[test]
+    fn strip_removes_tools_and_hint() {
+        let mut body = serde_json::json!({
+            "model": "m",
+            "tools": [{"type":"function","function":{"name":"web_search"}}],
+            "tool_choice": "auto",
+            "messages": [
+                {"role":"system","content":"人格"},
+                {"role":"system","content":"Web research tools (web_search, open_url) are executed by the serving proxy."},
+                {"role":"user","content":"你好"}
+            ]
+        });
+        strip_injected_tools(&mut body);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2, "只该去掉代理注入的提示：{msgs:?}");
+        assert_eq!(msgs[0]["content"], "人格");
+    }
 
     /// 跨 chunk 分帧 + UTF-8 半字切断：整帧完成前不产出，完成后能正确解码多字节字符
     #[test]
