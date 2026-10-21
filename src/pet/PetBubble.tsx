@@ -8,7 +8,7 @@
  * 流结束后按最终长度延长停留时间；`thinking` 非空时在正文上方显示一行弱化的
  * 「碎碎念」（对应上游 reasoning_content）。
  */
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 type Props = {
   /** 每条气泡带序号：同文案连续出现时也能重新触发淡入动画 */
@@ -56,6 +56,24 @@ export default function PetBubble({ seq, text, onDone, streaming, thinking, long
   const lenRef = useRef(0);
   lenRef.current = text.length;
 
+  // 等待反馈（P7 提速体验）：正文一个字都没到时显示「在想…」+ 已等秒数。
+  // 为什么加计时：上游首字可能要几秒（重型模型/排队），静态占位看起来像卡死；
+  // 秒数在跳 = 它活着在等上游，发送后的空窗从"黑箱"变成"可见的等待"。
+  // 每 500ms 跳一次（整数秒，500ms 间隔保证 1s 边界最多晚半秒出现）。
+  const [waited, setWaited] = useState(0);
+  const waiting = streaming && !text;
+  useEffect(() => {
+    if (!waiting) {
+      setWaited(0);
+      return;
+    }
+    const t0 = Date.now();
+    const timer = window.setInterval(() => {
+      setWaited(Math.floor((Date.now() - t0) / 1000));
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [waiting]);
+
   useEffect(() => {
     if (streaming) return; // 流式中：不挂计时器，等流结束
     const extra = Math.min(5200, lenRef.current * 60);
@@ -75,8 +93,13 @@ export default function PetBubble({ seq, text, onDone, streaming, thinking, long
           {think}
         </div>
       ) : null}
-      {/* 流式中还没出字：先给个"在酝酿"的占位，别让气泡空着 */}
-      {body || (streaming ? '嗯…' : '…')}
+      {/* 流式中还没出字：给"在想…"+秒数的动态占位，别让气泡空着也不像卡死 */}
+      {body ||
+        (streaming
+          ? waited > 0
+            ? `在想… ${waited}s`
+            : '在想…'
+          : '…')}
     </div>
   );
 }

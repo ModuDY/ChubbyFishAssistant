@@ -493,6 +493,8 @@ export interface Settings {
   pet_persona?: string | null;
   /** AI 对话档位（P3）：off（默认，只用本地台词）/ manual（仅右键主动）/ auto（主动 + 事件自动点评） */
   pet_ai_mode?: PetAiMode | null;
+  /** 桌宠对话专用模型（null/空 = 跟随网关默认模型）；挑 flash 档可以明显缩短首字等待 */
+  pet_ai_model?: string | null;
   /** 无事件进入打盹态的分钟数（null = 5） */
   pet_sleep_minutes?: number | null;
   /** 素材包（P4 预留） */

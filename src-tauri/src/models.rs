@@ -396,6 +396,11 @@ pub struct Settings {
     /// auto（主动 + 事件自动点评）。None 等价 off
     #[serde(default)]
     pub pet_ai_mode: Option<String>,
+    /// 桌宠 AI 对话专用的模型（None/空 = 用网关默认模型 `default_model`）。
+    /// 为什么单独成项：网关默认模型可能是 glm-5.3 这类重型模型，桌宠要的是
+    /// 「一句话快点出来」，用户可在此固定 flash 档模型而不影响其它客户端。
+    #[serde(default)]
+    pub pet_ai_model: Option<String>,
     /// 多久无业务事件进入打盹态（分钟；None = 5）
     #[serde(default)]
     pub pet_sleep_minutes: Option<u32>,

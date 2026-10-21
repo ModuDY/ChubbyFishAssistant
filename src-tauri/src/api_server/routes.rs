@@ -533,9 +533,13 @@ pub(crate) async fn run_chat_completion(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(&state.default_model)
         .to_string();
-    // issue #26 白名单准入（空名单不限）
-    if let Some(resp) = whitelist_check(&state, &model, proto) {
-        return resp;
+    // issue #26 白名单准入（空名单不限）。
+    // 桌宠内部流量（internal:pet）跳过：桌宠可能配置了目录外的专用模型，
+    // 准入是给外部客户端设的闸，内部固定通道不应被白名单配置卡死
+    if key_str != crate::api_server::PET_INTERNAL_KEY {
+        if let Some(resp) = whitelist_check(&state, &model, proto) {
+            return resp;
+        }
     }
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
@@ -1443,7 +1447,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                         // 双败/首字超时 → 冷却换号；首字节到达后正常流速不受限
                         let mut win = match race_trae_first_byte(
                             &state, &picked.uid, reader, primary_hdr, &tried, trae_allowed.as_ref(),
-                            trae_dedicated.as_deref(), &body_vec, sanitize, &templates,
+                            trae_dedicated.as_deref(), &body_vec, sanitize, &templates, &key_id,
                         ) {
                             Ok(w) => w,
                             Err(()) => {
@@ -2421,10 +2425,16 @@ fn race_trae_first_byte(
     body_vec: &[u8],
     sanitize: bool,
     templates: &[(String, String)],
+    key_id_str: &str,
 ) -> Result<TraeRaceWin, ()> {
-    let hedge_ms = state
-        .trae_hedge_threshold_ms
-        .load(std::sync::atomic::Ordering::Relaxed);
+    // 桌宠内部流量（internal:pet）收窄竞速窗口：首字 2.5s 未到即对冲
+    // （mod::hedge_threshold_ms_for 按 key 归一，其余流量原样取池配置）
+    let hedge_ms = super::hedge_threshold_ms_for(
+        state
+            .trae_hedge_threshold_ms
+            .load(std::sync::atomic::Ordering::Relaxed),
+        key_id_str,
+    );
     if hedge_ms == 0 {
         let lines = super::wb_upstream::lines_with_first_byte_timeout(reader)?;
         return Ok(TraeRaceWin {

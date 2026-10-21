@@ -301,8 +301,14 @@ fn race_first_byte(
     tried: &HashSet<String>,
     allowed: Option<&HashSet<String>>,
     dedicated: Option<&str>,
+    key_id: &str,
 ) -> Result<RaceWin, ()> {
-    let hedge_ms = state.wb_hedge_threshold_ms.load(std::sync::atomic::Ordering::Relaxed);
+    // 桌宠内部流量（internal:pet）收窄竞速窗口：首字 2.5s 未到即对冲
+    // （mod::hedge_threshold_ms_for 按 key 归一，其余流量原样取池配置）
+    let hedge_ms = super::hedge_threshold_ms_for(
+        state.wb_hedge_threshold_ms.load(std::sync::atomic::Ordering::Relaxed),
+        key_id,
+    );
     if hedge_ms == 0 {
         return wb_upstream::lines_with_first_byte_timeout(reader).map(|lines| RaceWin {
             lines,
@@ -688,6 +694,7 @@ fn run_wb_stream(
                         &tried,
                         allowed_set.as_ref(),
                         dedicated.as_deref(),
+                        key_id,
                     ) {
                         Ok(w) => w,
                         Err(()) => {
@@ -1100,6 +1107,7 @@ pub async fn wb_aggregate_chat(
                             &tried,
                             allowed_set.as_ref(),
                             dedicated.as_deref(),
+                            &key_id,
                         ) {
                             Ok(w) => w,
                             Err(()) => {

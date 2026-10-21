@@ -420,10 +420,16 @@ fn race_qoder_first_byte(
     allowed: Option<&HashSet<String>>,
     dedicated: Option<&str>,
     primary_session_ids: &Option<(String, String, String)>,
+    key_id: &str,
 ) -> Result<QoderRaceWin, ()> {
-    let hedge_ms = state
-        .qoder_hedge_threshold_ms
-        .load(std::sync::atomic::Ordering::Relaxed);
+    // 桌宠内部流量（internal:pet）收窄竞速窗口：首字 2.5s 未到即对冲
+    // （mod::hedge_threshold_ms_for 按 key 归一，其余流量原样取池配置）
+    let hedge_ms = super::hedge_threshold_ms_for(
+        state
+            .qoder_hedge_threshold_ms
+            .load(std::sync::atomic::Ordering::Relaxed),
+        key_id,
+    );
     if hedge_ms == 0 {
         let lines = lines_with_first_byte_timeout(primary_reader)?;
         return Ok(QoderRaceWin {
@@ -882,6 +888,7 @@ fn run_qoder_stream(
                         allowed_set.as_ref(),
                         dedicated.as_deref(),
                         &envelope_ids,
+                        key_id,
                     ) {
                         Ok(w) => w,
                         Err(()) => {
@@ -1444,6 +1451,7 @@ pub async fn qoder_aggregate_chat(
                             allowed_set.as_ref(),
                             dedicated.as_deref(),
                             &envelope_ids,
+                            &key_id,
                         ) {
                             Ok(w) => w,
                             Err(()) => {

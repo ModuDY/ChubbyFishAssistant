@@ -55,6 +55,26 @@ pub const FUNCTION: &str = "solo_work_lite";
 pub const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 pub const REFERER_BASE: &str = "https://trae-api-cn.mchost.guru";
 
+/// 桌宠内部流量的记账标识（`commands/pet.rs` 的 `PET_SAY_KEY` 单一事实源；
+/// 桌宠进程内调用不经 HTTP 鉴权，用量页按此 key 单独审计）
+pub const PET_INTERNAL_KEY: &str = "internal:pet";
+
+/// 桌宠内部流量的首字竞速对冲阈值（毫秒）：桌宠要的是「一句话快点出来」，
+/// 全局默认 8s 的竞速窗口对它太宽——首字 2.5s 未到即向第二账号发对冲请求。
+/// 仅在池对冲开启（阈值非 0）时生效，且取 min(池配置, 本值) 不放大用户配置
+pub const PET_HEDGE_THRESHOLD_MS: u64 = 2500;
+
+/// 按流量来源解析生效的对冲阈值（纯函数，便于单测）：
+/// - 桌宠内部流量（`key_id == PET_INTERNAL_KEY`）且池对冲开启 → min(池配置, PET_HEDGE)
+/// - 其余流量原样返回池配置（0 = 关闭，保持既有语义）
+pub fn hedge_threshold_ms_for(pool_cfg_ms: u64, key_id: &str) -> u64 {
+    if key_id == PET_INTERNAL_KEY && pool_cfg_ms != 0 {
+        pool_cfg_ms.min(PET_HEDGE_THRESHOLD_MS)
+    } else {
+        pool_cfg_ms
+    }
+}
+
 /// 网关活动事件发射器（设计 §6.5）：网关层无 AppHandle，由启动方注入。
 /// 参数 `(事件名, payload)`；当前用于向 pet 窗口推 `gateway-activity`。
 pub type ActivityEmitter = Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>;
@@ -1261,5 +1281,16 @@ mod activity_tests {
         }
         st.record_usage(true, "m", "uid", "key1", false, false, 5, 1, 1);
         assert!(events(&sink).is_empty());
+    }
+
+    /// 桌宠内部流量收窄竞速窗口：普通 key 原样、internal:pet 取 min(池配置, 2500)、
+    /// 对冲关闭（0）不受影响
+    #[test]
+    fn hedge_threshold_for_pet_traffic() {
+        assert_eq!(hedge_threshold_ms_for(8000, "ck_abc"), 8000);
+        assert_eq!(hedge_threshold_ms_for(8000, PET_INTERNAL_KEY), 2500);
+        assert_eq!(hedge_threshold_ms_for(1500, PET_INTERNAL_KEY), 1500);
+        // 池对冲关闭：桌宠也不开（0 = 用户显式关闭，不放大）
+        assert_eq!(hedge_threshold_ms_for(0, PET_INTERNAL_KEY), 0);
     }
 }

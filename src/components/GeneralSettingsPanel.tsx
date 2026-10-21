@@ -35,6 +35,8 @@ export default function GeneralSettingsPanel() {
   const [iconPickerFor, setIconPickerFor] = useState<AppKey | null>(null);
   // P4-3：可用的桌宠素材包（用户目录 pets/<id>/，不含内置）
   const [packs, setPacks] = useState<Array<{ id: string; name: string; action_count: number }>>([]);
+  // 桌宠对话专用模型候选：统一模型目录的 id 列表（加载失败留空 = 只能跟随网关默认）
+  const [modelOptions, setModelOptions] = useState<string[]>([]);
   // 自我进化 P1：网关观测快照（只读，10s 轮询；网关未运行时不显示）
   const [metrics, setMetrics] = useState<EvolutionMetrics | null>(null);
 
@@ -43,6 +45,14 @@ export default function GeneralSettingsPanel() {
       .packList()
       .then((list) => setPacks(Array.isArray(list) ? list : []))
       .catch(() => setPacks([]));
+    void api.apiServer
+      .unifiedModels(true)
+      .then((list) =>
+        setModelOptions(
+          Array.isArray(list) ? list.map((m) => m.id).filter(Boolean).sort() : [],
+        ),
+      )
+      .catch(() => setModelOptions([]));
   }, []);
 
   useEffect(() => {
@@ -540,6 +550,25 @@ export default function GeneralSettingsPanel() {
                 <option value="butler">正经管家</option>
                 <option value="zen">禅意</option>
               </select>
+            </div>
+            <div>
+              <label className="label">对话模型</label>
+              <select
+                value={form.pet_ai_model ?? ''}
+                onChange={(e) => update('pet_ai_model', e.target.value || null)}
+                className="input w-56"
+              >
+                <option value="">跟随网关默认模型</option>
+                {modelOptions.map((id) => (
+                  <option key={id} value={id}>
+                    {id}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-slate-400 mt-1">
+                想让桌宠回得快就选 flash 档模型（如 deepseek-v4-flash）；
+                跟随默认时用的是网关设置里的模型，重型模型会明显变慢。
+              </p>
             </div>
             <div>
               <label className="label">形象（素材包）</label>

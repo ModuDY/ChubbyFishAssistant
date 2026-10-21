@@ -871,8 +871,10 @@ pub fn pet_probe_report(report: String) -> Result<String, String> {
 // 页面点「停止 API 网关」**不会**打断已开始的这一流；下一次 `pet_say` 因 runtime 为
 // None 返回 Err("网关未启动")，前端回落本地台词。
 
-/// 桌宠 AI 请求在用量/日志里的记账标识（与真实 Key 区分，便于用量页单独审计）
-const PET_SAY_KEY: &str = "internal:pet";
+/// 桌宠 AI 请求在用量/日志里的记账标识（与真实 Key 区分，便于用量页单独审计）。
+/// 单一事实源 = `api_server::PET_INTERNAL_KEY`（网关侧按此识别内部流量跳过白名单/
+/// 收窄对冲阈值），这里 `use` 引用，改名/改值只动一处
+use crate::api_server::PET_INTERNAL_KEY as PET_SAY_KEY;
 /// 两次发言最小间隔（ms）：防连点/事件风暴把额度打空
 ///
 /// 2026-10-21（P7 内联对话）：用户明确选择「完全放开」，故**对话档不再使用此间隔**。
@@ -1324,11 +1326,21 @@ pub async fn pet_say(
     // 对话模式由调用方声明；未知值保守按独白处理（更省 token）
     let is_chat = mode.as_deref() == Some("chat");
 
-    // 网关运行态（None = 未启动）；顺带取默认模型名
+    // 网关运行态（None = 未启动）；顺带解析生效模型：桌宠专用模型（settings.pet_ai_model）
+    // 优先，空/未配置回退网关默认。专用模型让桌宠固定走 flash 档快模型，
+    // 不被网关 default_model（可能是 glm-5.3 等重型模型）拖慢首字
     let model = {
         let rt = app.state::<Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
         let guard = rt.lock().unwrap_or_else(|e| e.into_inner());
-        guard.as_ref().map(|r| r.shared.default_model.clone())
+        let pet_model = settings
+            .pet_ai_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        guard
+            .as_ref()
+            .map(|r| pet_model.unwrap_or_else(|| r.shared.default_model.clone()))
     };
     let Some(model) = model else {
         return Err("网关未启动".into());
