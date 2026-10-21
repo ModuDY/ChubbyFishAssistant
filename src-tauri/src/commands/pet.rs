@@ -29,7 +29,8 @@ const BASE_H: f64 = 360.0;
 /// 窗口右侧额外留白：右键菜单要浮在角色**右边**且不被窗口裁剪，
 /// 而这部分区域全透明——点击穿透（start_hit_watcher）会让它正常放行鼠标。
 /// 必须与 `pet.css` 的 `--pet-menu-space` 保持一致。
-const MENU_SPACE: f64 = 160.0;
+/// V2 菜单卡宽 216px + 两侧各 8px 边距 = 232（旧值 160 只能塞下 148 宽的窄卡）。
+const MENU_SPACE: f64 = 232.0;
 /// 默认位置距屏幕右下角的间距（给任务栏与视觉留白）
 const EDGE_RIGHT: f64 = 24.0;
 const EDGE_BOTTOM: f64 = 64.0;
@@ -104,6 +105,45 @@ fn default_position(window: &WebviewWindow, w: f64, h: f64) -> Option<LogicalPos
     ))
 }
 
+/// 把窗口左上角夹紧到「所在显示器」的可见范围内。
+///
+/// 为什么需要：`MENU_SPACE` 加宽后窗口更宽，用户记忆的 `pet_x` 若贴着屏幕右缘，
+/// 新增的菜单留白会整段跑到屏幕外——DOM 会被窗口裁掉，菜单也就点不到。
+/// 输入输出都是**物理像素**，与 `pet_x/pet_y` 的落盘口径一致。
+fn clamp_origin(
+    window: &WebviewWindow,
+    x: i32,
+    y: i32,
+    logical_w: f64,
+    logical_h: f64,
+) -> (i32, i32) {
+    let sf = window.scale_factor().unwrap_or(1.0);
+    let pw = (logical_w * sf).round() as i32;
+    let ph = (logical_h * sf).round() as i32;
+
+    let target = window
+        .available_monitors()
+        .ok()
+        .and_then(|mons| {
+            mons.into_iter().find(|m| {
+                let p = m.position();
+                let s = m.size();
+                x >= p.x && y >= p.y && x < p.x + s.width as i32 && y < p.y + s.height as i32
+            })
+        })
+        .or_else(|| window.primary_monitor().ok().flatten());
+
+    let Some(monitor) = target else {
+        return (x, y);
+    };
+    let pos = monitor.position();
+    let size = monitor.size();
+    // 窗口比显示器还大时（极端 DPI + 最大缩放），以显示器左上角为准
+    let max_x = (pos.x + size.width as i32 - pw).max(pos.x);
+    let max_y = (pos.y + size.height as i32 - ph).max(pos.y);
+    (x.clamp(pos.x, max_x), y.clamp(pos.y, max_y))
+}
+
 /// 按设置应用窗口状态：尺寸、位置、置顶、显隐。
 ///
 /// 调用时机：① 启动 setup；② `settings_set` 保存了 `pet_*` 字段之后；③ 托盘显隐。
@@ -124,10 +164,11 @@ pub fn apply_settings(app: &AppHandle) {
         crate::fs_utils::app_log(&st.data_dir, &format!("桌宠设置尺寸失败: {e}"));
     }
 
-    // 位置：优先用户记忆的物理坐标；否则按当前显示器右下角落位
+    // 位置：优先用户记忆的物理坐标（并夹紧在显示器内）；否则按当前显示器右下角落位
     match (settings.pet_x, settings.pet_y) {
         (Some(x), Some(y)) => {
-            let _ = window.set_position(PhysicalPosition::new(x, y));
+            let (cx, cy) = clamp_origin(&window, x, y, win_w, h);
+            let _ = window.set_position(PhysicalPosition::new(cx, cy));
         }
         _ => {
             if let Some(pos) = default_position(&window, win_w, h) {

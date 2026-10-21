@@ -33,7 +33,7 @@ body.pet-window {
   touch-action: none;
   pointer-events: none;
   /* 窗口右侧留白（右键菜单浮在角色右边用）——必须与 pet.rs 的 MENU_SPACE 一致 */
-  --pet-menu-space: 160px;
+  --pet-menu-space: 232px;
 }
 
 /* 视频按窗口宽度铺满、贴底对齐：素材 640×360，角色脚底在 y=330，
@@ -86,10 +86,12 @@ body.pet-window {
   z-index: 2;
 }
 
-/* 气泡本体：宽度随文字收缩但不超过 230px，避免短句拉成一条横条 */
+/* 气泡本体：宽度随文字收缩但不超过 230px，避免短句拉成一条横条。
+ * 用 min() 跟舞台宽联动：窄缩放（scale=0.6 → 舞台 180px）下固定 230px 会溢出到菜单区，
+ * 被卡片压掉右半截（设计稿 §1-P3）。 */
 .pet-bubble {
   position: relative;
-  max-width: 230px;
+  max-width: min(230px, calc(100% - 16px));
   /* P3 流式：AI 回复可能较长，限高防遮挡角色（超出裁掉，回复本身已限 40 字） */
   max-height: 132px;
   overflow: hidden;
@@ -111,7 +113,7 @@ body.pet-window {
    独白档的 230px / 132px 是为"一句话"调的，对话答复会成段，
    沿用会把文字挤成很窄的一条并很快被裁掉。左对齐更适合成段阅读。 */
 .pet-bubble-long {
-  max-width: 258px;
+  max-width: min(258px, calc(100% - 16px));
   max-height: 190px;
   text-align: left;
   font-size: 11.5px;
@@ -228,8 +230,12 @@ body.pet-window {
   cursor: default;
 }
 
-/* ---- 右键菜单（无边框窗口自绘，替代系统菜单） ---- */
-/* 全窗透明遮罩：唯一作用是「点菜单外部即关闭」，故需接收指针事件 */
+/* ---- 右键菜单（V2：光标锚定 / 单层翻页 / 搜索式点播） ----
+ * 设计见 docs/pending/桌宠右键菜单重设计方案.md
+ * 关键点：一张卡片三个视图，动作列表只有「搜索 + 分类 + 扁平列表」，
+ * 不再有「组折叠 + 内层滚动」的嵌套结构。
+ */
+/* 全窗透明遮罩：唯一作用是「点外部 / 再次右键即关闭」，故需接收指针事件 */
 .pet-menu-backdrop {
   position: absolute;
   inset: 0;
@@ -237,126 +243,412 @@ body.pet-window {
   z-index: 5;
 }
 
-/* 菜单卡片：位置由 PetRoot 注入（left/top），已夹紧在窗口内 */
-.pet-menu {
+/* 卡片：位置由 PetRoot 的 placeMenu 注入（left/top + transform-origin） */
+.pet-menu-card {
   position: absolute;
-  min-width: 132px;
-  padding: 4px;
-  border-radius: 10px;
-  background: rgba(31, 41, 55, 0.96);
-  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.35);
   display: flex;
   flex-direction: column;
+  width: 216px;
+  max-height: calc(100vh - 16px);
+  padding: 6px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 14px;
+  background: rgba(26, 33, 48, 0.96);
+  box-shadow:
+    0 14px 34px rgba(0, 0, 0, 0.38),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  color: #e7edf7;
+  font-family: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  font-size: 12px;
   pointer-events: auto;
-  animation: pet-menu-in 0.12s ease-out;
+  animation: pet-menu-in 0.15s cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
-.pet-menu button {
-  display: block;
+/* 主菜单滚动容器（窗口很矮时才需要滚，例如 pet_scale=0.6） */
+.pet-menu-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* 条目：图标 14 + 文案 + 右侧状态/箭头 */
+.pet-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   width: 100%;
-  padding: 7px 10px;
+  min-height: 32px;
+  padding: 0 8px;
   border: 0;
-  border-radius: 6px;
+  border-radius: 7px;
   background: transparent;
-  color: #f1f5f9;
-  font-family: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  color: #e7edf7;
+  font-family: inherit;
   font-size: 12px;
   line-height: 1.4;
   text-align: left;
   cursor: pointer;
 }
 
-.pet-menu button:hover {
-  background: rgba(59, 130, 246, 0.85);
+/* hover 用淡蓝底 + 左侧指示条，不再整行饱和蓝（旧样式与"选中态"混淆） */
+.pet-menu-item:hover {
+  background: rgba(110, 168, 254, 0.14);
+  box-shadow: inset 3px 0 0 #6ea8fe;
+}
+
+.pet-menu-item:focus-visible {
+  outline: 1px solid rgba(110, 168, 254, 0.7);
+  outline-offset: -2px;
+}
+
+/* 焦点入口：动作点播 */
+.pet-menu-item.is-focal {
+  background: rgba(110, 168, 254, 0.12);
+  box-shadow: inset 3px 0 0 #6ea8fe;
+  color: #a9c8ff;
+}
+
+/* 当前形象 */
+.pet-menu-item.is-active {
+  background: rgba(110, 168, 254, 0.1);
+  color: #a9c8ff;
+}
+
+.pet-menu-icon {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+  color: #93a2b8;
+}
+
+.pet-menu-item:hover .pet-menu-icon,
+.pet-menu-item.is-focal .pet-menu-icon {
+  color: #cfe0ff;
+}
+
+.pet-menu-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pet-menu-tag {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  color: #93a2b8;
+}
+
+.pet-menu-chevron {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+  margin-left: auto;
+  color: #93a2b8;
+}
+
+/* 网关状态：圆点 + 运行中/已停止 */
+.pet-menu-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  font-size: 10.5px;
+  color: #93a2b8;
+}
+
+.pet-menu-state i {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: #64748b;
+}
+
+.pet-menu-state i.is-on {
+  background: #4ade80;
+}
+
+/* 「陪它玩」三枚 pill：一行放下三件高频互动 */
+.pet-menu-pills {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+  padding: 0 0 4px;
+}
+
+.pet-menu-pill {
+  height: 30px;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #dbe4f2;
+  font-family: inherit;
+  font-size: 11.5px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.pet-menu-pill:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.pet-menu-pill:focus-visible {
+  outline: 1px solid rgba(110, 168, 254, 0.7);
+  outline-offset: -2px;
 }
 
 .pet-menu-sep {
+  flex: 0 0 auto;
   height: 1px;
-  margin: 4px 6px;
-  background: rgba(148, 163, 184, 0.35);
+  margin: 5px 8px;
+  background: rgba(255, 255, 255, 0.06);
 }
 
-/* ── 二级视图（动作点播 / 切换形象）：同级换内容，不再向右展开一层 ──
-   窗口右侧只有留给菜单的 160px，子菜单再向右会被窗口裁掉 */
-.pet-menu-scroll {
-  max-height: 232px;
+/* 二级视图标题行：返回 + 标题 + 计数同排，不单独占一整行 */
+.pet-menu-head {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  padding: 0 4px 6px;
+}
+
+.pet-menu-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #6ea8fe;
+  font-family: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.pet-menu-back svg {
+  width: 12px;
+  height: 12px;
+}
+
+.pet-menu-back:hover {
+  background: rgba(110, 168, 254, 0.14);
+}
+
+.pet-menu-title {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.pet-menu-count {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: #93a2b8;
+}
+
+/* 搜索框 */
+.pet-menu-search {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  margin: 0 6px 6px;
+  padding: 0 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.pet-menu-search input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: #e7edf7;
+  font-family: inherit;
+  font-size: 12px;
+  outline: none;
+}
+
+.pet-menu-search input::placeholder {
+  color: #93a2b8;
+}
+
+.pet-menu-clear {
+  display: inline-flex;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #93a2b8;
+  cursor: pointer;
+}
+
+.pet-menu-clear svg {
+  width: 12px;
+  height: 12px;
+}
+
+/* 分类 chips：换行不滚动（滚动只留一处，给动作列表） */
+.pet-menu-chips {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 0 6px 6px;
+}
+
+.pet-menu-chip {
+  padding: 3px 8px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #c9d5e6;
+  font-family: inherit;
+  font-size: 10.5px;
+  cursor: pointer;
+}
+
+.pet-menu-chip.is-on {
+  background: rgba(110, 168, 254, 0.22);
+  color: #bcd4ff;
+}
+
+.pet-menu-chip:focus-visible {
+  outline: 1px solid rgba(110, 168, 254, 0.7);
+  outline-offset: -1px;
+}
+
+/* 窗口很矮（pet_scale ≤ 0.8 → 高度 288）时，chips 收成单行横向滚动：
+ * 换行会吃掉 60~90px，把列表压到只剩一行；分类是次要入口，让位给搜索与列表。 */
+@media (max-height: 320px) {
+  .pet-menu-chips {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+
+  .pet-menu-chip {
+    flex: 0 0 auto;
+  }
+
+  .pet-menu-chips::-webkit-scrollbar {
+    height: 2px;
+  }
+
+  .pet-menu-chips::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.18);
+  }
+}
+
+/* 动作列表：唯一可滚动区域 */
+.pet-menu-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 0 2px;
   overflow-y: auto;
   overscroll-behavior: contain;
 }
 
-/* 标题行：返回按钮与标题同排，避免为它单独占一整行高度 */
-.pet-menu-title {
+.pet-menu-list .pet-menu-item {
+  min-height: 30px;
+}
+
+/* 底栏：随机入口固定在底部，不随列表滚走 */
+.pet-menu-foot {
   display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-top: 4px;
+  padding: 6px 8px 2px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  font-size: 10.5px;
+  color: #93a2b8;
+}
+
+.pet-menu-random {
+  display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 2px 4px 6px;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.3);
-  margin-bottom: 4px;
-}
-
-.pet-menu-title button {
-  width: auto;
-  padding: 2px 6px;
-  font-size: 12px;
-  color: #93c5fd;
-}
-
-.pet-menu-title span {
-  font-size: 12px;
-  font-weight: 500;
-  color: #e2e8f0;
-}
-
-/* 分组标题现在是可点击的折叠按钮（106 个动作默认收起），故要抹掉按钮默认外观 */
-.pet-menu-group {
-  display: block;
-  width: 100%;
-  padding: 6px 8px 2px;
-  font-size: 11px;
-  color: #94a3b8;
-  text-align: left;
-  background: none;
-  border: none;
+  padding: 2px 4px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #6ea8fe;
+  font-family: inherit;
+  font-size: 11.5px;
   cursor: pointer;
 }
 
-.pet-menu-group:hover {
-  color: #cbd5e1;
-}
-
-/* 随机点播入口：置于动作列表最上方，样式与普通动作项一致但略带强调 */
-.pet-menu-random {
-  display: block;
-  width: 100%;
-  padding: 6px 8px;
-  font-size: 12px;
-  color: #93c5fd;
-  text-align: left;
-  background: none;
-  border: none;
-  cursor: pointer;
+.pet-menu-random svg {
+  width: 12px;
+  height: 12px;
 }
 
 .pet-menu-random:hover {
-  background: rgba(148, 163, 184, 0.18);
+  background: rgba(110, 168, 254, 0.14);
+}
+
+.pet-menu-random:focus-visible {
+  outline: 1px solid rgba(110, 168, 254, 0.7);
+  outline-offset: -1px;
 }
 
 .pet-menu-hint {
+  margin: 0;
   padding: 6px 8px;
-  font-size: 11px;
-  line-height: 1.5;
-  color: #94a3b8;
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: #93a2b8;
 }
 
-.pet-menu button.active {
-  color: #bfdbfe;
-  background: rgba(59, 130, 246, 0.28);
+/* 当前形象的小圆点（未选中时占位，避免文字左右跳） */
+.pet-menu-dot {
+  position: relative;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+}
+
+.pet-menu-dot::before {
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 4px;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(147, 162, 184, 0.55);
+}
+
+/* 细滚动条：透明轨道 + 4px 拇指 */
+.pet-menu-body::-webkit-scrollbar,
+.pet-menu-list::-webkit-scrollbar {
+  width: 4px;
+}
+
+.pet-menu-body::-webkit-scrollbar-track,
+.pet-menu-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.pet-menu-body::-webkit-scrollbar-thumb,
+.pet-menu-list::-webkit-scrollbar-thumb {
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.18);
 }
 
 @keyframes pet-menu-in {
   from {
     opacity: 0;
-    transform: scale(0.94);
+    transform: scale(0.97);
   }
   to {
     opacity: 1;

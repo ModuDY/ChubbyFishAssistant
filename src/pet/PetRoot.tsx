@@ -9,9 +9,9 @@
  * 交互约定（P0）：
  * - 拖拽 = 按住移动超过 5px（调用 `startDragging`），松开播落地反馈并记住位置；
  * - 单击 = 随机点击回应 + 台词；双击 = 呼出主窗口（单击延迟 240ms 给双击让路）；
- * - 右键 = 打开自绘菜单（无边框窗口没有系统菜单），复用签到 / 网关 / 呼出主窗口 / 隐藏动作。
+ * - 右键 = 打开自绘菜单（无边框窗口没有系统菜单）：光标处弹出，签到 / 网关 / 互动 / 动作点播 / 形象与位置 / 隐藏。
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from 'react';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -27,7 +27,6 @@ import { isQuietHour, pickFlavorAction, pickSlotAction, pushRecent, timeSlot } f
 import { linePoolForAction, STARTLE_ACTIONS, TRANSIENT_POOLS } from './pools';
 import {
   clickKindFor,
-  INTERACTIONS,
   pickLandingAction,
   shouldPetOnHover,
   trackClick,
@@ -36,6 +35,10 @@ import { usePetEvents } from './usePetEvents';
 import type { PetSignal } from './usePetEvents';
 import { usePetSay, type SayState, type SayTurn } from './usePetSay';
 import PetChatInput from './PetChatInput';
+import PetMenu from './PetMenu';
+import type { PackEntry, PetMenuView } from './PetMenu';
+import { placeMenu } from './menuPlacement';
+import { pushRecentId, shortLabel } from './menuModel';
 import {
   appendTurn,
   detectIntent,
@@ -85,6 +88,10 @@ const WORK_MUMBLE_MS = 45_000;
  * 调大 → 背景更干净、角色边缘更硬；调小 → 边缘更柔、可能残留一点灰边。
  */
 const ALPHA_FLOOR = 0.1;
+/** 右键菜单卡片宽度（必须与 pet.css 的 .pet-menu-card width 一致） */
+const MENU_W = 216;
+/** 首帧高度估值：仅用于「实测完成前」的第一次落位，随后由真实 rect 校正 */
+const MENU_H_FALLBACK = 320;
 
 type PetUpdatePayload = {
   visible?: boolean;
@@ -153,21 +160,24 @@ export default function PetRoot() {
   const [bubble, setBubble] = useState<{ seq: number; text: string } | null>(null);
   /** AI 气泡结束的时刻：之后 1.5s 内不再弹普通播报气泡，避免画面"一跳" */
   const [sayEndAt, setSayEndAt] = useState(0);
-  /** 右键菜单位置（网关运行态由 `gatewayRunning` 统一提供，见下） */
   /**
-   * 右键菜单：坐标 + 当前视图。
-   * 二级视图（动作点播 / 切换形象）复用同一个卡片换内容，而不是向右再展开一层——
-   * 窗口右侧只有留给菜单的 160px，再向右会被窗口裁掉。
+   * 右键菜单：锚点坐标 + 当前视图。
+   * 坐标是**光标位置**，由 `placeMenu` 换算成实际落点——
+   * 旧实现只用角色包围盒算固定槽位，右键点在哪都一样（见设计稿 §1-P2）。
    */
   const [menu, setMenu] = useState<{
     x: number;
     y: number;
-    view: 'main' | 'actions' | 'packs';
+    view: PetMenuView;
   } | null>(null);
-  /** 切换形象：进入 packs 视图时才拉取，避免每次右键都扫一遍用户目录 */
-  const [packs, setPacks] = useState<Array<{ id: string; name: string }>>([]);
-  /** 动作点播视图里已展开的分组名（默认全部收起，见 toggleGroup） */
-  const [openGroups, setOpenGroups] = useState<Set<string>>(new Set());
+  /** 卡片实测尺寸：视图切换后高度会变，落位要跟着重算（不再写死 MENU_H） */
+  const [menuSize, setMenuSize] = useState({ width: MENU_W, height: MENU_H_FALLBACK });
+  /** 卡片 DOM：测量尺寸 + 键盘导航用 */
+  const menuCardRef = useRef<HTMLDivElement | null>(null);
+  /** 最近点播过的动作（内存态，最多 6 条；不落盘，与「桌宠不写业务数据」一致） */
+  const [recentActions, setRecentActions] = useState<string[]>([]);
+  /** 形象列表：进入 packs 视图时才拉取，避免每次右键都扫一遍用户目录 */
+  const [packs, setPacks] = useState<PackEntry[]>([]);
   /**
    * API 网关运行态（全局单一来源）：
    * - 初始 / 打开菜单时经 `apiServer.status()` 探测；
@@ -1021,15 +1031,25 @@ export default function PetRoot() {
   /* --------------------------- 右键菜单 --------------------------- */
   const closeMenu = useCallback(() => setMenu(null), []);
 
+  /**
+   * 让桌宠窗口持有键盘焦点。
+   *
+   * 窗口是 `focus:false` 建的，仅 `el.focus()` 只能拿到视觉焦点：
+   * 搜索框打不了字、方向键与 Esc 也收不到（与 P7 输入条同一套处理）。
+   */
+  const requestKeyboard = useCallback(() => {
+    void api.pet.focusForInput().catch(() => {});
+  }, []);
+
   // 右键打开菜单：顺带探一下网关运行态，决定菜单显示「启动 / 停止」
+  // 菜单开着时再次右键由 backdrop 的 pointerdown 收起（见 PetMenu）
   const onContextMenu = (e: ReactMouseEvent<HTMLDivElement>) => {
     e.preventDefault();
     e.stopPropagation();
-    const x = e.clientX;
-    const y = e.clientY;
-    // 先按当前已知状态开菜单（不阻塞），随后补一次探测校正新鲜度；
+    // 先按光标位置开菜单（不阻塞），随后补一次探测校正状态新鲜度；
     // 之后的实时变化由 Rust 推送的 pet-update{gatewayRunning} 驱动
-    setMenu({ x, y, view: 'main' });
+    setMenu({ x: e.clientX, y: e.clientY, view: 'main' });
+    requestKeyboard();
     void api.apiServer
       .status()
       .then((s) => setGatewayRunning(!!s?.running))
@@ -1054,70 +1074,42 @@ export default function PetRoot() {
     [closeMenu, showBubble],
   );
 
-  const focusMainFromMenu = useCallback(() => {
-    closeMenu();
-    void api.pet.focusMain().catch(() => {});
-  }, [closeMenu]);
-
   const hideFromMenu = useCallback(() => {
     closeMenu();
     void api.pet.hide().catch(() => {});
   }, [closeMenu]);
 
-  /* ------- 菜单扩展（2026-10-20）：动作点播 / 位置与自愈 / 切换形象 ------- */
-
-  /** 动作分组的中文标题（与 manifest 的 group 字段对应；未知 group 回落显示原值） */
-  const GROUP_LABELS: Record<string, string> = {
-    idle: '待机',
-    work: '工作',
-    balance: '积分',
-    click: '点击回应',
-    mumble: '碎碎念',
-    drag: '拖拽',
-    turn: '转向',
-    jump: '跳跃',
-    // P6 全量彩蛋新增的 4 组
-    festival: '节日',
-    life: '饮食起居',
-    talent: '才艺玩物',
-    sfx: '特效',
-  };
+  /* ------- 菜单扩展（2026-10-20）：动作点播 / 位置与自愈 / 形象 ------- */
 
   /** 点播一个动作：走 click 池的瞬态通道并覆写动作 id，时长按素材实测值 */
-  const pet_playAction = (id: string) => {
-    closeMenu();
-    playTransient('click', undefined, id);
-  };
+  const playMenuAction = useCallback(
+    (id: string) => {
+      closeMenu();
+      setRecentActions((prev) => pushRecentId(prev, id));
+      playTransient('click', undefined, id);
+    },
+    [closeMenu, playTransient],
+  );
 
   /** 随机来一个：在**有素材**的动作里随机挑一个点播（106 个动作时的省事入口） */
-  const pet_playRandom = () => {
-    closeMenu();
+  const playRandomAction = useCallback(() => {
     const pool = ACTION_LIST.filter((a) => a.url);
     if (pool.length === 0) return;
     const a = pool[Math.floor(Math.random() * pool.length)];
-    playTransient('click', `来一个：${a.label}`, a.id);
-  };
+    closeMenu();
+    setRecentActions((prev) => pushRecentId(prev, a.id));
+    playTransient('click', `来一个：${shortLabel(a.label)}`, a.id);
+  }, [closeMenu, playTransient]);
 
-  /** 动作分组展开态（默认收起：106 个动作全展开会长到滚不完） */
-  const toggleGroup = (group: string) => {
-    setOpenGroups((cur) => {
-      const next = new Set(cur);
-      if (next.has(group)) next.delete(group);
-      else next.add(group);
-      return next;
-    });
-  };
-
-  const openActionView = useCallback(() => {
-    setMenu((m) => (m ? { ...m, view: 'actions' } : m));
-  }, []);
-
-  const openPackView = useCallback(() => {
-    setMenu((m) => (m ? { ...m, view: 'packs' } : m));
-    void api.pet
-      .packList()
-      .then((list) => setPacks(Array.isArray(list) ? list : []))
-      .catch(() => setPacks([]));
+  /** 切视图：进入形象页才拉取素材包列表（避免每次右键都扫用户目录） */
+  const setMenuView = useCallback((view: PetMenuView) => {
+    setMenu((m) => (m ? { ...m, view } : m));
+    if (view === 'packs') {
+      void api.pet
+        .packList()
+        .then((list) => setPacks(Array.isArray(list) ? list : []))
+        .catch(() => setPacks([]));
+    }
   }, []);
 
   /** 切换形象：写回设置，后端 pet-update{pack} 会触发前端重新装载动作表 */
@@ -1145,17 +1137,53 @@ export default function PetRoot() {
     void api.pet.reload().catch(() => {});
   }, [closeMenu]);
 
-  // Esc 关闭菜单 / 收起输入条（无边框窗口里没有系统菜单，键盘兜底更稳）
+  // Esc：二级视图逐级返回，主菜单关闭；同时收起输入条
   useEffect(() => {
     if (!menu && !chatOpen) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
-      if (menu) setMenu(null);
+      if (menu) {
+        if (menu.view !== 'main') setMenu((m) => (m ? { ...m, view: 'main' } : m));
+        else setMenu(null);
+      }
       if (chatOpen) setChatOpen(false);
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [menu, chatOpen]);
+
+  /**
+   * 卡片尺寸实测：首帧用 `MENU_H_FALLBACK` 占位，挂载后立即按真实 rect 校正落位。
+   *
+   * 旧实现用固定 `MENU_H = 400` 估值，而窗口只有 `360 × scale` 高，
+   * 垂直夹紧恒等于 4 → 卡片顶到上沿、底部被裁（设计稿 §1-P1）。
+   *
+   * 用 `useLayoutEffect` 而不是 `useEffect`：测量与重排发生在同一帧的绘制前，
+   * 用户看不到"先出现在估值位置、再跳一下"。
+   */
+  useLayoutEffect(() => {
+    if (!menu) return;
+    const el = menuCardRef.current;
+    if (!el) return;
+    // 用 offsetWidth/Height 而不是 getBoundingClientRect：卡片入场有 scale 动画，
+    // rect 量到的是被缩小后的尺寸（最多差 3%），offset* 只反映布局尺寸。
+    const width = el.offsetWidth;
+    const height = el.offsetHeight;
+    if (width < 1 || height < 1) return;
+    setMenuSize((prev) =>
+      Math.abs(prev.width - width) < 0.5 && Math.abs(prev.height - height) < 0.5
+        ? prev
+        : { width, height },
+    );
+  });
+
+  // 窗口失焦即收起：菜单悬在桌面上时，点其它窗口应该让它消失（无边框窗口没有系统菜单的自动行为）
+  useEffect(() => {
+    if (!menu) return;
+    const onBlur = () => setMenu(null);
+    window.addEventListener('blur', onBlur);
+    return () => window.removeEventListener('blur', onBlur);
+  }, [menu]);
 
   // 菜单开合 ↔ 点击穿透：打开时把掩码置为「整窗可交互」，关闭后恢复真实掩码。
   // 否则菜单若落在角色包围盒外，会被 Rust 的透明区穿透逻辑吃掉点击（按钮点不动）
@@ -1244,30 +1272,20 @@ export default function PetRoot() {
    */
   const chatInputBottom = hitBox ? `calc(${(100 - hitBox.top).toFixed(2)}% + 44px)` : '56%';
 
-  // 菜单落位：贴着角色**右侧**、垂直居中悬浮。
-  // 窗口宽度 = 角色舞台 + 右侧 160px 留白（pet.css 的 --pet-menu-space），
-  // 所以菜单能完整画在角色右边而不遮挡角色、也不被窗口裁掉。
-  const MENU_W = 148;
-  /**
-   * 菜单最大高度估值：AI 档位开启时多一行「跟我聊一句」，
-   * 2026-10-20 又加了「喂点吃的 / 陪我玩会儿 / 露一手」三行，
-   * 故上限直接给到 400（菜单本身按内容自适应，这里只用于垂直居中夹紧，
-   * 估偏小会把菜单推到窗口外被裁掉，估偏大只会略微偏上，故宁大勿小）。
-   */
-  const MENU_H = 400;
-  const MENU_GAP = 6;
-  const box = hitBox ?? { left: 14, top: 52, width: 72, height: 48 };
-  const charRightPx = ((box.left + box.width) / 100) * window.innerWidth;
-  const charMidPx = ((box.top + box.height / 2) / 100) * window.innerHeight;
-  const menuLeft = Math.max(
-    4,
-    Math.min(charRightPx + MENU_GAP, window.innerWidth - MENU_W - 4),
+  // 菜单落位：光标锚点 + 四向翻转 + 角色避让（placeMenu 是纯函数，单测覆盖）
+  // 尺寸用实测值：首帧还没量到时用 MENU_H_FALLBACK 占位，随后 useLayoutEffect 校正
+  const petBox = hitBox ?? { left: 14, top: 52, width: 72, height: 48 };
+  const placement = placeMenu(
+    { x: menu?.x ?? 0, y: menu?.y ?? 0 },
+    menuSize,
+    { width: window.innerWidth || 1, height: window.innerHeight || 1 },
+    {
+      left: (petBox.left / 100) * window.innerWidth,
+      top: (petBox.top / 100) * window.innerHeight,
+      width: (petBox.width / 100) * window.innerWidth,
+      height: (petBox.height / 100) * window.innerHeight,
+    },
   );
-  const menuTop = Math.max(
-    4,
-    Math.min(charMidPx - MENU_H / 2, window.innerHeight - MENU_H - 4),
-  );
-  const menuStyle: CSSProperties = { left: menuLeft, top: menuTop };
 
   return (
     <div className={`pet-root ${dragging ? 'dragging' : ''}`} style={{ opacity }}>
@@ -1360,151 +1378,42 @@ export default function PetRoot() {
         onContextMenu={onContextMenu}
       />
       {/*
-        右键菜单：无边框窗口没有系统菜单，这里自绘一个轻量卡片。
-        位置夹紧在窗口内；backdrop 覆盖全窗以支持「点外部关闭」。
+        右键菜单：无边框窗口没有系统菜单，这里自绘一张卡片。
+        落点由 placeMenu（光标锚点 + 翻转 + 角色避让）算好；
+        backdrop 覆盖全窗，支持「点外部 / 再次右键关闭」。
       */}
       {menu ? (
-        <div className="pet-menu-backdrop" onPointerDown={closeMenu} onContextMenu={(e) => e.preventDefault()}>
-          <div
-            className="pet-menu"
-            style={menuStyle}
-            onPointerDown={(e) => e.stopPropagation()}
-          >
-            {menu.view === 'actions' ? (
-              <>
-                <div className="pet-menu-title">
-                  <button type="button" onClick={() => setMenu((m) => (m ? { ...m, view: 'main' } : m))}>
-                    ‹ 返回
-                  </button>
-                  <span>动作点播</span>
-                </div>
-                <div className="pet-menu-scroll">
-                  <button type="button" className="pet-menu-random" onClick={pet_playRandom}>
-                    随机来一个
-                  </button>
-                  {Object.entries(
-                    ACTION_LIST.reduce<Record<string, typeof ACTION_LIST>>((acc, a) => {
-                      (acc[a.group] ??= []).push(a);
-                      return acc;
-                    }, {}),
-                  ).map(([group, list]) => (
-                    <div key={group}>
-                      <button
-                        type="button"
-                        className="pet-menu-group"
-                        onClick={() => toggleGroup(group)}
-                        aria-expanded={openGroups.has(group)}
-                      >
-                        {GROUP_LABELS[group] ?? group}（{list.length}）{openGroups.has(group) ? '▾' : '▸'}
-                      </button>
-                      {openGroups.has(group)
-                        ? list.map((a) => (
-                            <button key={a.id} type="button" onClick={() => pet_playAction(a.id)}>
-                              {a.label}
-                            </button>
-                          ))
-                        : null}
-                    </div>
-                  ))}
-                </div>
-              </>
-            ) : menu.view === 'packs' ? (
-              <>
-                <div className="pet-menu-title">
-                  <button type="button" onClick={() => setMenu((m) => (m ? { ...m, view: 'main' } : m))}>
-                    ‹ 返回
-                  </button>
-                  <span>切换形象</span>
-                </div>
-                <div className="pet-menu-scroll">
-                  <button
-                    type="button"
-                    onClick={() => switchPack('builtin')}
-                    className={currentPack === 'builtin' ? 'active' : undefined}
-                  >
-                    内置形象
-                  </button>
-                  {packs.length === 0 ? (
-                    <p className="pet-menu-hint">
-                      未发现素材包。放到 %APPDATA%\AIWorkAssistant\pets\&lt;id&gt;\ 下即可。
-                    </p>
-                  ) : (
-                    packs.map((p) => (
-                      <button
-                        key={p.id}
-                        type="button"
-                        onClick={() => switchPack(p.id)}
-                        className={currentPack === p.id ? 'active' : undefined}
-                      >
-                        {p.name}
-                      </button>
-                    ))
-                  )}
-                </div>
-              </>
-            ) : (
-              <>
-                <button type="button" onClick={runCheckin}>
-                  一键签到
-                </button>
-                {aiMode !== 'off' ? (
-                  <>
-                    {/* P7：打开内联输入条，真正能问答（与下面"让它自己说一句"区分开） */}
-                    <button
-                      type="button"
-                      onClick={() => {
-                        closeMenu();
-                        setChatOpen(true);
-                      }}
-                    >
-                      跟我聊聊…
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        closeMenu();
-                        sayNow();
-                      }}
-                    >
-                      让它自己说一句
-                    </button>
-                  </>
-                ) : null}
-                <button type="button" onClick={() => toggleGateway(gatewayRunning)}>
-                  {gatewayRunning ? '停止 API 网关' : '启动 API 网关'}
-                </button>
-                <div className="pet-menu-sep" />
-                {/* 主动互动（2026-10-20）：把吃喝 / 玩乐 / 才艺 34 个动作变成"用户想让它做就做"，
-                    不再只能等时间彩蛋偶然漂出来 */}
-                {INTERACTIONS.map((it) => (
-                  <button key={it.id} type="button" onClick={() => interact(it.kind)}>
-                    {it.label}
-                  </button>
-                ))}
-                <div className="pet-menu-sep" />
-                <button type="button" onClick={focusMainFromMenu}>
-                  呼出主窗口
-                </button>
-                <button type="button" onClick={openActionView}>
-                  动作点播 ›
-                </button>
-                <button type="button" onClick={openPackView}>
-                  切换形象 ›
-                </button>
-                <button type="button" onClick={resetPosition}>
-                  回到初始位置
-                </button>
-                <div className="pet-menu-sep" />
-                <button type="button" onClick={reloadPet}>
-                  重新加载桌宠
-                </button>
-                <button type="button" onClick={hideFromMenu}>
-                  隐藏桌宠
-                </button>
-              </>
-            )}
-          </div>
-        </div>
+        <PetMenu
+          view={menu.view}
+          placement={placement}
+          cardRef={menuCardRef}
+          aiMode={aiMode}
+          gatewayRunning={gatewayRunning}
+          actions={ACTION_LIST}
+          recents={recentActions}
+          packs={packs}
+          currentPack={currentPack}
+          onClose={closeMenu}
+          onViewChange={setMenuView}
+          onCheckin={runCheckin}
+          onChat={() => {
+            closeMenu();
+            setChatOpen(true);
+          }}
+          onSay={() => {
+            closeMenu();
+            sayNow();
+          }}
+          onToggleGateway={() => toggleGateway(gatewayRunning)}
+          onInteract={interact}
+          onPlayAction={playMenuAction}
+          onPlayRandom={playRandomAction}
+          onPickPack={switchPack}
+          onResetPosition={resetPosition}
+          onReload={reloadPet}
+          onHide={hideFromMenu}
+          onRequestKeyboard={requestKeyboard}
+        />
       ) : null}
     </div>
   );
