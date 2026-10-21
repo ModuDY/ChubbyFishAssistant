@@ -13,6 +13,7 @@ import {
   ChevronLeft,
   ChevronRight,
   EyeOff,
+  Gamepad2,
   Layers,
   LayoutGrid,
   MapPin,
@@ -52,6 +53,8 @@ export type PetMenuProps = {
   onSay: () => void;
   onToggleGateway: () => void;
   onInteract: (kind: PetTransientKind) => void;
+  /** P9：打开猜拳对局（面板在角色右侧，与菜单同区域） */
+  onPlayGame: () => void;
   onPlayAction: (id: string) => void;
   onPlayRandom: () => void;
   onPickPack: (id: string) => void;
@@ -145,6 +148,11 @@ function QuickMenu(props: PetMenuProps) {
           </button>
         ))}
       </div>
+
+      <button type="button" className="pet-menu-item" data-nav onClick={props.onPlayGame}>
+        <Gamepad2 className="pet-menu-icon" aria-hidden />
+        <span>石头剪刀布</span>
+      </button>
 
       {aiMode !== 'off' ? (
         <>

@@ -35,6 +35,8 @@ import { usePetEvents } from './usePetEvents';
 import type { PetSignal } from './usePetEvents';
 import { usePetSay, type SayState, type SayTurn } from './usePetSay';
 import PetChatInput from './PetChatInput';
+import PetRpsGame from './PetRpsGame';
+import type { RpsRoundPayload } from './PetRpsGame';
 import PetMenu from './PetMenu';
 import type { PackEntry, PetMenuView } from './PetMenu';
 import { placeMenu } from './menuPlacement';
@@ -295,6 +297,15 @@ export default function PetRoot() {
   /** 输入条是否展开的最新值（事件回调用，避免闭包旧值） */
   const chatOpenRef = useRef(false);
   chatOpenRef.current = chatOpen;
+  /**
+   * P9：猜拳面板是否展开。
+   *
+   * 与 `chatOpen` 平级而非合并成一个「面板」状态：两者的掩码矩形、关闭时机、
+   * 「别打扰」判定语义都不同，合并会让每个消费点都要再判一次类型。
+   */
+  const [gameOpen, setGameOpen] = useState(false);
+  const gameOpenRef = useRef(false);
+  gameOpenRef.current = gameOpen;
 
   // 透明窗口要求 html/body 无背景：class 只在本页挂载期间存在
   useEffect(() => {
@@ -457,8 +468,9 @@ export default function PetRoot() {
       draggingRef.current ||
       !!transientRef.current ||
       !!sayRef.current?.streaming ||
-      // 用户正在打字时不自动点评：会把输入条顶掉/切走焦点
+      // 用户正在打字/对局时不自动点评：会把输入条顶掉、或让气泡压住出招按钮
       chatOpenRef.current ||
+      gameOpenRef.current ||
       document.hidden,
     startSay: (prompt, context, trigger) => {
       lastTriggerRef.current = trigger ?? 'auto';
@@ -938,6 +950,30 @@ export default function PetRoot() {
   );
 
   /**
+   * P9 猜拳：一轮结束 → 播对应动作 + 弹一句台词。
+   *
+   * 为什么动作与台词都由这里决定而不是游戏组件直接播：`playTransient` 是
+   * 唯一入口（它负责兜底时长、去重、气泡互斥）。游戏组件只回传「结果 + 建议动作」，
+   * 换素材/改台词池不用动 UI；反过来游戏组件也拿不到 `transient` 状态机，
+   * 不会跟彩蛋、签到动画抢动作槽。
+   */
+  const handleRpsRound = useCallback(
+    (r: RpsRoundPayload) => {
+      // kind 只用于「兜底池 + 兜底时长」，动作已由 `r.action` 显式指定
+      const kind: PetTransientKind =
+        r.action === 'click-tsundere'
+          ? 'tease'
+          : r.action === 'talent-violin'
+            ? 'perform'
+            : r.action === 'work-celebrate'
+              ? 'happy'
+              : 'click';
+      playTransient(kind, pickLine(r.linePool, lastLineRef.current), r.action);
+    },
+    [playTransient],
+  );
+
+  /**
    * 悬停抚摸轮询：鼠标静止在角色上 1.2s 就摸一下。
    *
    * 为什么不用 `onMouseEnter/Leave`：窗口是置顶的**透明且可穿透**窗口，
@@ -951,25 +987,16 @@ export default function PetRoot() {
     return () => window.clearInterval(timer);
   }, [playPetOnHover]);
 
-  /** 输入条 DOM 引用：掩码合成要用它量矩形（必须先于 withChatMask 声明） */
+  /** 输入条 DOM 引用：掩码合成要用它量矩形（必须先于 withOverlayMask 声明） */
   const chatBoxRef = useRef<HTMLDivElement | null>(null);
+  /** P9：猜拳面板 DOM 引用（同上，量矩形并入掩码） */
+  const gameBoxRef = useRef<HTMLDivElement | null>(null);
 
-  /**
-   * 把「输入条矩形」并进掩码交给 Rust（P7）。
-   *
-   * 为什么掩码要感知输入条：穿透线程按格子判断"光标是否在透明区"，
-   * 输入条不在 sprite alpha 里 → 不并进去就会被判成透明 → 输入框点不动。
-   * （另外 `setChatFocus(true)` 会让穿透线程整体暂停切换，两者是双保险：
-   *  mask 保证"光标算在非透明区"，CHAT_FOCUS 保证"移动途中的过渡帧也不切"。）
-   *
-   * 矩形按实测 `getBoundingClientRect()` 取，窗口尺寸取 `innerWidth/innerHeight`，
-   * 与 `PetSprite` 的采样口径一致（都用 CSS px 比例换算）。
-   */
-  const withChatMask = useCallback((base: Uint8Array) => {
-    if (!chatOpenRef.current) return base;
-    const el = chatBoxRef.current;
+  /** 把一个元素的矩形并进掩码（元素不存在/未布局时原样返回） */
+  const mergeMaskRect = useCallback((base: Uint8Array, el: HTMLElement | null) => {
     if (!el) return base;
     const r = el.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) return base;
     return overlayRectOnMask(
       base,
       { left: r.left, top: r.top, width: r.width, height: r.height },
@@ -979,6 +1006,25 @@ export default function PetRoot() {
       MASK_ROWS,
     );
   }, []);
+
+  /**
+   * 把「可点击浮层」矩形并进掩码交给 Rust（P7 输入条 + P9 猜拳面板）。
+   *
+   * 为什么掩码要感知浮层：穿透线程按格子判断"光标是否在透明区"，
+   * 浮层不在 sprite alpha 里 → 不并进去就会被判成透明 → 按钮点不动。
+   * （另外 `setChatFocus(true)` 会让穿透线程整体暂停切换，两者是双保险：
+   *  mask 保证"光标算在非透明区"，CHAT_FOCUS 保证"移动途中的过渡帧也不切"。）
+   *
+   * 矩形按实测 `getBoundingClientRect()` 取，窗口尺寸取 `innerWidth/innerHeight`，
+   * 与 `PetSprite` 的采样口径一致（都用 CSS px 比例换算）。
+   */
+  const withOverlayMask = useCallback(
+    (base: Uint8Array) => {
+      const chat = chatOpenRef.current ? mergeMaskRect(base, chatBoxRef.current) : base;
+      return gameOpenRef.current ? mergeMaskRect(chat, gameBoxRef.current) : chat;
+    },
+    [mergeMaskRect],
+  );
 
   /** 稳定引用：否则父组件每次渲染都会重置气泡的自动消失计时器 */
   const clearBubble = useCallback(() => setBubble(null), []);
@@ -1006,10 +1052,10 @@ export default function PetRoot() {
     maskRef.current = next;
     // 菜单打开期间不覆盖「整窗可交互」掩码，否则菜单会被 Rust 的穿透逻辑吃掉点击
     if (menuOpenRef.current) return;
-    void api.pet.setHitMask(MASK_COLS, MASK_ROWS, Array.from(withChatMask(next))).catch(() => {
+    void api.pet.setHitMask(MASK_COLS, MASK_ROWS, Array.from(withOverlayMask(next))).catch(() => {
       /* 上报失败只影响点击穿透，不影响显示，静默忽略 */
     });
-  }, []);
+  }, [withOverlayMask]);
 
   const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
@@ -1182,9 +1228,9 @@ export default function PetRoot() {
     void api.pet.reload().catch(() => {});
   }, [closeMenu]);
 
-  // Esc：二级视图逐级返回，主菜单关闭；同时收起输入条
+  // Esc：二级视图逐级返回，主菜单关闭；同时收起输入条 / 结束对局
   useEffect(() => {
-    if (!menu && !chatOpen) return;
+    if (!menu && !chatOpen && !gameOpen) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
       if (menu) {
@@ -1192,10 +1238,11 @@ export default function PetRoot() {
         else setMenu(null);
       }
       if (chatOpen) setChatOpen(false);
+      if (gameOpen) setGameOpen(false);
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [menu, chatOpen]);
+  }, [menu, chatOpen, gameOpen]);
 
   /**
    * 卡片尺寸实测：首帧用 `MENU_H_FALLBACK` 占位，挂载后立即按真实 rect 校正落位。
@@ -1254,8 +1301,10 @@ export default function PetRoot() {
    * 展开后等一帧再量矩形：组件刚挂载时还没布局完成，`getBoundingClientRect` 会拿到 0。
    */
   useEffect(() => {
-    if (!chatOpen) {
-      // 收起：恢复真实掩码（去掉之前并进来的输入条格子）
+    // 两个浮层（输入条 / 猜拳面板）共用一套掩码合成：任一打开就要把它的矩形并进去，
+    // 全部关闭才恢复纯 sprite 掩码——否则先关一个会把另一个的格子一起擦掉
+    if (!chatOpen && !gameOpen) {
+      // 收起：恢复真实掩码（去掉之前并进来的浮层格子）
       if (maskRef.current && !menuOpenRef.current) {
         void api.pet
           .setHitMask(MASK_COLS, MASK_ROWS, Array.from(maskRef.current))
@@ -1269,7 +1318,7 @@ export default function PetRoot() {
       const base = maskRef.current;
       if (!base || menuOpenRef.current) return;
       void api.pet
-        .setHitMask(MASK_COLS, MASK_ROWS, Array.from(withChatMask(base)))
+        .setHitMask(MASK_COLS, MASK_ROWS, Array.from(withOverlayMask(base)))
         .catch(() => {});
     };
     const raf = window.requestAnimationFrame(() => window.requestAnimationFrame(sync));
@@ -1277,7 +1326,7 @@ export default function PetRoot() {
       cancelled = true;
       window.cancelAnimationFrame(raf);
     };
-  }, [chatOpen, withChatMask]);
+  }, [chatOpen, gameOpen, withOverlayMask]);
 
   /* --------------------------- 播放调度 --------------------------- */
   const actionId = dragging ? 'drag-dangle' : (transient?.action ?? coreAction(core, idleTick));
@@ -1383,6 +1432,12 @@ export default function PetRoot() {
           />
         </div>
       ) : null}
+      {/* P9 猜拳面板：放在角色右侧的透明留白（与右键菜单同一区域），不遮角色也不压气泡 */}
+      {gameOpen ? (
+        <div className="pet-game-anchor" ref={gameBoxRef}>
+          <PetRpsGame onClose={() => setGameOpen(false)} onRoundEnd={handleRpsRound} />
+        </div>
+      ) : null}
       {/* 气泡锚点：底边贴在角色头顶上方，而不是窗口顶部 */}
       {notice ? (
         // 通知优先级最高：签到失败这类结果不能被随机台词或 AI 闲聊顶掉。
@@ -1462,6 +1517,9 @@ export default function PetRoot() {
           onCheckin={runCheckin}
           onChat={() => {
             closeMenu();
+            // 输入条与对局面板不能同时开：两者的 setChatFocus/掩码矩形成对出现，
+            // 交错关闭会让先关的那个把穿透暂停一起复位（另一个还在花屏/点不动）
+            setGameOpen(false);
             setChatOpen(true);
           }}
           onSay={() => {
@@ -1470,6 +1528,12 @@ export default function PetRoot() {
           }}
           onToggleGateway={() => toggleGateway(gatewayRunning)}
           onInteract={interact}
+          onPlayGame={() => {
+            closeMenu();
+            // 输入条与对局面板同占右侧/底部空间，开对局先收起输入条避免互相遮挡
+            setChatOpen(false);
+            setGameOpen(true);
+          }}
           onPlayAction={playMenuAction}
           onPlayRandom={playRandomAction}
           onPickPack={switchPack}

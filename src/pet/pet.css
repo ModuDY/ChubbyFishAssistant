@@ -260,6 +260,123 @@ body.pet-window {
   cursor: default;
 }
 
+/* ---- P9 石头剪刀布面板 ----
+   与右键菜单同区：角色右侧那条透明留白（--pet-menu-space）。
+   放这里而不是头顶/脚下：头顶是气泡的位置（对局中也会弹台词），
+   脚下是输入条的位置；右侧留白本来就为菜单准备、对局时菜单是关的。
+   锚点 pointer-events:none、面板自身 auto —— 与 .pet-chat 同一套做法。 */
+.pet-game-anchor {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  width: calc(var(--pet-menu-space) - 16px);
+  transform: translateY(-50%);
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+  z-index: 4;
+}
+
+.pet-game {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.97);
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.22);
+  font-family: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  font-size: 10.5px;
+  color: #1f2937;
+  pointer-events: auto;
+  animation: pet-bubble-in 0.14s ease-out;
+}
+
+.pet-game-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+}
+
+/* 比分用等宽数字：每次累积不会左右抖动 */
+.pet-game-score {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.pet-game-close {
+  flex: 0 0 auto;
+  padding: 0 2px;
+  border: 0;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.pet-game-close:hover {
+  color: #475569;
+}
+
+/* 结果行：给一个最小高度，出招前后不会让卡片高度跳动 */
+.pet-game-stage {
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  line-height: 1.4;
+  color: #475569;
+}
+
+.pet-game-outcome.is-win {
+  color: #16a34a;
+}
+
+.pet-game-outcome.is-lose {
+  color: #ea580c;
+}
+
+.pet-game-outcome.is-draw {
+  color: #64748b;
+}
+
+.pet-game-buttons {
+  display: flex;
+  gap: 4px;
+}
+
+.pet-game-btn {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  padding: 4px 0;
+  border: 1px solid rgba(148, 163, 184, 0.5);
+  border-radius: 10px;
+  background: #fff;
+  cursor: pointer;
+}
+
+.pet-game-btn:hover:not(:disabled) {
+  border-color: rgba(59, 130, 246, 0.8);
+  background: rgba(239, 246, 255, 0.92);
+}
+
+.pet-game-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.pet-game-btn-label {
+  font-size: 9px;
+  color: #64748b;
+}
+
 /* ---- 右键菜单（V2：光标锚定 / 单层翻页 / 搜索式点播） ----
  * 设计见 docs/pending/桌宠右键菜单重设计方案.md
  * 关键点：一张卡片三个视图，动作列表只有「搜索 + 分类 + 扁平列表」，
