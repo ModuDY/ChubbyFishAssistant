@@ -26,6 +26,12 @@ pub const PET_LABEL: &str = "pet";
 /// 基准逻辑尺寸（素材 640×360，窗口按 1:1 逻辑像素装下角色）
 const BASE_W: f64 = 300.0;
 const BASE_H: f64 = 360.0;
+/// 窗口底部额外留白：内联对话输入条贴在角色**脚下**（原先放头顶，气泡向上增长时会
+/// 整块压住输入条，见设计文档 §6.8）。这部分区域全透明，角色舞台底部同步抬高同样的量
+/// （`pet.css` 的 `--pet-chat-space` 与 `.pet-video` 的 bottom），保证加高前后角色在
+/// 屏幕上的**绝对位置不变**。必须与 `pet.css` 的 `--pet-chat-space` 保持一致。
+/// 取值 = 输入条实测高度 32px + 与窗口下沿的 12px 间距 + 4px 余量。
+const CHAT_SPACE: f64 = 48.0;
 /// 窗口右侧额外留白：右键菜单要浮在角色**右边**且不被窗口裁剪，
 /// 而这部分区域全透明——点击穿透（start_hit_watcher）会让它正常放行鼠标。
 /// 必须与 `pet.css` 的 `--pet-menu-space` 保持一致。
@@ -90,6 +96,11 @@ pub fn tray_item_text(enabled: bool) -> &'static str {
 }
 
 /// 未设置位置时的默认位：主屏右下角（考虑 DPI 缩放）。
+///
+/// `h` 传的是**窗口总高**（含底部 `CHAT_SPACE` 留白），但落位锚点要用角色舞台高度
+/// （`h - CHAT_SPACE`）：否则留白会把窗口整体往上顶 48px，角色相对屏幕的位置比
+/// 加留白之前上移一截（升级后用户会看到桌宠"自己往上跳了一下"）。
+/// 这样算出来窗口顶边与升级前完全一致，留白则向屏幕底方向延伸。
 fn default_position(window: &WebviewWindow, w: f64, h: f64) -> Option<LogicalPosition<f64>> {
     let monitor = window
         .current_monitor()
@@ -99,9 +110,10 @@ fn default_position(window: &WebviewWindow, w: f64, h: f64) -> Option<LogicalPos
     let sf = monitor.scale_factor();
     let size = monitor.size().to_logical::<f64>(sf);
     let pos = monitor.position().to_logical::<f64>(sf);
+    let stage_h = (h - CHAT_SPACE).max(0.0);
     Some(LogicalPosition::new(
         pos.x + size.width - w - EDGE_RIGHT,
-        pos.y + size.height - h - EDGE_BOTTOM,
+        pos.y + size.height - stage_h - EDGE_BOTTOM,
     ))
 }
 
@@ -157,7 +169,10 @@ pub fn apply_settings(app: &AppHandle) {
     let scale = scale_of(&settings);
     // w = 角色舞台宽度（视频按它铺满），窗口再额外加一段右侧留白给菜单
     let w = BASE_W * scale;
-    let h = BASE_H * scale;
+    // h = 角色舞台高度 + 底部留白（输入条贴在脚下用）；舞台本身由 CSS 抬到留白之上。
+    // 留白**不随 scale 缩放**：输入条是可读性优先的 UI，缩到 0.6 倍时 48px 只剩 29px，
+    // 字会挤成一条，所以这里按逻辑像素固定加，与 CSS 的 48px 严格一致。
+    let h = BASE_H * scale + CHAT_SPACE;
     let win_w = w + MENU_SPACE;
 
     if let Err(e) = window.set_size(LogicalSize::new(win_w, h)) {

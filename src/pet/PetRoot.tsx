@@ -412,7 +412,7 @@ export default function PetRoot() {
 
       // 3) **保持输入条打开**（不收起）：
       //    多轮对话的关键是"问完能马上追问"。收起会逼用户再右键一次，多轮体验直接断掉。
-      //    气泡在输入条下方长大，位置已错开（chatInputBottom 比 sayBubbleBottom 更高）。
+      //    输入条在角色脚下、气泡向上长，两者朝相反方向扩张，不会互相遮挡。
 
       // 4) 发起对话（chat 档：对话 prompt + 1200 token + 600ms 节流）
       lastTriggerRef.current = 'user';
@@ -1265,12 +1265,17 @@ export default function PetRoot() {
   // AI 气泡比普通播报气泡再高 10px：两者切换时不会"原地跳"，也不会把角色头顶压住
   const sayBubbleBottom = hitBox ? `calc(${(100 - hitBox.top).toFixed(2)}% + 18px)` : '52%';
   /**
-   * 输入条底边位置（P7）：再比 AI 气泡高 26px。
+   * 输入条贴窗口下沿 12px（P7 修正）。
    *
-   * 为什么还要往上挪：输入条比气泡矮但更宽，若贴着气泡位，两者同时出现会叠在一起；
-   * 26px ≈ 输入条自身高度 + 一个小间隙，保证「气泡在长大、输入条在上面」互不遮挡。
+   * 原先放在角色头顶、比气泡再高 26px。这有个硬伤：气泡是**向上**增长的，
+   * 答复一旦讲到两三句，气泡顶边就会越过输入条位置、整块盖住它——用户看不见
+   * 自己在打什么，也点不到输入框。
+   *
+   * 现在改到角色**脚下**：气泡向上长、输入条向下蹲，两者朝相反方向扩张，
+   * 再多轮也不会互相遮挡。空间由窗口底部的 `--pet-chat-space`（48px，见 pet.rs
+   * 的 CHAT_SPACE）提供，视频同步抬高，角色在屏幕上的绝对位置不变。
    */
-  const chatInputBottom = hitBox ? `calc(${(100 - hitBox.top).toFixed(2)}% + 44px)` : '56%';
+  const chatInputBottom = '12px';
 
   // 菜单落位：光标锚点 + 四向翻转 + 角色避让（placeMenu 是纯函数，单测覆盖）
   // 尺寸用实测值：首帧还没量到时用 MENU_H_FALLBACK 占位，随后 useLayoutEffect 校正

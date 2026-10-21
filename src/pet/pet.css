@@ -34,17 +34,21 @@ body.pet-window {
   pointer-events: none;
   /* 窗口右侧留白（右键菜单浮在角色右边用）——必须与 pet.rs 的 MENU_SPACE 一致 */
   --pet-menu-space: 232px;
+  /* 窗口底部留白（内联对话输入条贴在角色脚下）——必须与 pet.rs 的 CHAT_SPACE 一致。
+     窗口高度已含这段留白，故视频要用 bottom 抬起来，否则角色会被顶出下沿。 */
+  --pet-chat-space: 48px;
 }
 
-/* 视频按窗口宽度铺满、贴底对齐：素材 640×360，角色脚底在 y=330，
-   贴底后"脚踩窗口下沿"，视觉上像站在任务栏上方 */
+/* 视频按窗口宽度铺满、贴在"舞台底"：素材 640×360，角色脚底在 y=330，
+   贴底后"脚踩舞台下沿"。舞台底不是窗口下沿——底部要给输入条留 48px，
+   所以这里用 bottom 抬起来，让角色在屏幕上的绝对位置与加高前一致。 */
 .pet-video {
   position: absolute;
   left: 0;
   /* 视频只铺满"角色舞台"（窗口宽度 − 右侧菜单留白），
      角色视觉位置保持不变，右侧多出的透明区专门给右键菜单 */
   right: auto;
-  bottom: 0;
+  bottom: var(--pet-chat-space);
   width: calc(100% - var(--pet-menu-space));
   height: auto;
   pointer-events: none;
@@ -157,7 +161,9 @@ body.pet-window {
 }
 
 /* ---- P7 内联对话输入条 ----
-   贴在角色头顶上方，与气泡同级但更高一层（气泡在 z-index:2，这里 z-index:3）。
+   贴在角色**脚下**（bottom 由 PetRoot 注入），占窗口底部 --pet-chat-space 那条留白。
+   气泡向上增长、输入条向下蹲，两者朝相反方向扩张，多轮对话也不会互相遮挡。
+   z-index 高于气泡：万一极端窄窗口下仍有重叠，输入框要压在上面（可操作优先）。
    必须 pointer-events:auto —— 否则窗口根节点的 none 会让它收不到指针事件。 */
 /* 锚点：只负责定位（bottom 由 PetRoot 注入），本身不接收指针事件，
    事件交给内部 .pet-chat —— 这样锚点不占额外的可点击面积 */
