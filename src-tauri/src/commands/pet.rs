@@ -730,6 +730,49 @@ fn left_button_down() -> bool {
 // 全屏退出后按 `pet_enabled` 自动恢复。只对账窗口显隐，**不写设置**——用户「显示桌宠」的意愿
 // （pet_enabled）不被覆盖（区别于 pet_show/pet_hide，那两个会落盘）。
 
+/// watchdog 抑制计数：>0 时暂停「按 pet_enabled 对账显隐」。
+///
+/// 为什么需要：通知气泡要「叫醒」被隐藏的桌宠 8 秒，而 watchdog 每 1 秒对账一次，
+/// 会发现「用户设置是隐藏、窗口却可见」并立刻把气泡按回去——叫醒等于无效。
+/// 用计数而非 bool：并发叫醒（多个通知同时到）时提前结束会误伤后一个。
+static WAKE_HOLD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 叫醒期间窗口应保持可见（供 watchdog 判断）
+fn wake_holding() -> bool {
+    WAKE_HOLD.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
+/// 临时叫醒桌宠弹通知气泡，`hold_ms` 后自动还原（隐藏的继续隐藏）。
+///
+/// 用户选择「通知绝不丢」：桌宠被隐藏或因全屏应用被收起时，气泡原本看不见，
+/// 等于静默丢弃签到失败这类重要结果。这里临时 show 并把 watchdog 按  hold_ms 挡住，
+/// 到期后自行与 `pet_enabled` 对账——**不写设置**，不改变用户「显示桌宠」的意愿。
+fn wake_pet_for_notice(app: &AppHandle, hold_ms: u64) {
+    let Some(window) = pet_window(app) else {
+        return;
+    };
+    WAKE_HOLD.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let _ = window.show();
+    let _ = and_not_ex_style(&window, WS_EX_APPWINDOW as i64);
+    let _ = app.emit_to(PET_LABEL, "pet-update", serde_json::json!({ "visible": true }));
+
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+        WAKE_HOLD.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        // 到点立即对账，别等 watchdog 下一轮（最多多留 1s 的窗口）
+        if !wake_holding() {
+            if let Some(w) = pet_window(&app) {
+                let enabled = app.state::<AppState>().settings().pet_enabled;
+                if !enabled {
+                    let _ = w.hide();
+                    let _ = app.emit_to(PET_LABEL, "pet-update", serde_json::json!({ "visible": false }));
+                }
+            }
+        }
+    });
+}
+
 /// 启动置顶 watchdog（只需调用一次；重复调用为空操作）。
 pub fn start_top_watchdog(app: AppHandle) {
     #[cfg(windows)]
@@ -747,6 +790,10 @@ pub fn start_top_watchdog(app: AppHandle) {
             let Some(window) = pet_window(&app) else {
                 continue;
             };
+            // 叫醒期间不做对账，否则刚弹出的通知气泡会被立刻按回去
+            if wake_holding() {
+                continue;
+            }
             // 期望可见 = 用户设置要显示 且 前台不是全屏应用；与实际状态对账（幂等，可自愈）
             let want =
                 app.state::<AppState>().settings().pet_enabled && !foreground_is_fullscreen();
@@ -1310,6 +1357,49 @@ fn say_count_bump(data_dir: &std::path::Path) -> u32 {
 
 fn emit_say(app: &AppHandle, event: &str, payload: serde_json::Value) {
     let _ = app.emit_to(PET_LABEL, event, payload);
+}
+
+/// 通知气泡停留时长：与前端 `pet-notice` 的消失计时同源。
+///
+/// 比普通台词气泡（3.8s 起、最长约 9s）更长：通知类文案（签到结果、失败原因）
+/// 用户需要读完，太短会"刚抬头就没了"。
+const NOTICE_HOLD_MS: u64 = 8000;
+
+/// 系统通知 → 桌宠气泡（用户选择「所有系统通知都走气泡，通知栏不再出现」）。
+///
+/// 这是 `notify::notify` 的替代入口，语义差异有三点，都是刻意的：
+/// 1. **不弹系统通知**：需求就是让通知栏不再出现这些东西；
+/// 2. **隐藏/全屏时叫醒**：气泡只在桌宠可见时能被看到，所以先临时 show；
+/// 3. **不影响远程渠道**：Bark / 企业微信 / Server酱 与桌面通知互相独立，
+///    手机端看不到桌宠，那几条推送照旧发送（见 `notify_all`）。
+pub fn notice_bubble(app: &AppHandle, title: &str, body: &str) {
+    let visible = pet_window(app)
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false);
+    let payload = serde_json::json!({
+        "title": title,
+        "body": body,
+        // 毫秒：前端据此挂消失计时器，避免前端硬编码一份时长后两处漂移
+        "holdMs": NOTICE_HOLD_MS,
+    });
+    let data_dir = app.state::<AppState>().data_dir.clone();
+    if visible {
+        crate::fs_utils::app_log(&data_dir, &format!("[通知气泡] 直接下发: {title}"));
+        emit_say(app, "pet-notice", payload);
+        return;
+    }
+    // 窗口此前是隐藏的：必须"先 show 再等一下"，不能紧接着 emit。
+    // 原因：WebView2 在窗口隐藏期间会冻结执行环境（rAF/定时器/事件派发都停），
+    // show 之后要过一小段才恢复；立刻 emit 的事件会落在一段还没醒的页面上，
+    // 表现为"叫醒了窗口，但气泡根本没出现"（实测 2026-10-21）。
+    crate::fs_utils::app_log(&data_dir, &format!("[通知气泡] 叫醒桌宠后下发: {title}"));
+    wake_pet_for_notice(app, NOTICE_HOLD_MS + 2000);
+    let app = app.clone();
+    std::thread::spawn(move || {
+        // 250ms：经验值，够 WebView2 恢复一次渲染循环；再久用户会觉得"迟钝"
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        emit_say(&app, "pet-notice", payload);
+    });
 }
 
 fn emit_say_error(app: &AppHandle, session: u64, code: &str, message: &str) {

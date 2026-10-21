@@ -36,12 +36,27 @@ type Props = {
    * 它正在干活。正文一到就自动让位（见下面的 `body ||` 分支）。
    */
   hint?: string;
+  /**
+   * 通知标题（系统通知转气泡时使用）。
+   *
+   * 有标题时走「通知样式」：标题一行加粗、正文换行显示且放宽长度上限。
+   * 通知文案是两段结构（如「Trae 签到启动失败」+ 具体错误），
+   * 用普通台词的单段截断会把错误原因吃掉，用户只看到一句"失败了"。
+   */
+  title?: string;
 };
 
 /** 气泡正文上限：模型偶尔会啰嗦（甚至把思考写进正文），超长直接截断，别把气泡撑爆 */
 const MAX_TEXT = 80;
 /** 对话答复的正文上限（见 `long` 说明） */
 const MAX_TEXT_LONG = 200;
+/**
+ * 通知正文上限。
+ *
+ * 通知里常带错误原文（HTTP 状态、堆栈摘要），截太短用户只知道"失败了"却不知道为什么。
+ * 但气泡贴在头顶、空间有限，仍要封顶——再长的完整内容本来也该去日志看。
+ */
+const MAX_TEXT_NOTICE = 240;
 /** 思考小字上限：只给个"它在想什么"的感觉，不占满整个气泡 */
 const MAX_THINK = 60;
 
@@ -59,7 +74,7 @@ function worthShowingThink(s: string): boolean {
   return cjk >= 4;
 }
 
-export default function PetBubble({ seq, text, onDone, streaming, thinking, long, hint }: Props) {
+export default function PetBubble({ seq, text, onDone, streaming, thinking, long, hint, title }: Props) {
   // 用 ref 读最终文本长度：避免 text 逐字变化时反复重启计时器
   const lenRef = useRef(0);
   lenRef.current = text.length;
@@ -84,15 +99,28 @@ export default function PetBubble({ seq, text, onDone, streaming, thinking, long
 
   useEffect(() => {
     if (streaming) return; // 流式中：不挂计时器，等流结束
+    // 通知由 Rust 侧统一定时（holdMs），这里再挂一个计时器会两处抢着清空：
+    // 先到点的一方生效，后到的那个回调还会把**新**通知误清掉（seq 已变）
+    if (title) return;
     const extra = Math.min(5200, lenRef.current * 60);
     const timer = window.setTimeout(onDone, 3800 + extra);
     return () => window.clearTimeout(timer);
-  }, [seq, streaming, onDone]);
+  }, [seq, streaming, onDone, title]);
 
-  const body = text ? clip(text, long ? MAX_TEXT_LONG : MAX_TEXT) : '';
+  const body = text ? clip(text, title ? MAX_TEXT_NOTICE : long ? MAX_TEXT_LONG : MAX_TEXT) : '';
   // 正文一旦开吐就收起思考：模型常在 thinking 里复述人设与要求，和真话并排显示很出戏
   const think =
     !body && thinking && worthShowingThink(thinking) ? clip(thinking, MAX_THINK) : '';
+
+  // 通知样式：标题 + 正文两段，不走「在想…」占位逻辑
+  if (title) {
+    return (
+      <div key={seq} className="pet-bubble pet-bubble-notice" role="status">
+        <div className="pet-bubble-notice-title">{clip(title, 40)}</div>
+        {body ? <div className="pet-bubble-notice-body">{body}</div> : null}
+      </div>
+    );
+  }
 
   return (
     <div key={seq} className={`pet-bubble${long ? ' pet-bubble-long' : ''}`} role="status">

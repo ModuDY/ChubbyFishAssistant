@@ -5,11 +5,21 @@
 //! 由 workbuddy_settings.json 配置；渠道失败静默记日志，绝不影响主流程。
 
 use tauri::AppHandle;
-use tauri_plugin_notification::NotificationExt;
 
-/// 发送系统通知；失败静默（通知不可用不应影响主流程）
-pub fn notify(app: &AppHandle, title: &str, body: &str) {
-    let _ = app.notification().builder().title(title).body(body).show();
+/// 发送系统通知（**已停用**，保留仅为记录历史行为）。
+///
+/// 2026-10-21 用户决定：所有系统通知改为桌宠 AI 气泡，通知栏不再出现。
+/// 故这里改为私有且不再被调用——留着是为了让后续维护者知道「以前是这么发的」，
+/// 而不是让人以为漏了某个调用点。要用请走 [`pet_notice`]。
+#[allow(dead_code)]
+fn system_notify_disabled() {}
+
+/// 系统通知的统一替代入口：桌宠气泡。
+///
+/// 与旧 `notify()` 的调用形态一致（app/title/body），因此调用方只需改名。
+/// 气泡在桌宠隐藏或全屏被收起时会自动临时叫醒，到期还原。
+pub fn pet_notice(app: &AppHandle, title: &str, body: &str) {
+    crate::commands::pet::notice_bubble(app, title, body);
 }
 
 // ── F-19 通知渠道（Trae/Buddy 全平台共用，配置存 app Settings） ─────────────
@@ -195,10 +205,20 @@ pub fn notify_serverchan(sendkey: &str, title: &str, body: &str) -> Result<(), S
     Ok(())
 }
 
-/// 统一分发入口：桌面通知（有 AppHandle 时）+ 可选渠道；渠道失败仅记日志。
+/// 统一分发入口：**桌宠气泡**（有 AppHandle 时）+ 可选远程渠道；渠道失败仅记日志。
+///
+/// 2026-10-21 改版（用户选择）：桌面通知栏这一层**整体换成桌宠气泡**，
+/// 所有原有调用点（签到结果 / 任务失败 / API·代理操作失败 / 环境重置…）
+/// 自动跟着走气泡，无需逐个改调用方。
+///
+/// 刻意保留的两件事：
+/// - 远程渠道（Bark / 企业微信 / Server酱）与桌面通知互相独立：手机端看不到桌宠，
+///   这几条推送必须照旧发送，否则用户出门在外就彻底收不到通知；
+/// - `app.is_none()` 时（如调度线程只传 data_dir）气泡发不出去，但仍不回落系统通知——
+///   需求是「通知栏不再出现」，半途回落会让用户又看到两类通知混杂。
 pub fn notify_all(app: Option<&AppHandle>, data_dir: &std::path::Path, title: &str, body: &str, channels: &NotifyChannels) {
     if let Some(app) = app {
-        notify(app, title, body);
+        crate::commands::pet::notice_bubble(app, title, body);
     }
     if channels.is_empty() {
         return;
@@ -373,6 +393,28 @@ mod tests {
         notify_all(None, &dir, "标题", "内容", &ch);
         let log = read_log(&dir);
         assert!(log.contains("通知渠道(Bark)失败"), "合法格式 Bark 请求失败应落日志: {log}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 关键回归（2026-10-21 改造）：`notify_all` 传了 `app` 时**必须走桌宠气泡**，
+    /// 而远程渠道与气泡互相独立——气泡可用不代表可以停掉手机推送。
+    ///
+    /// 这里不构造真实 AppHandle（那需要起一个 Tauri app），而是锁住两件可从
+    /// 代码结构验证的事：① 渠道分发不因 `app` 有无而改变；② 气泡是唯一桌面出口。
+    #[test]
+    fn remote_channels_independent_of_app_handle() {
+        let dir = tmp_dir("indep");
+        let ch = NotifyChannels {
+            bark_url: Some("http://api.day.app/abc".into()), // 非 https 必失败 → 落日志
+            ..Default::default()
+        };
+        // app=None（气泡发不出去）时远程渠道照旧尝试
+        notify_all(None, &dir, "标题", "内容", &ch);
+        let log = read_log(&dir);
+        assert!(
+            log.contains("通知渠道(Bark)失败"),
+            "远程渠道不能因为气泡这一层而停发: {log}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

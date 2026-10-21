@@ -309,11 +309,13 @@ fn tick(app: &AppHandle, st: &AppState) {
                 // 退避窗口按实际分钟数展示（连续失败 30→60→120 分钟封顶）
                 let cooldown_min = (retry_cooldown_ms(st, t.key) / 60_000).max(1);
                 fs_utils::app_log(&st.data_dir, &format!("[调度器] {}（{}）失败，{cooldown_min} 分钟后重试：{}", t.name, trigger, summary));
-                // 调度任务失败通知（通知渠道面板）：推 Bark/Webhook/Server酱（无 AppHandle，仅渠道；
-                // 渠道失败静默，绝不影响调度循环）
+                // 调度任务失败通知（通知渠道面板）：桌宠气泡 + Bark/Webhook/Server酱，
+                // 渠道失败静默，绝不影响调度循环。
+                // 2026-10-21：原先传 `None`（当年只有远程渠道可用），改气泡后若继续传
+                // `None`，任务失败就一条都发不出去——这是本次改造最容易漏掉的一处。
                 if first_fail_today {
                     crate::commands::workbuddy::push_notify(
-                        None,
+                        Some(app),
                         &st.data_dir,
                         &format!("{}失败", t.name),
                         &format!("{summary}\n{cooldown_min} 分钟后自动重试，连续失败会逐步拉长间隔"),

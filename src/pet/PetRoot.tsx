@@ -93,6 +93,16 @@ const MENU_W = 216;
 /** 首帧高度估值：仅用于「实测完成前」的第一次落位，随后由真实 rect 校正 */
 const MENU_H_FALLBACK = 320;
 
+/**
+ * 系统通知气泡载荷（Rust `commands/pet.rs::notice_bubble` 发出）。
+ * `holdMs` 由 Rust 下发而不是前端硬编码：两处各写一份时长必然漂移。
+ */
+type NoticePayload = {
+  title?: string;
+  body?: string;
+  holdMs?: number;
+};
+
 type PetUpdatePayload = {
   visible?: boolean;
   bubble?: boolean;
@@ -158,6 +168,18 @@ export default function PetRoot() {
   const [idleTick, setIdleTick] = useState(0);
   const [playKey, setPlayKey] = useState(0);
   const [bubble, setBubble] = useState<{ seq: number; text: string } | null>(null);
+  /**
+   * 系统通知气泡（2026-10-21：通知栏整体改为桌宠气泡）。
+   *
+   * 与普通台词气泡分开存：通知有标题 + 正文两段、停留更久，
+   * 且**优先级最高**——签到失败这类结果不能被"随机台词"顶掉。
+   */
+  const [notice, setNotice] = useState<{
+    seq: number;
+    title: string;
+    body: string;
+    holdMs: number;
+  } | null>(null);
   /** AI 气泡结束的时刻：之后 1.5s 内不再弹普通播报气泡，避免画面"一跳" */
   const [sayEndAt, setSayEndAt] = useState(0);
   /**
@@ -209,6 +231,8 @@ export default function PetRoot() {
 
   const seqRef = useRef(0);
   const bubbleSeqRef = useRef(0);
+  /** 通知气泡序号：同一条通知重复到达、或新通知替换旧通知时用于判定 */
+  const noticeSeqRef = useRef(0);
   const lastEventRef = useRef(Date.now());
   const lastLineRef = useRef<string | undefined>(undefined);
   const sadTimerRef = useRef<number | null>(null);
@@ -597,6 +621,27 @@ export default function PetRoot() {
     }).then((un) => {
       if (disposed) un();
       else unlisten = un;
+    });
+
+    // 系统通知 → 气泡（Rust notice_bubble 发出；隐藏时已先叫醒窗口）
+    void listen<NoticePayload>('pet-notice', (event) => {
+      if (disposed) return;
+      const p = event.payload;
+      if (!p?.title && !p?.body) return;
+      noticeSeqRef.current += 1;
+      const seq = noticeSeqRef.current;
+      setNotice({
+        seq,
+        title: p.title ?? '',
+        body: p.body ?? '',
+        holdMs: typeof p.holdMs === 'number' && p.holdMs > 0 ? p.holdMs : 8000,
+      });
+      // 到点自动消失：用 seq 判定是否已被后来的通知替换，避免把新通知提前清掉
+      window.setTimeout(() => {
+        setNotice((cur) => (cur && cur.seq === seq ? null : cur));
+      }, typeof p.holdMs === 'number' && p.holdMs > 0 ? p.holdMs : 8000);
+    }).then((un) => {
+      if (disposed) un();
     });
 
     // 页面变隐藏时补暂停；变可见时**仅当窗口真在显示**才解除暂停
@@ -1339,7 +1384,19 @@ export default function PetRoot() {
         </div>
       ) : null}
       {/* 气泡锚点：底边贴在角色头顶上方，而不是窗口顶部 */}
-      {bubbleEnabled && say ? (
+      {notice ? (
+        // 通知优先级最高：签到失败这类结果不能被随机台词或 AI 闲聊顶掉。
+        // 不受 bubbleEnabled 约束——关掉「日常台词气泡」的用户仍需要看到操作结果，
+        // 否则关掉气泡就等于关掉全部通知（通知栏已经不再出现了）。
+        <div className="pet-bubble-anchor" style={{ bottom: bubbleBottom }}>
+          <PetBubble
+            seq={notice.seq}
+            title={notice.title}
+            text={notice.body}
+            onDone={() => setNotice(null)}
+          />
+        </div>
+      ) : bubbleEnabled && say ? (
         // AI 发言优先：流式中文本随 delta 增长（打字机），流结束后按长度延时消失
         <div className="pet-bubble-anchor" style={{ bottom: sayBubbleBottom }}>
           <PetBubble

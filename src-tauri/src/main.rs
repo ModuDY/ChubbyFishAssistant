@@ -639,7 +639,7 @@ fn main() {
                                             &st.data_dir,
                                             &format!("托盘 Trae 签到失败: {e}"),
                                         );
-                                        notify::notify(&app2, "Trae 签到启动失败", &e);
+                                        notify::pet_notice(&app2, "Trae 签到启动失败", &e);
                                     }
                                     commands::workbuddy::tray_checkin_all(&app2, &st);
                                 });
@@ -670,7 +670,7 @@ fn main() {
                                         &st.data_dir,
                                         &format!("托盘 API 服务操作失败: {e}"),
                                     );
-                                    notify::notify(app, "API 服务操作失败", &e);
+                                    notify::pet_notice(app, "API 服务操作失败", &e);
                                 }
                             }
                             "proxy-toggle" => {
@@ -704,7 +704,7 @@ fn main() {
                                         &st.data_dir,
                                         &format!("托盘代理操作失败: {e}"),
                                     );
-                                    notify::notify(app, "代理操作失败", &e);
+                                    notify::pet_notice(app, "代理操作失败", &e);
                                 }
                             }
                             "quit" => {
@@ -756,7 +756,7 @@ fn main() {
                     };
                     if let Err(e) = commands::checkin::start_checkin_core(&app2, &st, opts, true) {
                         fs_utils::app_log(&st.data_dir, &format!("静默签到失败: {e}"));
-                        notify::notify(&app2, "静默签到失败", &e);
+                        notify::pet_notice(&app2, "静默签到失败", &e);
                     }
                 });
             }

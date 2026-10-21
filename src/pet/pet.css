@@ -124,6 +124,30 @@ body.pet-window {
   line-height: 1.6;
 }
 
+/* 通知气泡（系统通知转气泡）：标题 + 正文两段。
+   与台词气泡的区别够用即可，整体视觉统一留到「气泡样式优化」那一轮统一调。 */
+.pet-bubble-notice {
+  max-width: min(258px, calc(100% - 16px));
+  max-height: 190px;
+  text-align: left;
+  font-size: 11.5px;
+  line-height: 1.6;
+  padding: 7px 11px;
+}
+
+.pet-bubble-notice-title {
+  font-weight: 600;
+  font-size: 11.5px;
+  margin-bottom: 2px;
+  color: #0f172a;
+}
+
+.pet-bubble-notice-body {
+  color: #334155;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* 思考链小字（P3 碎碎念）：弱化展示，不喧宾夺主 */
 .pet-bubble-think {
   margin-bottom: 4px;
