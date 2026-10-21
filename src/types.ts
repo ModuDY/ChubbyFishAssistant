@@ -495,6 +495,10 @@ export interface Settings {
   pet_ai_mode?: PetAiMode | null;
   /** 桌宠对话专用模型（null/空 = 跟随网关默认模型）；挑 flash 档可以明显缩短首字等待 */
   pet_ai_model?: string | null;
+  /** 桌宠联网查实时信息（当前支持天气；null = 开） */
+  pet_online?: boolean | null;
+  /** 问天气用的城市（null/空 = 按出口 IP 自动定位，可能不准） */
+  pet_weather_city?: string | null;
   /** 无事件进入打盹态的分钟数（null = 5） */
   pet_sleep_minutes?: number | null;
   /** 素材包（P4 预留） */

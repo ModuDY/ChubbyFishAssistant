@@ -4,8 +4,8 @@
 //! learn-the-design 不抄码）。客户端（Codex /v1/responses）声明 `type:"web_search"`
 //! 等上游不支持的工具时：
 //! 1. 代理向 chat body 注入同义 function 工具（web_search / open_url）+ system 提示；
-//! 2. 上游模型发起 function 调用 → 代理本地执行（DuckDuckGo HTML 搜索 / 页面抓取
-//!    剥离，零新增依赖，ureq 已有）；
+//! 2. 上游模型发起 function 调用 → 代理本地执行（**Bing HTML 搜索，DDG 回退** /
+//!    页面抓取剥离，零新增依赖，ureq 已有）；
 //! 3. 结果以 tool 消息回喂上游继续，直至最终回复（上限 MAX_ROUNDS 轮防积分失控）；
 //! 4. 响应投影：历史调用轮以原生 `web_search_call` 输出项返回（Responses 协议），
 //!    最终回复按既有 completion_to_responses 投影。
@@ -279,12 +279,63 @@ fn read_body_limited(resp: ureq::Response) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&buf).to_string())
 }
 
-/// DuckDuckGo HTML 搜索（lite 端点；单发不重试，失败明示）
+/// 联网搜索：**Bing 优先，DuckDuckGo 回退**（单次请求内串行，不重试单源）。
+///
+/// 为什么换主源（2026-10-21 实测）：DuckDuckGo 的 html/lite 两个端点在
+/// 国内网络环境下均 **连接超时**（本机 8s 超时未握手），即原实现实际不可用——
+/// Codex 等客户端声明 web_search 后只会拿到「搜索请求失败」。
+/// Bing 可达（200 / ~100KB / 稳定 10 条结果），且结果块结构稳定：
+/// `<li class="b_algo"> … <h2><a href=…>标题</a></h2> … <p class="b_lineclamp2">摘要`。
+///
+/// 保留 DDG 回退的原因：Bing 对高频抓取可能返回验证页（无 b_algo 块）；
+/// 而 DDG 在能连通的环境（海外/代理）质量更好。两个都失败才明示失败。
 fn web_search(query: &str) -> Result<String, String> {
-    let url = format!("https://html.duckduckgo.com/html/?q={}", url_encode(query));
+    let mut errors: Vec<String> = Vec::new();
+
+    match search_bing(query) {
+        Ok(results) if !results.is_empty() => return format_results(&results),
+        Ok(_) => errors.push("Bing 无结果".into()),
+        Err(e) => errors.push(format!("Bing: {e}")),
+    }
+
+    match search_ddg(query) {
+        Ok(results) if !results.is_empty() => return format_results(&results),
+        Ok(_) => errors.push("DuckDuckGo 无结果".into()),
+        Err(e) => errors.push(format!("DuckDuckGo: {e}")),
+    }
+
+    Err(format!(
+        "搜索不可用（{}）。可稍后重试，或直接回答已知信息",
+        errors.join("；")
+    ))
+}
+
+/// 统一搜索结果输出格式（供上游模型阅读）
+fn format_results(results: &[(String, String, String)]) -> Result<String, String> {
+    if results.is_empty() {
+        return Err("搜索无结果".into());
+    }
+    let mut out = String::new();
+    for (i, (title, url, snippet)) in results.iter().take(SEARCH_RESULTS_LIMIT).enumerate() {
+        out.push_str(&format!("{}. {}\n   {}\n   {}\n\n", i + 1, title, url, snippet));
+    }
+    Ok(out)
+}
+
+/// Bing 搜索（HTML 版；单发不重试）
+fn search_bing(query: &str) -> Result<Vec<(String, String, String)>, String> {
+    // 必须用 **cn.bing.com**：`www.bing.com` 在国内返回 302「Object moved」
+    // （2026-10-21 实测，body 仅 200 字节），而本函数为了 SSRF 防护用
+    // `redirects(0)` 不跟随跳转，等于每次都只拿到空壳页。
+    // cn.bing.com 直返 200 / ~100KB / 11 个 b_algo 块。
+    //
+    // `setlang=zh-CN` + `cc=CN`：中文结果优先，与用户语言一致
+    let url = format!(
+        "https://cn.bing.com/search?q={}&setlang=zh-CN&cc=CN",
+        url_encode(query)
+    );
     url_allowed(&url)?;
-    // 审查修复（SSRF 补强）：与 open_url 同款 redirects(0)——DDG 的 302 可被引导至内网
-    // 地址（盲探测面）；html 端点正常直返 200，若 302 则 fail-closed 明示失败
+    // redirects(0) 与 open_url 同款（SSRF 补强）：302 可被引导至内网盲探测面
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(8))
         .timeout(std::time::Duration::from_secs(15))
@@ -292,20 +343,162 @@ fn web_search(query: &str) -> Result<String, String> {
         .build();
     let resp = agent
         .get(&url)
-        .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .set("User-Agent", BROWSE_UA)
         .set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
         .call()
-        .map_err(|e| format!("搜索请求失败: {e}"))?;
+        .map_err(|e| format!("{e}"))?;
+    let html = read_body_limited(resp)?;
+    let results = parse_bing_results(&html);
+    if results.is_empty() {
+        // 验证页/限流的典型表现是「页面正常但无结果块」，此处无法与「真的没结果」区分
+        return Err("无结果块（可能触发人机验证）".into());
+    }
+    Ok(results)
+}
+
+/// DuckDuckGo HTML 搜索（海外/代理环境可用；单发不重试）
+fn search_ddg(query: &str) -> Result<Vec<(String, String, String)>, String> {
+    let url = format!("https://html.duckduckgo.com/html/?q={}", url_encode(query));
+    url_allowed(&url)?;
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(8))
+        .timeout(std::time::Duration::from_secs(15))
+        .redirects(0)
+        .build();
+    let resp = agent
+        .get(&url)
+        .set("User-Agent", BROWSE_UA)
+        .set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .call()
+        .map_err(|e| format!("{e}"))?;
     let html = read_body_limited(resp)?;
     let results = parse_ddg_results(&html);
     if results.is_empty() {
-        return Err("搜索无结果（上游可能限流，可稍后重试）".into());
+        return Err("无结果（可能限流）".into());
     }
-    let mut out = String::new();
-    for (i, (title, url, snippet)) in results.iter().take(SEARCH_RESULTS_LIMIT).enumerate() {
-        out.push_str(&format!("{}. {}\n   {}\n   {}\n\n", i + 1, title, url, snippet));
+    Ok(results)
+}
+
+/// 浏览器 UA：Bing 对非浏览器 UA 直接回验证页，必须伪装
+const BROWSE_UA: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36";
+
+/// 从 Bing HTML 提取 (title, url, snippet)。
+///
+/// 结构（2026-10-21 实测）：每个结果块以 `<li class="b_algo"` 开头，
+/// 内部 `<h2><a href="真实URL">标题</a></h2>`，摘要常见于
+/// `b_lineclamp*` / `b_caption` 包裹的 `<p>`。
+/// 注意：`b_algo` 之后紧跟若干 `<link rel=stylesheet>`，故必须用 `[\s\S]*?`
+/// 跨过它们再找 `h2`，且限定在同一结果块内（以 `</li>` 为界）。
+fn parse_bing_results(html: &str) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while out.len() < SEARCH_RESULTS_LIMIT {
+        let Some(rel) = html[from..].find("<li class=\"b_algo\"") else { break };
+        let block_start = from + rel;
+        // 块尾：下一个结果块或列表结束。用下一个 b_algo 作为上界更稳
+        let block_end = html[block_start + 18..]
+            .find("<li class=\"b_algo\"")
+            .map(|p| block_start + 18 + p)
+            .unwrap_or(html.len());
+        let block = &html[block_start..block_end];
+
+        // h2 内首个 <a href> 即结果链接
+        if let Some(h2pos) = block.find("<h2") {
+            let seg = &block[h2pos..];
+            if let Some(href) = extract_attr(seg, "href") {
+                // 只接受 http(s) 绝对链接：Bing 有时给 /ck/a?... 跳转串，需还原
+                let real = normalize_bing_url(&href);
+                if !real.is_empty() {
+                    let title = seg
+                        .find('>')
+                        .and_then(|p| seg[p + 1..].find("</a>").map(|e| &seg[p + 1..p + 1 + e]))
+                        .map(strip_tags)
+                        .unwrap_or_default();
+                    let snippet = extract_bing_snippet(block);
+                    if !title.is_empty() {
+                        out.push((title, real, snippet));
+                    }
+                }
+            }
+        }
+        from = block_end;
+        if block_end >= html.len() {
+            break;
+        }
     }
-    Ok(out)
+    out
+}
+
+/// 提取 Bing 摘要：优先 `b_lineclamp*`，其次 `b_caption` 内的 `<p>`
+fn extract_bing_snippet(block: &str) -> String {
+    for marker in ["b_lineclamp", "b_caption"] {
+        if let Some(p) = block.find(marker) {
+            let seg = &block[p..];
+            if let Some(lt) = seg.find("<p") {
+                let s = &seg[lt..];
+                if let Some(gt) = s.find('>') {
+                    if let Some(end) = s[gt..].find("</p>") {
+                        let text = strip_tags(&s[gt + 1..gt + end]);
+                        if !text.trim().is_empty() {
+                            return text;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// Bing 跳转链接还原：`/ck/a?...&u=a1aHR0cHM6...` 的 `u` 参数是 base64url 编码的真实 URL
+fn normalize_bing_url(href: &str) -> String {
+    let h = href.trim();
+    if h.starts_with("http://") || h.starts_with("https://") {
+        return h.to_string();
+    }
+    // 相对跳转串：形如 /ck/a?tid=1&u=a1<base64url>&rut=…
+    // `a1` 是 Bing 的格式标记（其后才是 base64url 本体），必须连标记一起跳过，
+    // 故从 `p + 4`（"u=a1" 共 4 字节）开始取编码串
+    if let Some(p) = h.find("u=a1") {
+        let raw = &h[p + 4..];
+        let end = raw.find('&').unwrap_or(raw.len());
+        let encoded = &raw[..end];
+        if let Some(decoded) = base64url_decode(encoded) {
+            if decoded.starts_with("http://") || decoded.starts_with("https://") {
+                return decoded;
+            }
+        }
+    }
+    String::new()
+}
+
+/// 极简 base64url 解码（Bing 的 `a1` 前缀后即为 base64url，不含 padding）
+fn base64url_decode(s: &str) -> Option<String> {
+    let val = |c: u8| -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        }
+    };
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits = 0u32;
+    for &c in bytes {
+        let v = val(c)?;
+        buf = (buf << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// 从 DDG HTML 提取 (title, url, snippet)：仅做字符串定位，不引 HTML 解析器
@@ -539,6 +732,83 @@ pub fn search_call_items(records: &[SearchRecord], resp_id: &str) -> Vec<Value> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bing 结果解析（2026-10-21 按真实 HTML 骨架裁剪）。
+    ///
+    /// 特意保留两个真实坑：
+    /// 1. `b_algo` 后紧跟一串 `<link rel=stylesheet>`，标题在它们之后；
+    /// 2. 摘要在 `b_lineclamp2` 包裹的 `<p>` 里，不是紧跟标题。
+    #[test]
+    fn parses_bing_results() {
+        let html = r#"
+<li class="b_algo" data-id iid=SERP.1>
+  <link rel="stylesheet" href="/rp/a.css"/>
+  <link rel="stylesheet" href="/rp/b.css"/>
+  <h2><a href="https://www.tianqi.com/beijing/today/" h="ID=SERP,1">【北京今天天气预报】北京天气</a></h2>
+  <div class="b_caption"><p class="b_lineclamp2">北京今天晴，最高 36℃。</p></div>
+</li>
+<li class="b_algo" data-id iid=SERP.2>
+  <h2><a href="https://www.weather.com.cn/weather/101010100.shtml">北京天气预报</a></h2>
+  <div class="b_caption"><p class="b_lineclamp3">7 天预报。</p></div>
+</li>
+"#;
+        let r = parse_bing_results(html);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].0, "【北京今天天气预报】北京天气");
+        assert_eq!(r[0].1, "https://www.tianqi.com/beijing/today/");
+        assert_eq!(r[0].2, "北京今天晴，最高 36℃。");
+        assert_eq!(r[1].1, "https://www.weather.com.cn/weather/101010100.shtml");
+        assert_eq!(r[1].2, "7 天预报。");
+    }
+
+    /// 验证页（无结果块）必须返回空而不是 panic 或脏数据
+    #[test]
+    fn bing_verify_page_yields_nothing() {
+        let html = "<html><body><form id=\"captcha\">请验证你是人类</form></body></html>";
+        assert!(parse_bing_results(html).is_empty());
+        assert!(parse_bing_results("").is_empty());
+    }
+
+    /// Bing 跳转链接还原：/ck/a?...&u=a1<base64url> 应解出真实 URL
+    #[test]
+    fn decodes_bing_redirect_url() {
+        // "a1" 之后为 base64url("https://example.com/x")
+        let real = "https://example.com/x";
+        let encoded = base64url_encode_for_test(real.as_bytes());
+        let href = format!("/ck/a?tid=1&u=a1{encoded}&rut=abc");
+        assert_eq!(normalize_bing_url(&href), real);
+        // 绝对链接原样返回
+        assert_eq!(normalize_bing_url("https://a.b/c"), "https://a.b/c");
+        // 无法还原的返回空串（宁可丢弃这条，也不给模型一个假链接）
+        assert_eq!(normalize_bing_url("/ck/a?tid=1"), "");
+    }
+
+    /// 真实联网：验证 Bing 主源在国内网络下确实可达并能解析出结果。
+    ///
+    /// 这是本次换源的核心证据——旧源 DDG 在此环境超时，必须实测才能确认修复有效。
+    /// 跑法：cargo test -- --ignored live_search
+    #[test]
+    #[ignore = "需要外网；手动执行验证真实可达性"]
+    fn live_search_returns_results() {
+        let out = web_search("北京今天天气").expect("搜索应成功（Bing 或 DDG 任一可达）");
+        println!("[live] 搜索结果前 300 字：\n{}", out.chars().take(300).collect::<String>());
+        assert!(out.contains("1."), "应有编号结果：{}", out);
+        assert!(out.len() > 40, "结果内容过短");
+    }
+
+    fn base64url_encode_for_test(data: &[u8]) -> String {
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = String::new();
+        for chunk in data.chunks(3) {
+            let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+            let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+            let chars = (chunk.len() * 8 + 5) / 6;
+            for i in 0..chars {
+                out.push(T[((n >> (18 - i * 6)) & 0x3F) as usize] as char);
+            }
+        }
+        out
+    }
 
     #[test]
     fn detects_web_search_tools() {

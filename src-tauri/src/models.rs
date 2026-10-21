@@ -401,6 +401,19 @@ pub struct Settings {
     /// 「一句话快点出来」，用户可在此固定 flash 档模型而不影响其它客户端。
     #[serde(default)]
     pub pet_ai_model: Option<String>,
+    /// 桌宠联网：允许对话时查实时信息（当前支持天气）。None = 开。
+    ///
+    /// 之所以默认开：用户在大肥鱼里问「今天天气怎么样」是很自然的期待，
+    /// 答不出来会显得这功能是残的。联网只走本地直连的公开数据源
+    /// （wttr.in，无需 key），不把用户对话内容发给任何搜索厂商。
+    #[serde(default)]
+    pub pet_online: Option<bool>,
+    /// 桌宠问天气时用的城市（None/空 = 由数据源按出口 IP 自动定位）。
+    ///
+    /// 自动定位并不可靠：实测本机出口 IP 在东莞，wttr.in 自己的定位库
+    /// 却给出郑州。所以用户显式填了就用它，比自动定位准得多。
+    #[serde(default)]
+    pub pet_weather_city: Option<String>,
     /// 多久无业务事件进入打盹态（分钟；None = 5）
     #[serde(default)]
     pub pet_sleep_minutes: Option<u32>,

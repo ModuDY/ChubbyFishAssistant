@@ -1070,6 +1070,19 @@ fn chat_system_prompt(persona: Option<&str>) -> String {
     )
 }
 
+/// 联网补充说明（P8）：仅当本轮真的查到了实时数据时追加。
+///
+/// 为什么必须单独说明：原 prompt 末句写着「不编造没给过你的数据」，
+/// 查到的天气是**刚给它的**，但模型不知道这一点时会保守地拒答或含糊其辞
+/// （「我查不到实时天气」）——用户看到的就是「明明联网了还说不知道」。
+/// 这段把「这份数据是本轮刚查的、可以放心用」讲清楚，同时要求别装作自己
+/// 有实时感知（避免「我刚出门看了一眼」这类编造）。
+fn online_note_prompt() -> String {
+    "\n下面是系统刚刚替你查到的实时数据，可以直接采信并用来回答，不必说查不到；\
+说的时候用你自己的口吻讲，不要复述数据格式，也不要谎称是你亲自出门看到的。"
+        .to_string()
+}
+
 /// 历史消息（Rust 侧接收前端的多轮上下文）。
 #[derive(serde::Deserialize)]
 pub struct PetSayTurn {
@@ -1369,15 +1382,69 @@ pub async fn pet_say(
     }
     say_count_bump(&st.data_dir);
 
+    // 联网补充（P8，2026-10-21）：对话里问到天气时先查实时数据，再喂给模型。
+    //
+    // 为什么在**进模型之前**查、而不是让模型自己调工具：
+    // 1. 桌宠走的是 chat/completions 直连，没有工具循环编排；
+    // 2. 让模型先决定要不要查，会多一轮往返（几秒），桌宠要的是「一句话快点出来」；
+    // 3. 天气意图用关键词判定足够可靠（`looks_like_weather_query` 保守表），
+    //    误判的代价只是多查一次公开天气接口，不影响语义。
+    //
+    // 为什么查失败不阻断对话：联网是锦上添花，查不到就让模型说「我查不到」，
+    // 总比整轮报错、用户啥也听不到好。失败原因只写日志。
+    let online = settings.pet_online.unwrap_or(true);
+    // 只在与天气相关的问句上联网：别的闲聊不必花时间查、也不该把
+    // 「今天好热」这种感叹当成查询请求
+    let weather_intent =
+        is_chat && online && crate::api_server::weather::looks_like_weather_query(&prompt);
+    let weather_note = if weather_intent {
+        // ureq 是阻塞调用，必须离开 async 线程（否则卡住整个运行时）
+        let city = settings.pet_weather_city.clone().unwrap_or_default();
+        let asked = prompt.clone();
+        let out = tauri::async_runtime::spawn_blocking(move || {
+            // 优先用问题里点名的城市；没点名才用设置项
+            let target = crate::api_server::weather::extract_city(&asked)
+                .filter(|c| !c.is_empty())
+                .unwrap_or(city);
+            crate::api_server::weather::query(&target)
+        })
+        .await;
+        match out {
+            Ok(Ok(r)) => Some(r.for_prompt()),
+            Ok(Err(e)) => {
+                eprintln!("[pet] 天气查询失败: {e}");
+                None
+            }
+            Err(e) => {
+                eprintln!("[pet] 天气查询任务失败: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // 组装请求体。
     // 对话档：system(chat) + 历史若干条 + 本轮 user；独白档：system(monologue) + 单条 user。
-    let mut messages: Vec<serde_json::Value> = Vec::with_capacity(PET_CHAT_MAX_TURNS + 2);
-    let system = if is_chat {
+    let mut messages: Vec<serde_json::Value> = Vec::with_capacity(PET_CHAT_MAX_TURNS + 3);
+    let mut system = if is_chat {
         chat_system_prompt(settings.pet_persona.as_deref())
     } else {
         persona_system_prompt(settings.pet_persona.as_deref())
     };
+    // 只有真查到数据时才补这段说明（见 online_note_prompt 的注释）
+    if weather_note.is_some() {
+        system.push_str(&online_note_prompt());
+    }
     messages.push(serde_json::json!({ "role": "system", "content": system }));
+
+    // 实时数据作为**独立 system 消息**而非拼进 user：
+    // 拼进 user 会让模型以为这是用户说的话（「用户刚刚告诉我东莞34度」），
+    // 在人格化回复里容易变成复述用户；
+    // 也没塞进历史末尾——历史由前端的对话记录派生，混入数据会污染多轮上下文。
+    if let Some(note) = &weather_note {
+        messages.push(serde_json::json!({ "role": "system", "content": note }));
+    }
 
     if is_chat {
         for t in sanitize_turns(history.unwrap_or_default()) {

@@ -571,6 +571,35 @@ export default function GeneralSettingsPanel() {
               </p>
             </div>
             <div>
+              <label className="label">联网查天气</label>
+              <select
+                value={(form.pet_online ?? true) ? 'on' : 'off'}
+                onChange={(e) => update('pet_online', e.target.value === 'on')}
+                className="input w-40"
+              >
+                <option value="on">开启</option>
+                <option value="off">关闭</option>
+              </select>
+              <p className="text-xs text-slate-400 mt-1">
+                问天气时会实时查一次公开数据源（wttr.in，无需账号），
+                把结果交给模型再回答。只在这个话题上联网，别的闲聊不会发出请求。
+              </p>
+            </div>
+            <div>
+              <label className="label">所在城市</label>
+              <input
+                type="text"
+                value={form.pet_weather_city ?? ''}
+                onChange={(e) => update('pet_weather_city', e.target.value || null)}
+                placeholder="如 东莞 / Dongguan，留空按 IP 自动定位"
+                className="input w-56"
+              />
+              <p className="text-xs text-slate-400 mt-1">
+                建议填上。自动定位依赖出口 IP，走代理或被运营商 NAT 时会定位到别的城市
+                （实测本机出口在东莞，数据源却报郑州）。
+              </p>
+            </div>
+            <div>
               <label className="label">形象（素材包）</label>
               <select
                 value={form.pet_pack ?? 'builtin'}

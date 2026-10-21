@@ -37,6 +37,8 @@ pub mod wb_sse;
 pub mod wb_sticky;
 pub mod wb_toolexec;
 pub mod wb_upstream;
+/// 天气查询（桌宠对话 + 网关工具代执行共用同一数据源与口径）
+pub mod weather;
 
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
