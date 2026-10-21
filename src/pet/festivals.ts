@@ -85,6 +85,41 @@ export type FestivalPlan = {
   actions: string[];
 };
 
+/**
+ * 全部节日可能播到的动作（覆盖率审计用）。
+ *
+ * 注意语义：这里是「**某一天**命中某节日时可能出现的候选」的并集，
+ * 不是「同一天全都会播」——`nextFestivalAction` 按天轮播，一天最多播完当天的候选。
+ * key 直接从 `LUNAR_META` 取，避免另维护一份清单导致漂移。
+ */
+export const ALL_FESTIVAL_ACTIONS: string[] = [
+  ...SOLAR_RULES.flatMap((r) => r.actions),
+  ...Object.values(LUNAR_META).flatMap((m) => m.actions),
+];
+
+/**
+ * 节日当天该播哪个动作（**轮播**，2026-10-20）。
+ *
+ * 原实现只取 `actions.find(有素材)`——春节 5 个候选里 4 个「收红包 / 吃年糕 / 写福字 /
+ * 舞狮头」永远不播，19 个节日动作里有 10 个因此吃灰。
+ *
+ * 现在改成：当天每次轮到节日就播**下一个还没播过的**候选，一天之内把
+ * `actions` 逐个轮完（春节当天能看到放烟花 → 收红包 → 吃年糕 → 写福字 → 舞狮头），
+ * 播完最后一支就停（`festivalFiredRef` 记满即视为当天收工，不再打扰）。
+ *
+ * @param actions 候选动作 id（已按优先序）
+ * @param used    当天已播过的动作 id
+ * @param hasAsset 素材存在性判定（默认全部存在；由调用方注入 `ACTIONS[id]?.url` 校验）
+ * @returns 下一个要播的动作；全部播完返回 null
+ */
+export function nextFestivalAction(
+  actions: string[],
+  used: string[] = [],
+  hasAsset: (id: string) => boolean = () => true,
+): string | null {
+  return actions.find((id) => hasAsset(id) && !used.includes(id)) ?? null;
+}
+
 /** 本地日期键（用本地时区，避免 UTC 偏移导致「节日错一天」） */
 export function localDateKey(d: Date): string {
   const y = d.getFullYear();

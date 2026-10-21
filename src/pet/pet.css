@@ -107,6 +107,17 @@ body.pet-window {
   animation: pet-bubble-in 0.18s ease-out;
 }
 
+/* 长答复气泡（P7 对话）：放宽限高与宽度。
+   独白档的 230px / 132px 是为"一句话"调的，对话答复会成段，
+   沿用会把文字挤成很窄的一条并很快被裁掉。左对齐更适合成段阅读。 */
+.pet-bubble-long {
+  max-width: 258px;
+  max-height: 190px;
+  text-align: left;
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
 /* 思考链小字（P3 碎碎念）：弱化展示，不喧宾夺主 */
 .pet-bubble-think {
   margin-bottom: 4px;
@@ -141,6 +152,80 @@ body.pet-window {
     opacity: 1;
     transform: translateY(0) scale(1);
   }
+}
+
+/* ---- P7 内联对话输入条 ----
+   贴在角色头顶上方，与气泡同级但更高一层（气泡在 z-index:2，这里 z-index:3）。
+   必须 pointer-events:auto —— 否则窗口根节点的 none 会让它收不到指针事件。 */
+/* 锚点：只负责定位（bottom 由 PetRoot 注入），本身不接收指针事件，
+   事件交给内部 .pet-chat —— 这样锚点不占额外的可点击面积 */
+.pet-chat-anchor {
+  position: absolute;
+  left: 8px;
+  /* 与气泡同口径：右侧扣掉菜单留白，才能居中在角色上方而不是整窗中心 */
+  right: calc(8px + var(--pet-menu-space));
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+  z-index: 3;
+}
+
+.pet-chat {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  pointer-events: auto;
+  animation: pet-bubble-in 0.14s ease-out;
+}
+
+.pet-chat-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  /* 角色舞台只有 300px，输入条不能占满：留出两侧呼吸空间 */
+  max-width: 230px;
+  padding: 6px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.55);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.97);
+  color: #1f2937;
+  font-family: system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  font-size: 12px;
+  line-height: 1.5;
+  outline: none;
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.18);
+}
+
+.pet-chat-input::placeholder {
+  color: #94a3b8;
+}
+
+/* 聚焦时给一圈细描边：透明窗口里没有系统焦点框，用户需要"看得见正在输入" */
+.pet-chat-input:focus {
+  border-color: rgba(59, 130, 246, 0.85);
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.22), 0 4px 14px rgba(15, 23, 42, 0.18);
+}
+
+.pet-chat-send {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 10px;
+  background: rgba(59, 130, 246, 0.92);
+  color: #fff;
+  font-size: 12px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.pet-chat-send:hover:not(:disabled) {
+  background: rgba(37, 99, 235, 0.95);
+}
+
+.pet-chat-send:disabled {
+  background: rgba(148, 163, 184, 0.55);
+  cursor: default;
 }
 
 /* ---- 右键菜单（无边框窗口自绘，替代系统菜单） ---- */

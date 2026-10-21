@@ -12,8 +12,11 @@
  * - `happy` / `rich` / `broke` 是**瞬态**（一次性播完就回落），不参与优先级竞争，
  *   因为它们表达"刚刚发生了什么"，而不是"现在处于什么状态"；
  * - 同一优先级内新事件覆盖旧事件。
+ *
+ * 动作池集中在 `pools.ts`（单一事实来源），本模块只负责"该用哪个池"。
  */
 import { ACTIONS } from './actions';
+import { CORE_POOLS, TRANSIENT_POOLS, pickFromPool } from './pools';
 
 /** 参与优先级竞争的"核心态" */
 export type PetCoreState = 'idle' | 'sleepy' | 'thinking' | 'working' | 'sad';
@@ -31,30 +34,16 @@ export function raise(current: PetCoreState, next: PetCoreState): PetCoreState {
   return PRIORITY[next] >= PRIORITY[current] ? next : current;
 }
 
-/** 瞬态类型 → 动作候选（同一语义有多个素材时随机取一个，避免每次都一样） */
-const TRANSIENT_ACTIONS: Record<PetTransientKind, string[]> = {
-  happy: ['work-celebrate', 'click-happy'],
-  rich: ['balance-jingle', 'balance-full', 'balance-count'],
-  broke: ['balance-broke', 'balance-empty'],
-  click: ['click-wave', 'click-happy', 'click-tickle', 'click-tsundere'],
-  // 空闲彩蛋（低频）：东张西望 / 发呆碎碎念 / 深度思考碎碎念。
-  // 上游把「深度思考碎碎念」放在 animations.categories 的「文字」随机池（weight 10）里，
-  // 不是 thinking 态专用动作，所以归 idle 随机池，而不是"working 无进度"的 mumble 池
-  idle: ['idle-look', 'mumble-daze', 'mumble-deep'],
-  // 重试等待（签到 retry）
-  pace: ['work-pace'],
-  // 批量收尾（done 混合结果时清点归档）
-  archive: ['work-archive'],
-  // 余额查询无变化
-  neutral: ['balance-normal'],
-  // 切换账号 / 切换页面
-  turn: ['turn-run'],
-  // 大额到账 / 里程碑
-  jump: ['jump-grab'],
-  // 长时间 working 但无进度（对屏碎碎念）
-  mumble: ['mumble-screen'],
-};
+/** 当前态是否高于目标态（用于判断"低优先级事件不该打断"） */
+export function isHigher(current: PetCoreState, target: PetCoreState): boolean {
+  return PRIORITY[current] > PRIORITY[target];
+}
 
+/**
+ * 瞬态语义。前 11 个是业务/时间驱动的原语义；
+ * `feed` / `play` / `perform` / `pet` / `tease` 是 2026-10-20 新增的**用户主动互动**语义，
+ * 让 106 个动作里的吃喝玩乐才艺真正被"人"点到，而不只是随机漂出来。
+ */
 export type PetTransientKind =
   | 'happy'
   | 'rich'
@@ -66,7 +55,13 @@ export type PetTransientKind =
   | 'neutral'
   | 'turn'
   | 'jump'
-  | 'mumble';
+  | 'mumble'
+  | 'feed'
+  | 'play'
+  | 'perform'
+  | 'pet'
+  | 'tease'
+  | 'festival';
 
 export type PetTransient = {
   /** 每次触发递增：同一动作连播时也能重启视频 */
@@ -80,8 +75,7 @@ export type PetTransient = {
 
 /** 按语义随机挑一个动作（供调用方先拿到 action、再查它的实测时长） */
 export function pickTransientAction(kind: PetTransientKind, override?: string): string {
-  const pool = TRANSIENT_ACTIONS[kind];
-  return override ?? pool[Math.floor(Math.random() * pool.length)];
+  return override ?? pickFromPool(TRANSIENT_POOLS[kind]) ?? 'click-wave';
 }
 
 export function makeTransient(
@@ -99,19 +93,22 @@ export function makeTransient(
   return { seq, kind, action, text, ms };
 }
 
-/** 核心态 → 动作候选；idle 用 tick 交替，避免长时间定格同一个循环动作 */
-const CORE_ACTIONS: Record<PetCoreState, string[]> = {
-  idle: ['idle-breathe', 'idle-float'],
-  sleepy: ['idle-nap'],
-  thinking: ['work-think'],
-  working: ['work-busy'],
-  sad: ['work-sad'],
-};
-
+/**
+ * 核心态 → 动作（池内按 tick 交替）。
+ *
+ * `working` 现在是 `work-busy` / `work-pace` 两个循环动作交替：签到一轮可能跑几十秒，
+ * 一直播同一段循环最容易看出是"假动画"。非 idle 态也一并走 tick，
+ * 池子长度 >1 时自动获得交替能力（改池子即可，不用改这里）。
+ */
 export function coreAction(state: PetCoreState, tick: number): string {
-  const pool = CORE_ACTIONS[state].filter((id) => ACTIONS[id]);
+  const pool = CORE_POOLS[state].filter((id) => ACTIONS[id]);
   if (pool.length === 0) return 'idle-breathe';
-  return pool[tick % pool.length];
+  return pool[((tick % pool.length) + pool.length) % pool.length];
+}
+
+/** 该核心态的动作池是否有多个候选（有则值得按 tick 交替） */
+export function corePoolSize(state: PetCoreState): number {
+  return CORE_POOLS[state].filter((id) => ACTIONS[id]).length;
 }
 
 /** 动作是否循环播放（来自 manifest，唯一事实来源） */

@@ -19,10 +19,21 @@ type Props = {
   streaming?: boolean;
   /** 思考链小字（可空） */
   thinking?: string;
+  /**
+   * 长文本模式（P7 对话答复）。
+   *
+   * 为什么需要：独白档只有"一句话"（上限 80 字够用），而对话档的 token 预算是 1200，
+   * 答复常超过 80 字——沿用独白口径会把回答截在半句，用户以为模型没答完。
+   * 这里放宽到 200 字并把容器限高抬高；再长仍截断（气泡是"贴在头顶"的，
+   * 无限长会盖住角色，也超出窗口上方可用空间）。
+   */
+  long?: boolean;
 };
 
 /** 气泡正文上限：模型偶尔会啰嗦（甚至把思考写进正文），超长直接截断，别把气泡撑爆 */
 const MAX_TEXT = 80;
+/** 对话答复的正文上限（见 `long` 说明） */
+const MAX_TEXT_LONG = 200;
 /** 思考小字上限：只给个"它在想什么"的感觉，不占满整个气泡 */
 const MAX_THINK = 60;
 
@@ -40,7 +51,7 @@ function worthShowingThink(s: string): boolean {
   return cjk >= 4;
 }
 
-export default function PetBubble({ seq, text, onDone, streaming, thinking }: Props) {
+export default function PetBubble({ seq, text, onDone, streaming, thinking, long }: Props) {
   // 用 ref 读最终文本长度：避免 text 逐字变化时反复重启计时器
   const lenRef = useRef(0);
   lenRef.current = text.length;
@@ -52,13 +63,13 @@ export default function PetBubble({ seq, text, onDone, streaming, thinking }: Pr
     return () => window.clearTimeout(timer);
   }, [seq, streaming, onDone]);
 
-  const body = text ? clip(text, MAX_TEXT) : '';
+  const body = text ? clip(text, long ? MAX_TEXT_LONG : MAX_TEXT) : '';
   // 正文一旦开吐就收起思考：模型常在 thinking 里复述人设与要求，和真话并排显示很出戏
   const think =
     !body && thinking && worthShowingThink(thinking) ? clip(thinking, MAX_THINK) : '';
 
   return (
-    <div key={seq} className="pet-bubble" role="status">
+    <div key={seq} className={`pet-bubble${long ? ' pet-bubble-long' : ''}`} role="status">
       {think ? (
         <div className="pet-bubble-think" aria-hidden="true">
           {think}

@@ -22,6 +22,9 @@ export type SayState = {
   thinking: string;
 } | null;
 
+/** 一轮上下文（P7 多轮对话；字段名与 Rust `PetSayTurn` 一致） */
+export type SayTurn = { role: 'user' | 'assistant'; content: string };
+
 type StartPayload = { sessionId: number; trigger?: string; model?: string };
 type DeltaPayload = { sessionId: number; kind: 'text' | 'reasoning'; delta: string };
 type DonePayload = { sessionId: number; ok: boolean; text: string; reasoning: string };
@@ -102,11 +105,24 @@ export function usePetSay(opts: Options) {
 
   /**
    * 发起一次发言。true = 已受理（气泡进入流式态）；false = 无法发言（已回调 onFallback）。
+   *
+   * P7：`opts` 可带多轮历史与档位（mode）。翻成 Rust 侧参数名 `history` / `mode`。
    */
   const startSay = useCallback(
-    async (prompt: string, context?: string | null, trigger: 'user' | 'auto' = 'user') => {
+    async (
+      prompt: string,
+      context?: string | null,
+      trigger: 'user' | 'auto' = 'user',
+      opts?: { history?: SayTurn[]; mode?: 'chat' | 'monologue' },
+    ) => {
       try {
-        const id = await api.pet.say(prompt, context, trigger);
+        const id = await api.pet.say(
+          prompt,
+          context,
+          trigger,
+          opts?.history ?? null,
+          opts?.mode ?? 'monologue',
+        );
         // 若 pet-say-start 事件先于 invoke 返回到达（sessionId 已被接受），
         // 这里不要再覆盖状态，否则会把已收到的 delta 清空
         if (id > activeRef.current) {

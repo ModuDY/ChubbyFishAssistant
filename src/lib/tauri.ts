@@ -299,15 +299,40 @@ export const api = {
      * 让桌宠说一句 AI 话（P3）。命令立即返回 sessionId；流式结果经
      * `pet-say-start` / `pet-say-delta` / `pet-say-done` / `pet-say-error` 事件下发。
      * 同步 reject 表示「无法发言」（未开启 / 网关未启动 / 节流 / 超上限）→ 调用方回落本地台词。
+     *
+     * P7（2026-10-21）新增两项可选参数，老调用方零改动：
+     * - `history`：多轮上下文（仅 `mode='chat'` 生效，Rust 侧二次裁剪条数与单条长度）
+     * - `mode`：`chat`（用户在输入框发问）/ `monologue`（独白，默认）。
+     *   两档的 prompt、token 预算与节流间隔都不同，见 `pet.rs` 的常量说明。
      */
-    say: (prompt: string, context?: string | null, trigger?: 'user' | 'auto') =>
-      invoke<number>('pet_say', { prompt, context: context ?? null, trigger: trigger ?? 'user' }),
+    say: (
+      prompt: string,
+      context?: string | null,
+      trigger?: 'user' | 'auto',
+      history?: Array<{ role: 'user' | 'assistant'; content: string }> | null,
+      mode?: 'chat' | 'monologue',
+    ) =>
+      invoke<number>('pet_say', {
+        prompt,
+        context: context ?? null,
+        trigger: trigger ?? 'user',
+        history: history ?? null,
+        mode: mode ?? 'monologue',
+      }),
     /**
      * 上报「可点击格子」掩码（窗口百分比网格，1=角色 0=透明）。
      * Rust 侧据此让角色以外的区域放行鼠标消息，避免透明窗口挡住下层窗口的点击。
      */
     setHitMask: (cols: number, rows: number, cells: number[]) =>
       invoke('pet_set_hit_mask', { cols, rows, cells }),
+    /**
+     * P7 内联对话：进入/退出「整窗强制可交互」态。
+     * 输入框只在掩码里占一小块，鼠标移向它的途中会经过透明格子 → 窗口被切成穿透 → 点不进去。
+     * 置位期间穿透线程暂停切换（见 pet.rs 的 CHAT_FOCUS）。
+     */
+    setChatFocus: (on: boolean) => invoke<boolean>('pet_set_chat_focus', { on }),
+    /** P7：让桌宠窗口取得键盘焦点（`focus:false` 建的窗口，仅 el.focus() 收不到按键与 IME） */
+    focusForInput: () => invoke<boolean>('pet_focus_for_input'),
     /** 可用素材包（用户放在 %APPDATA%\AIWorkAssistant\pets\<id>\ 下的形象） */
     packList: () =>
       invoke<Array<{ id: string; name: string; action_count: number }>>('pet_pack_list'),

@@ -19,14 +19,31 @@ import { api } from '../lib/tauri';
 import PetBubble from './PetBubble';
 import PetSprite, { MASK_COLS, MASK_ROWS, type SpriteBox } from './PetSprite';
 import { coreAction, makeTransient, pickTransientAction, raise } from './petState';
-import type { PetCoreState, PetTransient } from './petState';
+import type { PetCoreState, PetTransient, PetTransientKind } from './petState';
 import { applyPetPack, ACTION_LIST, ACTIONS } from './actions';
 import { pickLine } from './lines';
-import { localDateKey, getTodaysFestivalPlan } from './festivals';
-import { pickFlavorAction, pickSlotAction, pushRecent, timeSlot } from './flavor';
+import { localDateKey, getTodaysFestivalPlan, nextFestivalAction } from './festivals';
+import { isQuietHour, pickFlavorAction, pickSlotAction, pushRecent, timeSlot } from './flavor';
+import { linePoolForAction, STARTLE_ACTIONS, TRANSIENT_POOLS } from './pools';
+import {
+  clickKindFor,
+  INTERACTIONS,
+  pickLandingAction,
+  shouldPetOnHover,
+  trackClick,
+} from './interaction';
 import { usePetEvents } from './usePetEvents';
 import type { PetSignal } from './usePetEvents';
-import { usePetSay, type SayState } from './usePetSay';
+import { usePetSay, type SayState, type SayTurn } from './usePetSay';
+import PetChatInput from './PetChatInput';
+import {
+  appendTurn,
+  detectIntent,
+  MAX_INPUT_CHARS,
+  overlayRectOnMask,
+  trimHistory,
+  type ChatTurn,
+} from './petChatTypes';
 import { usePetAutoSay, AUTO_TRIGGER_TYPES } from './usePetAutoSay';
 import { usePetGatewayEvents } from './usePetGatewayEvents';
 import type { PetAiMode } from '../types';
@@ -38,10 +55,21 @@ const CLICK_DELAY = 240;
 const DRAG_THRESHOLD = 5;
 /** 失败态停留时长：给用户足够时间看到"出错了"，然后自行回落 */
 const SAD_HOLD_MS = 9000;
-/** idle 循环动作交替间隔：长时间一个循环动作会显得死板 */
+/**
+ * 循环动作交替间隔：长时间一个循环动作会显得死板。
+ * 2026-10-20 起不再只服务 idle——`working` 也轮到 `work-pace`（签到一轮几十秒），
+ * 所以按「所有核心态池长度 >1」统一交替（`corePoolSize` 判定）。
+ */
 const IDLE_SWAP_MS = 24_000;
 /** 打盹检测轮询间隔 */
 const SLEEP_CHECK_MS = 20_000;
+/**
+ * 悬停抚摸的判定节拍（ms）。
+ *
+ * 不做到每帧：抚摸的判定阈值是 1.2s，250ms 的粒度误差最多 0.25s，手感无差；
+ * 而 60fps 轮询会在角色贴边时频繁唤醒 JS（桌宠是常驻窗口，省电优先）。
+ */
+const HOVER_CHECK_MS = 250;
 /**
  * 空闲彩蛋 / 节日 / 时段的默认间隔（分钟）。
  * 实际间隔由设置项 `pet_easter_egg_minutes` 决定（默认 1 分钟）；这里只是默认值的兜底。
@@ -211,6 +239,28 @@ export default function PetRoot() {
   const lastTriggerRef = useRef<'user' | 'auto'>('user');
   /** 本次发言是否由我们把核心态抬到了 thinking（结束只回退自己抬高的一档） */
   const sayThinkingRef = useRef(false);
+  /** 点击时间戳历史（滚动 3s 窗口）：用于区分"打招呼 / 戳烦了 / 炸毛" */
+  const clickHistoryRef = useRef<number[]>([]);
+  /** 上次「被抚摸」的时间戳：冷却用，避免悬停刷屏 */
+  const petAtRef = useRef(0);
+  /** 鼠标是否停在角色热区内 + 起始时刻（悬停抚摸判定） */
+  const hoverRef = useRef<{ inside: boolean; since: number }>({ inside: false, since: 0 });
+  /** 拖拽轨迹（算松手速度 → 决定是否"被甩出去"） */
+  const dragTrackRef = useRef<{ t: number; x: number; y: number; speed: number } | null>(null);
+  /** 当天已播过的节日动作（节日轮播用；键 `YYYY-MM-DD#festival` → 已播动作） */
+  const festivalPlayedRef = useRef<Map<string, string[]>>(new Map());
+  /** P7：对话输入条是否展开 */
+  const [chatOpen, setChatOpen] = useState(false);
+  /**
+   * P7：多轮对话历史（user / assistant 交替）。
+   *
+   * 只存在内存：桌宠重启即清空。刻意不落盘——聊天内容属于隐私，
+   * 与既有红线「桌宠不写任何业务数据」一致；而且重启后"重新认识"也更自然。
+   */
+  const chatHistoryRef = useRef<ChatTurn[]>([]);
+  /** 输入条是否展开的最新值（事件回调用，避免闭包旧值） */
+  const chatOpenRef = useRef(false);
+  chatOpenRef.current = chatOpen;
 
   // 透明窗口要求 html/body 无背景：class 只在本页挂载期间存在
   useEffect(() => {
@@ -236,14 +286,36 @@ export default function PetRoot() {
     }
   }, []);
 
-  /** 播放一次性动作（happy / rich / broke / click），到时自动回落 */
+  /**
+   * 按「动作语义」取台词：吃西瓜不会说"水面很平静"，放烟花不会说"摸鱼中"。
+   * 台词池映射集中在 `pools.linePoolForAction`（单一事实来源），这里只管取。
+   */
+  const lineForAction = useCallback(
+    (action: string) => pickLine(linePoolForAction(action), lastLineRef.current),
+    [],
+  );
+
+  /**
+   * 播放一次性动作（happy / rich / broke / click…），到时自动回落。
+   *
+   * 台词三级取值（2026-10-20 起）：
+   * 1. 显式传入 `text`（业务事件带文案，优先级最高）；
+   * 2. `sayText === false` 时**不弹气泡**（被动落地反馈 / 启动伸懒腰这种不该说话的场合）；
+   * 3. 其余按**动作语义**自动配一句（`lineForAction`），彻底消除"吃西瓜却说水面很平静"的穿帮。
+   */
   const playTransient = useCallback(
-    (kind: PetTransient['kind'], text?: string, actionOverride?: string) => {
+    (
+      kind: PetTransientKind,
+      text?: string,
+      actionOverride?: string,
+      opts?: { sayText?: boolean },
+    ) => {
       seqRef.current += 1;
       const action = pickTransientAction(kind, actionOverride);
+      const finalText = text ?? (opts?.sayText === false ? undefined : lineForAction(action));
       // 兜底时长按该素材的实测时长算（PetSprite loadedmetadata 上报），
       // 否则 10s 的素材会在第 4s 被掐断
-      const t = makeTransient(seqRef.current, kind, action, text, durationRef.current[action]);
+      const t = makeTransient(seqRef.current, kind, action, finalText, durationRef.current[action]);
       setTransient(t);
       setPlayKey(t.seq);
       showBubble(t.text);
@@ -251,7 +323,7 @@ export default function PetRoot() {
         setTransient((cur) => (cur && cur.seq === t.seq ? null : cur));
       }, t.ms);
     },
-    [showBubble],
+    [showBubble, lineForAction],
   );
 
   /** 记录各动作的实测时长（ms），供上面的兜底计时器使用 */
@@ -286,8 +358,10 @@ export default function PetRoot() {
   );
 
   const { say, startSay, cancelSay } = usePetSay({
-    // 首个 reasoning delta → 点亮「深度思考碎碎念」（上游大肥鱼梗的原始设定）
-    onReasoningFirst: () => playTransient('idle', undefined, 'mumble-deep'),
+    // 首个 reasoning delta → 点亮「深度思考碎碎念」（上游大肥鱼梗的原始设定）。
+    // 此时气泡正被 AI 流式文本占用，故禁掉自动台词，避免两条气泡打架。
+    onReasoningFirst: () =>
+      playTransient('idle', undefined, 'mumble-deep', { sayText: false }),
     onFallback: handleSayFallback,
   });
   sayRef.current = say;
@@ -299,6 +373,47 @@ export default function PetRoot() {
     void startSay(buildSayPrompt(ctx), ctx ?? null, 'user');
   }, [startSay]);
 
+  /**
+   * P7 内联对话：发送用户的一句话。
+   *
+   * 四件事按顺序做（顺序有原因）：
+   * 1. **先播动作**：用户说"唱一个"就立刻开唱，不等模型（模型可能几秒才出首字）。
+   *    意图解析走本地关键词（`detectIntent`），零 token、零 prompt 污染。
+   * 2. **写历史**：user 侧先入队，模型回答由 `say` 流结束时再补 assistant 侧。
+   * 3. **收起输入条**：避免它压住正在长大的气泡。
+   * 4. **发起流式请求**：`mode='chat'` + 当前历史，Rust 侧拼多轮 messages。
+   */
+  const sendChat = useCallback(
+    (text: string) => {
+      const clipped = text.trim().slice(0, MAX_INPUT_CHARS);
+      if (!clipped) return;
+
+      // 1) 用户的话 → 动作（确定性联动，不等模型）。
+      //    闭掉自动台词：紧接着 AI 流式气泡就会占位，两条气泡打架只会闪一下。
+      const intent = detectIntent(clipped);
+      if (intent) playTransient(intent.kind, undefined, undefined, { sayText: false });
+
+      // 2) 入队本轮 user 消息（送给模型的 history 不含本轮，本轮走 prompt）
+      const historyForModel = trimHistory(chatHistoryRef.current);
+      chatHistoryRef.current = appendTurn(chatHistoryRef.current, {
+        role: 'user',
+        content: clipped,
+      });
+
+      // 3) **保持输入条打开**（不收起）：
+      //    多轮对话的关键是"问完能马上追问"。收起会逼用户再右键一次，多轮体验直接断掉。
+      //    气泡在输入条下方长大，位置已错开（chatInputBottom 比 sayBubbleBottom 更高）。
+
+      // 4) 发起对话（chat 档：对话 prompt + 1200 token + 600ms 节流）
+      lastTriggerRef.current = 'user';
+      void startSay(clipped, null, 'user', {
+        history: historyForModel as SayTurn[],
+        mode: 'chat',
+      });
+    },
+    [playTransient, startSay],
+  );
+
   /** 自动点评（auto 档）：节流 + 「别打扰」判定都在 usePetAutoSay 内 */
   const { say: autoSay } = usePetAutoSay({
     enabled: aiMode === 'auto',
@@ -308,6 +423,8 @@ export default function PetRoot() {
       draggingRef.current ||
       !!transientRef.current ||
       !!sayRef.current?.streaming ||
+      // 用户正在打字时不自动点评：会把输入条顶掉/切走焦点
+      chatOpenRef.current ||
       document.hidden,
     startSay: (prompt, context, trigger) => {
       lastTriggerRef.current = trigger ?? 'auto';
@@ -495,6 +612,29 @@ export default function PetRoot() {
     };
   }, []);
 
+  /* ------------------- 对话历史：assistant 侧入队 ------------------- */
+  /**
+   * 流结束（streaming 由 true → false）且拿到正文时，把回答记进历史。
+   *
+   * 为什么放在这里而不是 `sendChat`：sendChat 发起时还不知道答案；
+   * 而 `say.text` 在 `pet-say-done` 时被 Rust 用**最终全文**覆盖（不是 delta 拼接的残留），
+   * 是唯一可靠的完整来源。
+   *
+   * 用 ref 记录"上个 sessionId 是否已入队"，避免同一轮因 streaming 抖动重复写入。
+   */
+  const recordedSayRef = useRef(0);
+  useEffect(() => {
+    if (!say || say.streaming) return;
+    const finalText = say.text.trim();
+    if (!finalText) return;
+    if (recordedSayRef.current === say.sessionId) return;
+    recordedSayRef.current = say.sessionId;
+    chatHistoryRef.current = appendTurn(chatHistoryRef.current, {
+      role: 'assistant',
+      content: finalText,
+    });
+  }, [say]);
+
   /* ------------------- AI 发言 ↔ 核心态 / 气泡 ------------------- */
   useEffect(() => {
     if (say?.streaming) {
@@ -525,14 +665,15 @@ export default function PetRoot() {
         !draggingRef.current
       ) {
         stallFiredRef.current = true;
-        playTransient('mumble', pickLine('working', lastLineRef.current));
+        // 三个碎碎念轮换（对屏 / 擦桌 / 是啊吃什么），台词由动作语义自动配
+        playTransient('mumble');
         return;
       }
       if (idleFor < sleepMinutes * 60_000) return;
       // 只有空闲态会进打盹：业务态（working/sad）绝不因为"没新事件"就睡觉
       if (coreRef.current === 'idle') {
-        // 入睡前先打个哈欠（idle-yawn），再接打盹循环
-        playTransient('idle', undefined, 'idle-yawn');
+        // 入睡前先打个哈欠（idle-yawn），再接打盹循环（哈欠不配台词，由下一行的睡眠台词统一说）
+        playTransient('idle', undefined, 'idle-yawn', { sayText: false });
         setCore('sleepy');
         showBubble(pickLine('sleepy', lastLineRef.current));
       }
@@ -540,7 +681,11 @@ export default function PetRoot() {
     return () => window.clearInterval(timer);
   }, [sleepMinutes, showBubble, playTransient]);
 
-  /* --------------------- idle 循环动作交替（避免单调） --------------------- */
+  /* --------------------- 循环动作交替（避免单调） --------------------- */
+  /**
+   * 只要有任一核心态的动作池长度 >1 就值得交替（idle 两个呼吸 / working 忙碌与踱步）。
+   * 单池状态（sleepy/thinking/sad）tick 递增无副作用（`coreAction` 取模后仍是同一动作）。
+   */
   useEffect(() => {
     const timer = window.setInterval(() => setIdleTick((n) => n + 1), IDLE_SWAP_MS);
     return () => window.clearInterval(timer);
@@ -561,20 +706,30 @@ export default function PetRoot() {
     const intervalMs = Math.max(1, Math.min(30, easterEggMinutes)) * 60_000;
     const timer = window.setInterval(() => {
       if (coreRef.current !== 'idle') return;
-      if (transientRef.current || draggingRef.current) return;
+      // 对话输入中不插播彩蛋：会盖住输入条 / 抢走气泡
+      if (transientRef.current || draggingRef.current || chatOpenRef.current) return;
       const now = new Date();
       const today = localDateKey(now);
 
-      // 1) 节日（含农历节日与节气；当天只播一次）
+      // 1) 节日（含农历节日与节气；当天**轮播**全部候选，播完为止）
+      //    2026-10-20：原实现 `actions.find()` 只播第一个有素材的候选，
+      //    19 个节日动作里有 10 个永远不会出现（春节 5 个只看得到"放烟花"）。
       if (anniversaryEnabled) {
         const plan = getTodaysFestivalPlan(now);
         if (plan && !festivalFiredRef.current.has(plan.key)) {
-          const action = plan.actions.find((id) => ACTIONS[id]?.url);
+          const played = festivalPlayedRef.current.get(plan.key) ?? [];
+          const action = nextFestivalAction(plan.actions, played, (id) => !!ACTIONS[id]?.url);
           if (action) {
-            festivalFiredRef.current.add(plan.key);
-            playTransient('idle', `${plan.label}到了`, action);
+            festivalPlayedRef.current.set(plan.key, [...played, action]);
+            // 全部候选都播完 → 记入"当天已收工"，后面不再打扰
+            if (nextFestivalAction(plan.actions, [...played, action], (id) => !!ACTIONS[id]?.url) === null) {
+              festivalFiredRef.current.add(plan.key);
+            }
+            playTransient('festival', `${plan.label}到了`, action);
             return;
           }
+          // 该节日一个素材都没有：直接标记收工，避免每分钟空转
+          festivalFiredRef.current.add(plan.key);
         }
       }
 
@@ -598,10 +753,13 @@ export default function PetRoot() {
       if (easterEggEnabled) {
         const tick = flavorTickRef.current;
         flavorTickRef.current += 1;
-        const action = pickFlavorAction(tick, recentFlavorRef.current);
+        // 深夜（23~5 点）只从安静池取：凌晨三点突然涮火锅 / 放烟花太出戏
+        const action = pickFlavorAction(tick, recentFlavorRef.current, Math.random, isQuietHour(now.getHours()));
         if (!ACTIONS[action]?.url) return;
         recentFlavorRef.current = pushRecent(recentFlavorRef.current, action);
-        playTransient('idle', pickLine('idle', lastLineRef.current));
+        // ⚠️ 这里原来漏传了 actionOverride，导致 pickFlavorAction 算出来的动作被丢弃，
+        // 实际只播 'idle' 池的 3 个动作——分桶池里 50 个动作一次都没自动播过（2026-10-20 修复）。
+        playTransient('idle', lineForAction(action), action);
       }
     }, intervalMs);
     return () => window.clearInterval(timer);
@@ -609,18 +767,39 @@ export default function PetRoot() {
 
   /* ----------------------- 启动彩蛋：伸个懒腰 ----------------------- */
   useEffect(() => {
-    const timer = window.setTimeout(() => playTransient('idle', undefined, 'idle-stretch'), 900);
+    // 启动伸懒腰只是"打个招呼"，不说话（否则每次启动都弹一句，容易烦）
+    const timer = window.setTimeout(
+      () => playTransient('idle', undefined, 'idle-stretch', { sayText: false }),
+      900,
+    );
     return () => window.clearTimeout(timer);
   }, [playTransient]);
 
-  /* --------------------------- 位置记忆 --------------------------- */
+  /* ------------- 拖拽速度采样 + 位置记忆（同一份 moved 订阅） ------------- */
   useEffect(() => {
     let disposed = false;
     let unlisten: UnlistenFn | undefined;
     let timer: number | undefined;
+    /** 上一次 moved 事件的窗口坐标与时间（反推拖拽速度） */
+    let lastMove: { t: number; x: number; y: number; speed: number } | null = null;
 
     void getCurrentWindow()
-      .onMoved(() => {
+      .onMoved(({ payload }) => {
+        // 拖拽一旦交给系统（startDragging），WebView 就不再收到 pointermove，
+        // 所以「甩出去」的速度只能从窗口 moved 事件反推：位移 / 时间，指数平滑。
+        const now = performance.now();
+        if (lastMove) {
+          const dt = Math.max(1, now - lastMove.t);
+          const dist = Math.hypot(payload.x - lastMove.x, payload.y - lastMove.y);
+          const instant = (dist / dt) * 1000;
+          const speed = lastMove.speed * 0.5 + instant * 0.5;
+          lastMove = { t: now, x: payload.x, y: payload.y, speed };
+          // 只在拖拽中喂给落地判定（窗口被程序化移动时不该算"甩"）
+          if (draggingRef.current) dragTrackRef.current = { ...lastMove };
+        } else {
+          lastMove = { t: now, x: payload.x, y: payload.y, speed: 0 };
+        }
+
         // 拖动过程会连续触发 moved：去抖 500ms 再落盘，避免高频写 SQLite
         if (timer) window.clearTimeout(timer);
         timer = window.setTimeout(() => {
@@ -640,9 +819,111 @@ export default function PetRoot() {
   }, []);
 
   /* --------------------------- 交互 --------------------------- */
+  /**
+   * 单击回应：按 3s 滚动窗口的点击次数分流。
+   * - 1~2 次 → `click` 池随机（元气挥手 / 跃动 / 挠痒）
+   * - ≥3 次 → `click-tsundere`（戳烦了）
+   * - ≥6 次 → 傲娇 + 更凶的台词
+   *
+   * 这条是 `click-tsundere` 设计意图「高频连点（防刷）」的正式落地——
+   * 原来它和另外 3 个动作一样纯随机，用户连点 20 下也看不到它变脸。
+   */
   const playClick = useCallback(() => {
-    playTransient('click', pickLine('click', lastLineRef.current));
+    const { history, mood, count } = trackClick(clickHistoryRef.current);
+    clickHistoryRef.current = history;
+    if (mood === 'normal') {
+      playTransient('click', pickLine('click', lastLineRef.current));
+      return;
+    }
+    const text =
+      mood === 'annoyed'
+        ? `戳了 ${count} 下了！${pickLine('tease', lastLineRef.current)}`
+        : pickLine('tease', lastLineRef.current);
+    playTransient(clickKindFor(mood), text);
   }, [playTransient]);
+
+  /**
+   * 悬停抚摸：鼠标停在角色身上不动（≥1.2s）且没有正在播的动作时，
+   * 播一次"被撸"的反应（撸猫 / 挠痒）。20s 内只一次，避免鼠标经过就刷屏。
+   */
+  const playPetOnHover = useCallback(() => {
+    const now = Date.now();
+    if (!shouldPetOnHover(
+      hoverRef.current.inside,
+      now - hoverRef.current.since,
+      petAtRef.current,
+      !!transientRef.current || draggingRef.current || pausedRef.current || menuOpenRef.current,
+      now,
+    )) return;
+    petAtRef.current = now;
+    hoverRef.current.since = now;
+    playTransient('pet', pickLine('hover', lastLineRef.current));
+  }, [playTransient]);
+
+  /**
+   * 主动互动（右键菜单三项）：喂点吃的 / 陪我玩会儿 / 露一手。
+   *
+   * 三项背后是 9 种吃的 + 9 种玩法 + 16 个才艺，纯随机会让同一个动作反复出现
+   * （9 个里抽 4 次很可能重复）。这里复用彩蛋的「最近记忆」去重：
+   * 优先挑最近没见过的，让用户连点几次真能把这一类看完。
+   */
+  const interact = useCallback(
+    (kind: PetTransientKind) => {
+      // 直接用 setMenu 关菜单：closeMenu 定义在下方，避免引用顺序上的歧义
+      setMenu(null);
+      const pool = TRANSIENT_POOLS[kind as keyof typeof TRANSIENT_POOLS] as readonly string[] | undefined;
+      const recent = recentFlavorRef.current;
+      const fresh = pool?.filter((id) => !recent.includes(id) && ACTIONS[id]?.url) ?? [];
+      const candidates = fresh.length > 0 ? fresh : (pool ?? []);
+      const action = candidates[Math.floor(Math.random() * candidates.length)];
+      if (action) recentFlavorRef.current = pushRecent(recent, action);
+      playTransient(kind, undefined, action);
+    },
+    [playTransient],
+  );
+
+  /**
+   * 悬停抚摸轮询：鼠标静止在角色上 1.2s 就摸一下。
+   *
+   * 为什么不用 `onMouseEnter/Leave`：窗口是置顶的**透明且可穿透**窗口，
+   * 鼠标落在透明区时事件根本不进 WebView，进出事件会漏；用固定节拍读
+   * 「当前是否 hover」最稳，代价是 4Hz 的空转（可忽略）。
+   */
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (hoverRef.current.inside && !draggingRef.current) playPetOnHover();
+    }, HOVER_CHECK_MS);
+    return () => window.clearInterval(timer);
+  }, [playPetOnHover]);
+
+  /** 输入条 DOM 引用：掩码合成要用它量矩形（必须先于 withChatMask 声明） */
+  const chatBoxRef = useRef<HTMLDivElement | null>(null);
+
+  /**
+   * 把「输入条矩形」并进掩码交给 Rust（P7）。
+   *
+   * 为什么掩码要感知输入条：穿透线程按格子判断"光标是否在透明区"，
+   * 输入条不在 sprite alpha 里 → 不并进去就会被判成透明 → 输入框点不动。
+   * （另外 `setChatFocus(true)` 会让穿透线程整体暂停切换，两者是双保险：
+   *  mask 保证"光标算在非透明区"，CHAT_FOCUS 保证"移动途中的过渡帧也不切"。）
+   *
+   * 矩形按实测 `getBoundingClientRect()` 取，窗口尺寸取 `innerWidth/innerHeight`，
+   * 与 `PetSprite` 的采样口径一致（都用 CSS px 比例换算）。
+   */
+  const withChatMask = useCallback((base: Uint8Array) => {
+    if (!chatOpenRef.current) return base;
+    const el = chatBoxRef.current;
+    if (!el) return base;
+    const r = el.getBoundingClientRect();
+    return overlayRectOnMask(
+      base,
+      { left: r.left, top: r.top, width: r.width, height: r.height },
+      window.innerWidth || 1,
+      window.innerHeight || 1,
+      MASK_COLS,
+      MASK_ROWS,
+    );
+  }, []);
 
   /** 稳定引用：否则父组件每次渲染都会重置气泡的自动消失计时器 */
   const clearBubble = useCallback(() => setBubble(null), []);
@@ -670,7 +951,7 @@ export default function PetRoot() {
     maskRef.current = next;
     // 菜单打开期间不覆盖「整窗可交互」掩码，否则菜单会被 Rust 的穿透逻辑吃掉点击
     if (menuOpenRef.current) return;
-    void api.pet.setHitMask(MASK_COLS, MASK_ROWS, Array.from(next)).catch(() => {
+    void api.pet.setHitMask(MASK_COLS, MASK_ROWS, Array.from(withChatMask(next))).catch(() => {
       /* 上报失败只影响点击穿透，不影响显示，静默忽略 */
     });
   }, []);
@@ -678,10 +959,15 @@ export default function PetRoot() {
   const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
     dragRef.current = { x: e.clientX, y: e.clientY, started: false };
+    // 悬停抚摸：按下即打断"抚摸计时"，避免一边拖一边被判定成摸
+    hoverRef.current = { inside: true, since: Date.now() };
+    dragTrackRef.current = { t: performance.now(), x: e.clientX, y: e.clientY, speed: 0 };
     e.currentTarget.setPointerCapture(e.pointerId);
   };
 
   const onPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    // 速度采样不在这里：`startDragging` 之后 WebView 就不再收到 pointermove，
+    // 改由窗口 `onMoved` 事件反推（见下方"拖拽速度采样"效应）。
     const drag = dragRef.current;
     if (!drag || drag.started) return;
     if (Math.hypot(e.clientX - drag.x, e.clientY - drag.y) < DRAG_THRESHOLD) return;
@@ -698,9 +984,18 @@ export default function PetRoot() {
 
     if (drag?.started) {
       setDragging(false);
-      // 落地反馈：接在拖拽悬空之后；click-shy 害羞 / idle-squat 蹲一下，随机取一个
-      const landing = Math.random() < 0.5 ? 'click-shy' : 'idle-squat';
-      playTransient('click', pickLine('click', lastLineRef.current), landing);
+      // 落地反馈按松手速度分流（2026-10-20）：
+      // - 快速甩动 → life-scared「被吓一跳」（25% 概率，另 75% 仍走常规落地）
+      // - 常规松手 → click-shy 害羞 / idle-squat 蹲一下
+      // 原来只按 50/50 纯随机，`life-scared` 只能靠时间彩蛋偶尔漂出来。
+      const speed = dragTrackRef.current?.speed ?? 0;
+      dragTrackRef.current = null;
+      const landing = pickLandingAction(speed);
+      // 惊吓类走 idle 语义（没有专属池），其余走 click 语义；文案一律按落地动作配
+      const kind: PetTransientKind = STARTLE_ACTIONS.includes(landing) ? 'idle' : 'click';
+      playTransient(kind, lineForAction(landing), landing);
+      // 松手后鼠标仍在角色上：重置抚摸计时，别刚放下就被"摸"
+      hoverRef.current = { inside: true, since: Date.now() };
       return;
     }
 
@@ -850,15 +1145,17 @@ export default function PetRoot() {
     void api.pet.reload().catch(() => {});
   }, [closeMenu]);
 
-  // Esc 关闭菜单（无边框窗口里没有系统菜单，键盘兜底更稳）
+  // Esc 关闭菜单 / 收起输入条（无边框窗口里没有系统菜单，键盘兜底更稳）
   useEffect(() => {
-    if (!menu) return;
+    if (!menu && !chatOpen) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setMenu(null);
+      if (e.key !== 'Escape') return;
+      if (menu) setMenu(null);
+      if (chatOpen) setChatOpen(false);
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [menu]);
+  }, [menu, chatOpen]);
 
   // 菜单开合 ↔ 点击穿透：打开时把掩码置为「整窗可交互」，关闭后恢复真实掩码。
   // 否则菜单若落在角色包围盒外，会被 Rust 的透明区穿透逻辑吃掉点击（按钮点不动）
@@ -873,6 +1170,41 @@ export default function PetRoot() {
       void api.pet.setHitMask(MASK_COLS, MASK_ROWS, cells).catch(() => {});
     }
   }, [menu]);
+
+  /**
+   * 输入条开合 ↔ 点击穿透（P7）。
+   *
+   * 与菜单不同，这里**不**把整窗置为可交互：输入条只占头顶一条，
+   * 整窗可交互会让角色周围的透明区挡住下层窗口的点击（那正是穿透功能存在的理由）。
+   * 正确做法是把输入条矩形并入掩码，其余区域仍按 sprite alpha 判定。
+   *
+   * 展开后等一帧再量矩形：组件刚挂载时还没布局完成，`getBoundingClientRect` 会拿到 0。
+   */
+  useEffect(() => {
+    if (!chatOpen) {
+      // 收起：恢复真实掩码（去掉之前并进来的输入条格子）
+      if (maskRef.current && !menuOpenRef.current) {
+        void api.pet
+          .setHitMask(MASK_COLS, MASK_ROWS, Array.from(maskRef.current))
+          .catch(() => {});
+      }
+      return;
+    }
+    let cancelled = false;
+    const sync = () => {
+      if (cancelled) return;
+      const base = maskRef.current;
+      if (!base || menuOpenRef.current) return;
+      void api.pet
+        .setHitMask(MASK_COLS, MASK_ROWS, Array.from(withChatMask(base)))
+        .catch(() => {});
+    };
+    const raf = window.requestAnimationFrame(() => window.requestAnimationFrame(sync));
+    return () => {
+      cancelled = true;
+      window.cancelAnimationFrame(raf);
+    };
+  }, [chatOpen, withChatMask]);
 
   /* --------------------------- 播放调度 --------------------------- */
   const actionId = dragging ? 'drag-dangle' : (transient?.action ?? coreAction(core, idleTick));
@@ -904,13 +1236,25 @@ export default function PetRoot() {
   const bubbleBottom = hitBox ? `calc(${(100 - hitBox.top).toFixed(2)}% + 8px)` : '48%';
   // AI 气泡比普通播报气泡再高 10px：两者切换时不会"原地跳"，也不会把角色头顶压住
   const sayBubbleBottom = hitBox ? `calc(${(100 - hitBox.top).toFixed(2)}% + 18px)` : '52%';
+  /**
+   * 输入条底边位置（P7）：再比 AI 气泡高 26px。
+   *
+   * 为什么还要往上挪：输入条比气泡矮但更宽，若贴着气泡位，两者同时出现会叠在一起；
+   * 26px ≈ 输入条自身高度 + 一个小间隙，保证「气泡在长大、输入条在上面」互不遮挡。
+   */
+  const chatInputBottom = hitBox ? `calc(${(100 - hitBox.top).toFixed(2)}% + 44px)` : '56%';
 
   // 菜单落位：贴着角色**右侧**、垂直居中悬浮。
   // 窗口宽度 = 角色舞台 + 右侧 160px 留白（pet.css 的 --pet-menu-space），
   // 所以菜单能完整画在角色右边而不遮挡角色、也不被窗口裁掉。
   const MENU_W = 148;
-  /** 菜单最大高度估值（含可选的「跟我聊一句」按钮，留余量） */
-  const MENU_H = 268;
+  /**
+   * 菜单最大高度估值：AI 档位开启时多一行「跟我聊一句」，
+   * 2026-10-20 又加了「喂点吃的 / 陪我玩会儿 / 露一手」三行，
+   * 故上限直接给到 400（菜单本身按内容自适应，这里只用于垂直居中夹紧，
+   * 估偏小会把菜单推到窗口外被裁掉，估偏大只会略微偏上，故宁大勿小）。
+   */
+  const MENU_H = 400;
   const MENU_GAP = 6;
   const box = hitBox ?? { left: 14, top: 52, width: 72, height: 48 };
   const charRightPx = ((box.left + box.width) / 100) * window.innerWidth;
@@ -955,6 +1299,22 @@ export default function PetRoot() {
         onMask={handleMask}
         onDuration={handleDuration}
       />
+      {/* P7 内联对话输入条：贴在气泡更高一层，避免与正在长大的气泡重叠 */}
+      {chatOpen ? (
+        <div className="pet-chat-anchor" style={{ bottom: chatInputBottom }} ref={chatBoxRef}>
+          <PetChatInput
+            onSend={sendChat}
+            onClose={() => setChatOpen(false)}
+            placeholder={
+              aiMode === 'off'
+                ? 'AI 对话未开启（设置页可打开）'
+                : gatewayRunning
+                  ? '跟大肥鱼说点什么…'
+                  : '网关未启动，先在右键菜单里启动'
+            }
+          />
+        </div>
+      ) : null}
       {/* 气泡锚点：底边贴在角色头顶上方，而不是窗口顶部 */}
       {bubbleEnabled && say ? (
         // AI 发言优先：流式中文本随 delta 增长（打字机），流结束后按长度延时消失
@@ -964,6 +1324,8 @@ export default function PetRoot() {
             text={say.text}
             thinking={say.thinking}
             streaming={say.streaming}
+            // 对话档答复可能成段：放宽截断长度与容器高度（独白档仍按一句的口径）
+            long={aiMode !== 'off' && chatHistoryRef.current.length > 0}
             onDone={() => {
               // 记一下结束时刻：紧接着跳回"积分播报"气泡会显得很突兀
               setSayEndAt(Date.now());
@@ -988,6 +1350,12 @@ export default function PetRoot() {
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
         onPointerCancel={onPointerUp}
+        onPointerEnter={() => {
+          hoverRef.current = { inside: true, since: Date.now() };
+        }}
+        onPointerLeave={() => {
+          hoverRef.current = { inside: false, since: 0 };
+        }}
         onDoubleClick={onDoubleClick}
         onContextMenu={onContextMenu}
       />
@@ -1080,19 +1448,39 @@ export default function PetRoot() {
                   一键签到
                 </button>
                 {aiMode !== 'off' ? (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      closeMenu();
-                      sayNow();
-                    }}
-                  >
-                    跟我聊一句
-                  </button>
+                  <>
+                    {/* P7：打开内联输入条，真正能问答（与下面"让它自己说一句"区分开） */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        closeMenu();
+                        setChatOpen(true);
+                      }}
+                    >
+                      跟我聊聊…
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        closeMenu();
+                        sayNow();
+                      }}
+                    >
+                      让它自己说一句
+                    </button>
+                  </>
                 ) : null}
                 <button type="button" onClick={() => toggleGateway(gatewayRunning)}>
                   {gatewayRunning ? '停止 API 网关' : '启动 API 网关'}
                 </button>
+                <div className="pet-menu-sep" />
+                {/* 主动互动（2026-10-20）：把吃喝 / 玩乐 / 才艺 34 个动作变成"用户想让它做就做"，
+                    不再只能等时间彩蛋偶然漂出来 */}
+                {INTERACTIONS.map((it) => (
+                  <button key={it.id} type="button" onClick={() => interact(it.kind)}>
+                    {it.label}
+                  </button>
+                ))}
                 <div className="pet-menu-sep" />
                 <button type="button" onClick={focusMainFromMenu}>
                   呼出主窗口

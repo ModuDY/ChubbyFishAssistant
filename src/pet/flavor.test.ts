@@ -44,18 +44,16 @@ describe('pickSlotAction', () => {
 });
 
 describe('pickFlavorAction —— 分桶轮转', () => {
-  it('连续 4 轮会依次轮到 4 个不同的桶', () => {
-    const picks = [0, 1, 2, 3].map((tick) => pickFlavorAction(tick, [], first));
-    // 每轮取的是不同桶的第一个动作 → 4 个结果互不相同
-    expect(new Set(picks).size).toBe(4);
-    expect(picks[0]).toBe(FLAVOR_BUCKETS[0][0]);
-    expect(picks[1]).toBe(FLAVOR_BUCKETS[1][0]);
-    expect(picks[2]).toBe(FLAVOR_BUCKETS[2][0]);
-    expect(picks[3]).toBe(FLAVOR_BUCKETS[3][0]);
+  it('连续 N 轮会依次轮到 N 个不同的桶', () => {
+    const picks = FLAVOR_BUCKETS.map((_, tick) => pickFlavorAction(tick, [], first));
+    // 每轮取的是不同桶的第一个动作 → 结果互不相同
+    expect(new Set(picks).size).toBe(FLAVOR_BUCKETS.length);
+    FLAVOR_BUCKETS.forEach((bucket, i) => expect(picks[i]).toBe(bucket[0]));
   });
 
-  it('轮次回绕（第 5 轮回到第 1 个桶）', () => {
-    expect(pickFlavorAction(4, [], first)).toBe(pickFlavorAction(0, [], first));
+  it('轮次回绕（第 N+1 轮回到第 1 个桶）', () => {
+    const wrap = FLAVOR_BUCKETS.length;
+    expect(pickFlavorAction(wrap, [], first)).toBe(pickFlavorAction(0, [], first));
   });
 
   it('负数轮次也能安全取模', () => {
