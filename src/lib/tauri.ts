@@ -296,6 +296,17 @@ export const api = {
     /** 重新加载桌宠窗口：画面空白 / 动画卡住时的一键自愈 */
     reload: () => invoke('pet_reload'),
     /**
+     * 长期记忆（opt-in）：读回上次的对话历史。
+     *
+     * 未启用时返回空数组，**且在 Rust 侧顺带清除磁盘上的残留**，
+     * 保证「开关关着」与「磁盘没有历史」永远等价。
+     */
+    memoryLoad: () =>
+      invoke<Array<{ role: 'user' | 'assistant'; content: string }>>('pet_memory_load'),
+    /** 覆盖写入长期记忆（未启用时 Rust 侧直接忽略并清空） */
+    memorySave: (turns: Array<{ role: 'user' | 'assistant'; content: string }>) =>
+      invoke('pet_memory_save', { turns }),
+    /**
      * 让桌宠说一句 AI 话（P3）。命令立即返回 sessionId；流式结果经
      * `pet-say-start` / `pet-say-delta` / `pet-say-done` / `pet-say-error` 事件下发。
      * 同步 reject 表示「无法发言」（未开启 / 网关未启动 / 节流 / 超上限）→ 调用方回落本地台词。

@@ -600,6 +600,40 @@ export default function GeneralSettingsPanel() {
               </p>
             </div>
             <div>
+              <label className="label">记住聊过的内容</label>
+              <select
+                value={(form.pet_long_memory ?? false) ? 'on' : 'off'}
+                onChange={(e) => update('pet_long_memory', e.target.value === 'on')}
+                className="input w-40"
+              >
+                <option value="off">不记住（默认）</option>
+                <option value="on">记住，重启后接着聊</option>
+              </select>
+              <p className="text-xs text-slate-400 mt-1">
+                关闭时对话只存在内存里，桌宠一重启全忘，磁盘上不留任何聊天内容。
+                开启后会把最近的对话写到本机数据库，下次开桌宠能接上；关掉开关会
+                <span className="text-slate-300">立即删除已保存的记录</span>。
+              </p>
+            </div>
+            {form.pet_long_memory ? (
+              <div>
+                <label className="label">最多记住多少条</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={200}
+                  value={form.pet_memory_turns ?? 40}
+                  onChange={(e) =>
+                    update('pet_memory_turns', Math.min(200, Math.max(1, Number(e.target.value) || 40)))
+                  }
+                  className="input w-24"
+                />
+                <p className="text-xs text-slate-400 mt-1">
+                  每条问答算两条（你的话 + 它的话）。太多会把无关的旧内容也带进上下文，反而变笨。
+                </p>
+              </div>
+            ) : null}
+            <div>
               <label className="label">形象（素材包）</label>
               <select
                 value={form.pet_pack ?? 'builtin'}

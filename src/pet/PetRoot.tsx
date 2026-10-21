@@ -125,6 +125,8 @@ type PetUpdatePayload = {
   easterEgg?: boolean;
   /** P6：彩蛋 / 节日 / 时段的触发间隔（分钟，默认 1） */
   easterEggMinutes?: number;
+  /** 长期记忆开关（默认关；关时前端不读也不写磁盘） */
+  longMemory?: boolean;
   /**
    * API 网关运行态（Rust 在每次启停时推送）。
    * 用于让**已打开的**右键菜单立即改写「启动 / 停止」文案，避免两侧菜单状态不一致。
@@ -304,6 +306,13 @@ export default function PetRoot() {
    * 与既有红线「桌宠不写任何业务数据」一致；而且重启后"重新认识"也更自然。
    */
   const chatHistoryRef = useRef<ChatTurn[]>([]);
+  /**
+   * 长期记忆开关（默认 false = 不落盘）。
+   *
+   * 语义刻意与旧的「只存内存」完全等价：关着的时候不读也不写磁盘，
+   * 关闭动作由 Rust 侧连带清除历史（见 pet.rs::pet_memory_clear）。
+   */
+  const longMemoryRef = useRef(false);
   /** 输入条是否展开的最新值（事件回调用，避免闭包旧值） */
   const chatOpenRef = useRef(false);
   chatOpenRef.current = chatOpen;
@@ -333,6 +342,18 @@ export default function PetRoot() {
     lastLineRef.current = text;
     bubbleSeqRef.current += 1;
     setBubble({ seq: bubbleSeqRef.current, text });
+  }, []);
+
+  /**
+   * 把当前历史写回磁盘（仅在长期记忆开启时）。
+   *
+   * 失败一律静默：记忆是锦上添花，不能因为它写不进去就打断对话
+   * （Rust 侧已落 app.log，排查时看得到）。
+   */
+  const persistMemory = useCallback(() => {
+    if (!longMemoryRef.current) return;
+    const turns = chatHistoryRef.current.map((t) => ({ role: t.role, content: t.content }));
+    void api.pet.memorySave(turns).catch(() => {});
   }, []);
 
   const clearSadTimer = useCallback(() => {
@@ -457,6 +478,7 @@ export default function PetRoot() {
         role: 'user',
         content: clipped,
       });
+      persistMemory();
 
       // 3) **保持输入条打开**（不收起）：
       //    多轮对话的关键是"问完能马上追问"。收起会逼用户再右键一次，多轮体验直接断掉。
@@ -469,7 +491,7 @@ export default function PetRoot() {
         mode: 'chat',
       });
     },
-    [playTransient, startSay],
+    [playTransient, startSay, persistMemory],
   );
 
   /** 自动点评（auto 档）：节流 + 「别打扰」判定都在 usePetAutoSay 内 */
@@ -610,6 +632,24 @@ export default function PetRoot() {
       if (typeof patch.easterEggMinutes === 'number' && patch.easterEggMinutes > 0) {
         setEasterEggMinutes(Math.min(30, Math.max(1, Math.round(patch.easterEggMinutes))));
       }
+      // 长期记忆：从关到开时把历史读回来（开着时反复读没有意义，还会覆盖当前内存态）
+      if (typeof patch.longMemory === 'boolean' && patch.longMemory !== longMemoryRef.current) {
+        longMemoryRef.current = patch.longMemory;
+        if (patch.longMemory) {
+          void api.pet
+            .memoryLoad()
+            .then((turns) => {
+              if (disposed || !turns?.length) return;
+              chatHistoryRef.current = trimHistory(
+                turns.map((t) => ({ role: t.role, content: t.content })),
+              );
+            })
+            .catch(() => {});
+        } else {
+          // 关掉即弃：内存里的也一起清，避免"界面关了、下一轮还带着旧上下文"
+          chatHistoryRef.current = [];
+        }
+      }
     };
 
     void api.pet
@@ -626,6 +666,7 @@ export default function PetRoot() {
           anniversary: s.anniversary,
           easterEgg: s.easterEgg,
           easterEggMinutes: s.easterEggMinutes,
+          longMemory: s.longMemory,
         });
       })
       .catch(() => {
@@ -709,11 +750,16 @@ export default function PetRoot() {
     if (!finalText) return;
     if (recordedSayRef.current === say.sessionId) return;
     recordedSayRef.current = say.sessionId;
+    // 只记「用户对话」的答复，不记自动点评（auto 档独白）。
+    // 独白是"看见你在签到就随口说一句"，与对话上下文无关；混进历史会把随机台词
+    // 当成模型说过的话送给下一轮，长期记忆一开还会被永久存下来。
+    if (lastTriggerRef.current !== 'user') return;
     chatHistoryRef.current = appendTurn(chatHistoryRef.current, {
       role: 'assistant',
       content: finalText,
     });
-  }, [say]);
+    persistMemory();
+  }, [say, persistMemory]);
 
   /* ------------------- AI 发言 ↔ 核心态 / 气泡 ------------------- */
   useEffect(() => {

@@ -198,6 +198,8 @@ fn main() {
             commands::pet_pack::pet_pack_manifest,
             // 桌宠 AI 对话（P3）：进程内复用 API 网关，流式事件 pet-say-*
             commands::pet::pet_say,
+            commands::pet::pet_memory_load,
+            commands::pet::pet_memory_save,
             // P7 内联对话：输入期间强制整窗可交互（暂停点击穿透切换）+ 取得键盘焦点
             commands::pet::pet_set_chat_focus,
             commands::pet::pet_focus_for_input,

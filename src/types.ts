@@ -511,6 +511,10 @@ export interface Settings {
   pet_easter_egg?: boolean | null;
   /** 彩蛋 / 节日 / 时段触发间隔（分钟；null = 1） */
   pet_easter_egg_minutes?: number | null;
+  /** 长期记忆：对话是否落盘（null/false = 不落盘，默认隐私优先） */
+  pet_long_memory?: boolean | null;
+  /** 长期记忆保留条数上限（null = 40） */
+  pet_memory_turns?: number | null;
 }
 
 /**
@@ -547,6 +551,10 @@ export interface PetStatus {
   easterEgg?: boolean;
   /** P6：彩蛋 / 节日 / 时段触发间隔（分钟，默认 1） */
   easterEggMinutes?: number;
+  /** 长期记忆：对话是否落盘（默认关，关闭后磁盘不保留任何历史） */
+  longMemory?: boolean;
+  /** 长期记忆保留的轮数上限 */
+  memoryTurns?: number;
 }
 
 /** F-74：会话域（WorkBuddy = ~/.workbuddy，CodeBuddy = ~/.codebuddy） */

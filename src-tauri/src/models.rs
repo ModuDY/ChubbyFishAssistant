@@ -435,6 +435,21 @@ pub struct Settings {
     /// 彩蛋 / 节日 / 时段共用的触发间隔（分钟，1~30；None = 1）
     #[serde(default)]
     pub pet_easter_egg_minutes: Option<u32>,
+    /// 长期记忆：对话历史是否**落盘**、重启后继续接上。None/false = 不落盘（默认）。
+    ///
+    /// 默认关闭是刻意的：聊天内容属于隐私，原设计明确「只存内存、重启即忘」。
+    /// 这里把它变成显式开关而不是改变默认行为——想让它记事的人自己打开，
+    /// 不想留下痕迹的人什么都不用做。关闭时还必须**清除已存的旧记录**，
+    /// 否则「关了但文件还在」，隐私承诺就是假的（见 pet.rs::pet_memory_clear 的调用点）。
+    #[serde(default)]
+    pub pet_long_memory: Option<bool>,
+    /// 长期记忆保留的轮数上限（None = 40 条）。
+    ///
+    /// 为什么要有上限而不是无限攒：每轮都会被送进 prompt，条数越多成本越高、
+    /// 越容易把早期无关内容拖进上下文；桌宠需要的是"记得前两天聊过什么"，
+    /// 不是完整聊天归档。
+    #[serde(default)]
+    pub pet_memory_turns: Option<u32>,
 }
 
 fn default_api_port() -> u16 {
