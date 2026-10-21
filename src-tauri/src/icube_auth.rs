@@ -274,4 +274,48 @@ mod tests {
         let bad = base64::engine::general_purpose::STANDARD.encode([1u8; 64]);
         assert!(tc_decrypt(&bad, false).is_err());
     }
+
+    /// 本机诊断（默认忽略，手动跑）：不解密也能看出凭证链断在哪一环。
+    /// 只输出**状态与错误原因**，绝不打印私钥或明文。
+    #[test]
+    #[ignore = "依赖本机 Trae 安装，手动执行诊断"]
+    fn diag_local_credentials() {
+        let appdata = std::env::var("APPDATA").unwrap_or_default();
+        let path = std::path::PathBuf::from(&appdata)
+            .join("Trae CN")
+            .join("User")
+            .join("globalStorage")
+            .join("storage.json");
+        let raw = std::fs::read_to_string(&path).expect("storage.json 读取失败");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("storage.json 解析失败");
+        let obj = v.as_object().expect("非对象");
+        let mut found = 0usize;
+        for (k, val) in obj {
+            let Some(id) = k.strip_prefix("iCubeAuthInfo://icube-dc:") else { continue };
+            found += 1;
+            let b64 = val.as_str().unwrap_or("");
+            println!("[diag] device={id} b64len={}", b64.len());
+            // 两种模式都试：AES 与 AES_PRIVATE
+            for (label, priv_mode) in [("AES", false), ("AES_PRIVATE", true)] {
+                match tc_decrypt(b64, priv_mode) {
+                    Ok(plain) => {
+                        let has_pem = plain.contains("privateKeyPEM") && plain.contains("BEGIN");
+                        println!("[diag]   {label}: OK len={} 含privateKeyPEM={has_pem}", plain.len());
+                    }
+                    Err(e) => println!("[diag]   {label}: ERR {e}"),
+                }
+            }
+        }
+        println!("[diag] icube 键共 {found} 个");
+        let creds = extract_device_credentials();
+        println!("[diag] 最终可用凭证 {} 个", creds.len());
+        for c in &creds {
+            println!(
+                "[diag]   device={} machineId={} appVersion=[{}]",
+                c.device_id,
+                if c.machine_id.is_empty() { "<空>" } else { "有" },
+                c.app_version
+            );
+        }
+    }
 }

@@ -299,7 +299,8 @@ fn load_or_create_oauth_device(state: &AppState) -> OAuthDevice {
     // device_id 首选 icube 设备凭证（F-78 DeviceProof）：签名私钥与 icube-dc
     // deviceId 绑定，登录 URL 的 device_id 必须与之同源，否则服务端 20403/20405；
     // 恒覆盖旧值（旧值是随机/device_map 对齐的，与私钥不匹配）
-    if let Some(cred) = icube_device_creds().first() {
+    let local_creds = icube_device_creds();
+    if let Some(cred) = local_creds.first() {
         if dev.device_id != cred.device_id {
             dev.device_id = cred.device_id.clone();
             let _ = store.kv_set("oauth_device", &dev);
@@ -341,9 +342,9 @@ fn load_or_create_oauth_device(state: &AppState) -> OAuthDevice {
 
 /// 按会话 device_id 匹配本机凭证（DeviceInfo/DeviceProof 的设备与签名私钥必须
 /// 同源，20403/20405 实测拒绝）；匹配不到返回 None 由调用方兜底
-fn find_cred_by_device(device_id: &str) -> Option<&'static crate::icube_auth::DeviceCredential> {
+fn find_cred_by_device(device_id: &str) -> Option<crate::icube_auth::DeviceCredential> {
     icube_device_creds()
-        .iter()
+        .into_iter()
         .find(|c| c.device_id == device_id)
 }
 
@@ -400,8 +401,8 @@ fn select_login_device(state: &AppState) -> (String, String) {
             .iter()
             .map(|a| a.user_id.clone())
             .collect();
-        let counts = credential_binding_counts(creds, &map, &uids);
-        if let Some(cred) = select_credential_index(creds, &counts).map(|i| &creds[i]) {
+        let counts = credential_binding_counts(&creds, &map, &uids);
+        if let Some(cred) = select_credential_index(&creds, &counts).map(|i| &creds[i]) {
             return (cred.device_id.clone(), cred.machine_id.clone());
         }
     }
@@ -774,13 +775,43 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, host: &str
 
     // issue #76：凭证按会话选定 device_id 匹配（DeviceInfo.DeviceID 与签名私钥必须
     // 同源）；匹配不到（无在途会话且回调粘贴等）回退首个凭证——历史行为
-    let cred = find_cred_by_device(device_id).or_else(|| icube_device_creds().first());
+    let local_creds = icube_device_creds();
+    let cred = find_cred_by_device(device_id).or_else(|| local_creds.first().cloned());
+
+    // 诊断（2026-10-21 故障闭环）：没凭证就只能走无 DeviceInfo 的兜底变体，
+    // 服务端只会回含糊的「无效参数」。此处把「本机扫到几套凭证、为什么对不上」
+    // 明确落日志，避免下次又靠猜。
+    match &cred {
+        None => fs_utils::app_log(
+            data_dir,
+            &format!(
+                "[OAuth交换] 本机未扫到 icube 设备凭证（扫描到 {} 套，会话 device_id={}）\
+→ 只能走兜底变体，服务端大概率回「无效参数」。请确认已登录/启动过 Trae CN 客户端",
+                local_creds.len(),
+                device_id
+            ),
+        ),
+        Some(c) if c.app_version.is_empty() => fs_utils::app_log(
+            data_dir,
+            "[OAuth交换] 设备凭证缺少 appVersion（Trae 客户端不在默认安装路径）\
+→ ClientVersion 回退为内置版本号",
+        ),
+        Some(_) => {}
+    }
 
     // 主变体（真实客户端形态）：DeviceInfo 对象 + IDEVersion，无 DeviceProof
-    if let Some(cred) = cred {
+    if let Some(cred) = &cred {
         let pub_pem = crate::icube_auth::device_public_key_pem(cred)
             .unwrap_or_default();
         let url = format!("{}/trae/api/v3/oauth/ExchangeToken", host.trim_end_matches('/'));
+        // Trae 装在非默认路径时读不到 package.json，app_version 为空。
+        // 空串会让 DeviceInfo.ClientVersion 缺失（服务端只回含糊的「无效参数」），
+        // 故回退到与登录 URL 参数同源的版本常量。
+        let client_version = if cred.app_version.trim().is_empty() {
+            OAUTH_PAGE_APP_VERSION
+        } else {
+            cred.app_version.as_str()
+        };
         variants.push((
             "ExchangeToken/DeviceInfo".into(),
             url,
@@ -795,14 +826,14 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, host: &str
                     "DeviceType": "PC",
                     "DeviceName": "",
                     "DeviceModel": "",
-                    "ClientVersion": cred.app_version,
+                    "ClientVersion": client_version,
                     "DevicePublicKey": pub_pem,
                     "DeviceBrand": "",
                     "DeviceCPU": "",
                     "OSInfo": "",
                     "OSVersion": "",
                 },
-                "IDEVersion": cred.app_version,
+                "IDEVersion": client_version,
             }),
             // 真实客户端 m("") 头形态：x-cloudide-token 必须带空串（F-70 实测缺失报 20403）
             true,
@@ -811,7 +842,7 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, host: &str
 
     // 兜底：旧形态探测变体（DeviceProof 是 refreshToken 刷新场景的结构，AuthCode
     // 场景按逆向结论不应携带；保留以验证逆向结论，全部失败时错误码进 app.log）
-    if let Some(cred) = cred {
+    if let Some(cred) = &cred {
         let proof_path_com = "/cloudide/api/v3/trae/oauth/ExchangeToken";
         for (fmt, tag_base, url) in [
             (
@@ -874,10 +905,19 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, host: &str
     Err(format!("全部交换变体失败 → {}", errs.join(" | ")))
 }
 
-/// 本机 Trae 客户端 icube 设备凭证（进程内缓存；首次调用扫描 storage.json）
-fn icube_device_creds() -> &'static [crate::icube_auth::DeviceCredential] {
-    static CREDS: std::sync::OnceLock<Vec<crate::icube_auth::DeviceCredential>> = std::sync::OnceLock::new();
-    CREDS.get_or_init(crate::icube_auth::extract_device_credentials)
+/// 本机 Trae 客户端 icube 设备凭证（每次现扫 `storage.json`）。
+///
+/// **不再用 `OnceLock` 缓存**（2026-10-21 线上故障的根因）：
+/// 此前是"进程内只扫一次"。用户先开本应用（17:41 启动）、后登录 Trae 客户端
+/// （17:48 才把 `iCubeAuthInfo://icube-dc:*` 写进 storage.json）时，缓存里
+/// 是空表且永不刷新，于是 AuthCode 交换退化成"无设备凭证"的两个兜底变体，
+/// 服务端只回一句 `10101/040004 无效参数：{__Message.field}`——
+/// 用户看到的就是"OAuth 登录失败"，而真实原因压根没被说出来。
+///
+/// 现改为一律现扫：读 15KB JSON + AES 解密一台设备，仅在登录/刷新时调用，
+/// 开销可忽略；换来的是"Trae 刚装好/Trae 刚登录"这类时序场景不会假死。
+fn icube_device_creds() -> Vec<crate::icube_auth::DeviceCredential> {
+    crate::icube_auth::extract_device_credentials()
 }
 
 /// 单个交换变体尝试：脱敏日志（请求+响应全量）→ 设备头请求 → 火山信封错误解析 →
@@ -1159,15 +1199,16 @@ pub(crate) fn exchange_token_refresh(
     let client_id = oauth_client().client_id.clone();
     let cred = device_id_override
         .and_then(find_cred_by_device)
-        .or_else(|| icube_device_creds().first());
+        .or_else(|| icube_device_creds().into_iter().next());
     let device_id = cred
+        .as_ref()
         .map(|c| c.device_id.clone())
         .unwrap_or_else(|| load_or_create_oauth_device(state).device_id);
 
     // 变体链（主→兜底）：固化协议 P1363/DER → 旧端点 P1363 → 旧协议（无凭证时唯一路径）
     let new_url = "https://api.trae.com.cn/trae/api/v3/oauth/ExchangeToken";
     let mut variants: Vec<(String, String, serde_json::Value, bool)> = Vec::new();
-    if let Some(cred) = cred {
+    if let Some(cred) = &cred {
         for (fmt, url, sign_path) in [
             (
                 crate::icube_auth::ProofSigFormat::P1363,
