@@ -37,6 +37,8 @@ import { usePetSay, type SayState, type SayTurn } from './usePetSay';
 import PetChatInput from './PetChatInput';
 import PetRpsGame from './PetRpsGame';
 import type { RpsRoundPayload } from './PetRpsGame';
+import PetSimonGame from './PetSimonGame';
+import { reactionFor, type SimonRoundPayload } from './simon';
 import PetMenu from './PetMenu';
 import type { PackEntry, PetMenuView } from './PetMenu';
 import { placeMenu } from './menuPlacement';
@@ -137,6 +139,9 @@ type PetUpdatePayload = {
  * 只做角度扰动，不追加任何格式要求（格式要求会让它先在思考里"规划怎么满足"）。
  */
 const SAY_ANGLES = ['随口说一句', '吐槽一句', '关心我一句', '跟我撒个娇'];
+
+/** 桌宠互动小游戏（同时只开一个，判断"是否在对局中"统一看 `activeGame !== null`） */
+type PetGame = 'rps' | 'simon';
 
 /** 组装给 AI 的提问：只含状态摘要与时间，不含账号名/邮箱/金额等敏感信息 */
 function buildSayPrompt(context?: string): string {
@@ -273,6 +278,11 @@ export default function PetRoot() {
   const lastEventSummaryRef = useRef<string | undefined>(undefined);
   /** 最近一次发言的触发来源：决定失败时是否回落本地台词（自动档静默，避免刷屏） */
   const lastTriggerRef = useRef<'user' | 'auto'>('user');
+  /**
+   * 游戏解说请求：被拒（5s 独白节流 / 当日上限 / 网关未启动）时静默。
+   * 本地台词已经在 `playTransient` 里说过，再补一句反而是重复刷屏。
+   */
+  const silentSayRef = useRef(false);
   /** 本次发言是否由我们把核心态抬到了 thinking（结束只回退自己抬高的一档） */
   const sayThinkingRef = useRef(false);
   /** 点击时间戳历史（滚动 3s 窗口）：用于区分"打招呼 / 戳烦了 / 炸毛" */
@@ -298,14 +308,15 @@ export default function PetRoot() {
   const chatOpenRef = useRef(false);
   chatOpenRef.current = chatOpen;
   /**
-   * P9：猜拳面板是否展开。
+   * P9/P10：当前展开的小游戏面板（null = 没开）。
    *
    * 与 `chatOpen` 平级而非合并成一个「面板」状态：两者的掩码矩形、关闭时机、
    * 「别打扰」判定语义都不同，合并会让每个消费点都要再判一次类型。
+   * 游戏之间互斥（同时只开一个），故用联合类型而不是多个布尔。
    */
-  const [gameOpen, setGameOpen] = useState(false);
-  const gameOpenRef = useRef(false);
-  gameOpenRef.current = gameOpen;
+  const [activeGame, setActiveGame] = useState<PetGame | null>(null);
+  const activeGameRef = useRef<PetGame | null>(null);
+  activeGameRef.current = activeGame;
 
   // 透明窗口要求 html/body 无背景：class 只在本页挂载期间存在
   useEffect(() => {
@@ -393,6 +404,8 @@ export default function PetRoot() {
   /* ------------------------- AI 发言（P3） ------------------------- */
   const handleSayFallback = useCallback(
     (reason: string) => {
+      // 游戏解说被节流/限流拒掉属于预期内：本地台词已说过，不再补一句
+      if (silentSayRef.current) return;
       // 档位关闭/网关未启动等"预期内"的拒绝不提示；主动触发给一句本地台词兜底，
       // 自动档静默（否则会变成刷屏）
       if (lastTriggerRef.current !== 'user') return;
@@ -470,7 +483,7 @@ export default function PetRoot() {
       !!sayRef.current?.streaming ||
       // 用户正在打字/对局时不自动点评：会把输入条顶掉、或让气泡压住出招按钮
       chatOpenRef.current ||
-      gameOpenRef.current ||
+      activeGameRef.current !== null ||
       document.hidden,
     startSay: (prompt, context, trigger) => {
       lastTriggerRef.current = trigger ?? 'auto';
@@ -974,6 +987,60 @@ export default function PetRoot() {
   );
 
   /**
+   * P10 记忆亮灯：一轮结束 → 动作 + 一句 AI 解说（**每轮都请**，用户明确选择）。
+   *
+   * 两条护栏都是必需的：
+   * 1. **上一句还在流式就跳过**：Rust 侧新请求会 abort 旧请求，正在说的话会被截成半句；
+   * 2. **被拒时静默**：独白档有 5s 节流，短序列的前几轮必然落在窗口内。
+   *    此时本地台词已由 `playTransient` 说过，不再兜底（`silentSayRef`）。
+   *
+   * 解说走独白档（`mode` 缺省）：只要一句话、low 思考、不挂联网工具——
+   * 对话档会带 medium 思考与 web_search，反而拖慢首字。
+   */
+  const commentOnSimon = useCallback(
+    (r: SimonRoundPayload) => {
+      if (aiMode === 'off' || sayRef.current?.streaming) return;
+      const fact =
+        r.event === 'miss'
+          ? `你陪我玩「记忆亮灯」：序列到第 ${r.round} 个，你在第 ${r.wrongAt ?? 1} 个按错了，这局最高 ${r.best} 个`
+          : r.event === 'record'
+            ? `你陪我玩「记忆亮灯」：一次记住 ${r.round} 个，刷新了这局纪录`
+            : `你陪我玩「记忆亮灯」：一次记住 ${r.round} 个`;
+      silentSayRef.current = true;
+      lastTriggerRef.current = 'user';
+      void startSay(
+        `${fact}。就着这件事说一句（20 字以内），别列清单，也别复述我原话。`,
+        null,
+        'user',
+      ).finally(() => {
+        silentSayRef.current = false;
+      });
+    },
+    [aiMode, startSay],
+  );
+
+  /**
+   * P10：记忆亮灯一轮结束 → 播动作 + 本地台词 + AI 解说。
+   *
+   * 顺序有原因：动作与本地台词**先出**（零延迟），AI 解说随后到（气泡优先级更高，
+   * 会自然替换成本地台词）。反过来会让玩家在等待首字的几秒里什么反馈都没有。
+   */
+  const handleSimonRound = useCallback(
+    (r: SimonRoundPayload) => {
+      const { action, linePool } = reactionFor(r.event, r.best);
+      const kind: PetTransientKind =
+        action === 'talent-violin'
+          ? 'perform'
+          : action === 'work-celebrate'
+            ? 'happy'
+            : 'click';
+      playTransient(kind, pickLine(linePool, lastLineRef.current), action);
+      commentOnSimon(r);
+    },
+    [playTransient, commentOnSimon],
+  );
+
+  /**
    * 悬停抚摸轮询：鼠标静止在角色上 1.2s 就摸一下。
    *
    * 为什么不用 `onMouseEnter/Leave`：窗口是置顶的**透明且可穿透**窗口，
@@ -989,7 +1056,7 @@ export default function PetRoot() {
 
   /** 输入条 DOM 引用：掩码合成要用它量矩形（必须先于 withOverlayMask 声明） */
   const chatBoxRef = useRef<HTMLDivElement | null>(null);
-  /** P9：猜拳面板 DOM 引用（同上，量矩形并入掩码） */
+  /** P9/P10：游戏面板 DOM 引用（同上，量矩形并入掩码；两个游戏互斥，共用一个锚点） */
   const gameBoxRef = useRef<HTMLDivElement | null>(null);
 
   /** 把一个元素的矩形并进掩码（元素不存在/未布局时原样返回） */
@@ -1008,7 +1075,7 @@ export default function PetRoot() {
   }, []);
 
   /**
-   * 把「可点击浮层」矩形并进掩码交给 Rust（P7 输入条 + P9 猜拳面板）。
+   * 把「可点击浮层」矩形并进掩码交给 Rust（P7 输入条 + P9/P10 游戏面板）。
    *
    * 为什么掩码要感知浮层：穿透线程按格子判断"光标是否在透明区"，
    * 浮层不在 sprite alpha 里 → 不并进去就会被判成透明 → 按钮点不动。
@@ -1021,7 +1088,7 @@ export default function PetRoot() {
   const withOverlayMask = useCallback(
     (base: Uint8Array) => {
       const chat = chatOpenRef.current ? mergeMaskRect(base, chatBoxRef.current) : base;
-      return gameOpenRef.current ? mergeMaskRect(chat, gameBoxRef.current) : chat;
+      return activeGameRef.current ? mergeMaskRect(chat, gameBoxRef.current) : chat;
     },
     [mergeMaskRect],
   );
@@ -1230,7 +1297,7 @@ export default function PetRoot() {
 
   // Esc：二级视图逐级返回，主菜单关闭；同时收起输入条 / 结束对局
   useEffect(() => {
-    if (!menu && !chatOpen && !gameOpen) return;
+    if (!menu && !chatOpen && !activeGame) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
       if (menu) {
@@ -1238,11 +1305,11 @@ export default function PetRoot() {
         else setMenu(null);
       }
       if (chatOpen) setChatOpen(false);
-      if (gameOpen) setGameOpen(false);
+      if (activeGame) setActiveGame(null);
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [menu, chatOpen, gameOpen]);
+  }, [menu, chatOpen, activeGame]);
 
   /**
    * 卡片尺寸实测：首帧用 `MENU_H_FALLBACK` 占位，挂载后立即按真实 rect 校正落位。
@@ -1301,9 +1368,9 @@ export default function PetRoot() {
    * 展开后等一帧再量矩形：组件刚挂载时还没布局完成，`getBoundingClientRect` 会拿到 0。
    */
   useEffect(() => {
-    // 两个浮层（输入条 / 猜拳面板）共用一套掩码合成：任一打开就要把它的矩形并进去，
+    // 两个浮层（输入条 / 游戏面板）共用一套掩码合成：任一打开就要把它的矩形并进去，
     // 全部关闭才恢复纯 sprite 掩码——否则先关一个会把另一个的格子一起擦掉
-    if (!chatOpen && !gameOpen) {
+    if (!chatOpen && !activeGame) {
       // 收起：恢复真实掩码（去掉之前并进来的浮层格子）
       if (maskRef.current && !menuOpenRef.current) {
         void api.pet
@@ -1326,7 +1393,7 @@ export default function PetRoot() {
       cancelled = true;
       window.cancelAnimationFrame(raf);
     };
-  }, [chatOpen, gameOpen, withOverlayMask]);
+  }, [chatOpen, activeGame, withOverlayMask]);
 
   /* --------------------------- 播放调度 --------------------------- */
   const actionId = dragging ? 'drag-dangle' : (transient?.action ?? coreAction(core, idleTick));
@@ -1432,10 +1499,14 @@ export default function PetRoot() {
           />
         </div>
       ) : null}
-      {/* P9 猜拳面板：放在角色右侧的透明留白（与右键菜单同一区域），不遮角色也不压气泡 */}
-      {gameOpen ? (
+      {/* P9/P10 小游戏面板：放在角色右侧的透明留白（与右键菜单同一区域），不遮角色也不压气泡 */}
+      {activeGame ? (
         <div className="pet-game-anchor" ref={gameBoxRef}>
-          <PetRpsGame onClose={() => setGameOpen(false)} onRoundEnd={handleRpsRound} />
+          {activeGame === 'rps' ? (
+            <PetRpsGame onClose={() => setActiveGame(null)} onRoundEnd={handleRpsRound} />
+          ) : (
+            <PetSimonGame onClose={() => setActiveGame(null)} onRoundEnd={handleSimonRound} />
+          )}
         </div>
       ) : null}
       {/* 气泡锚点：底边贴在角色头顶上方，而不是窗口顶部 */}
@@ -1519,7 +1590,7 @@ export default function PetRoot() {
             closeMenu();
             // 输入条与对局面板不能同时开：两者的 setChatFocus/掩码矩形成对出现，
             // 交错关闭会让先关的那个把穿透暂停一起复位（另一个还在花屏/点不动）
-            setGameOpen(false);
+            setActiveGame(null);
             setChatOpen(true);
           }}
           onSay={() => {
@@ -1532,7 +1603,12 @@ export default function PetRoot() {
             closeMenu();
             // 输入条与对局面板同占右侧/底部空间，开对局先收起输入条避免互相遮挡
             setChatOpen(false);
-            setGameOpen(true);
+            setActiveGame('rps');
+          }}
+          onPlaySimon={() => {
+            closeMenu();
+            setChatOpen(false);
+            setActiveGame('simon');
           }}
           onPlayAction={playMenuAction}
           onPlayRandom={playRandomAction}

@@ -16,6 +16,7 @@ import {
   Gamepad2,
   Layers,
   LayoutGrid,
+  Lightbulb,
   MapPin,
   MessageCircle,
   Plug,
@@ -55,6 +56,8 @@ export type PetMenuProps = {
   onInteract: (kind: PetTransientKind) => void;
   /** P9：打开猜拳对局（面板在角色右侧，与菜单同区域） */
   onPlayGame: () => void;
+  /** P10：打开记忆亮灯（同一面板区域，与猜拳互斥） */
+  onPlaySimon: () => void;
   onPlayAction: (id: string) => void;
   onPlayRandom: () => void;
   onPickPack: (id: string) => void;
@@ -152,6 +155,10 @@ function QuickMenu(props: PetMenuProps) {
       <button type="button" className="pet-menu-item" data-nav onClick={props.onPlayGame}>
         <Gamepad2 className="pet-menu-icon" aria-hidden />
         <span>石头剪刀布</span>
+      </button>
+      <button type="button" className="pet-menu-item" data-nav onClick={props.onPlaySimon}>
+        <Lightbulb className="pet-menu-icon" aria-hidden />
+        <span>记忆亮灯</span>
       </button>
 
       {aiMode !== 'off' ? (

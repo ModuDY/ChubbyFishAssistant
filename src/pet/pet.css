@@ -440,6 +440,83 @@ body.pet-window {
   color: #64748b;
 }
 
+/* ---- P10 记忆亮灯：2×2 灯阵 ----
+   面板复用 .pet-game，只多一套灯阵。灯位用固定高度而不是 aspect-ratio：
+   矮窗口（scale 0.6 时窗口仅 ~264px 高）下方形灯阵会把卡片撑出屏幕。
+   常态压暗（opacity .42）只留颜色暗示，亮起才是"信号"——与实体 Simon 一致。 */
+.pet-simon-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 4px;
+}
+
+.pet-simon-pad {
+  position: relative;
+  height: 52px;
+  border: 1px solid rgba(15, 23, 42, 0.12);
+  border-radius: 10px;
+  opacity: 0.42;
+  cursor: pointer;
+  transition: opacity 0.12s ease, transform 0.12s ease, box-shadow 0.12s ease;
+}
+
+.pet-simon-pad:disabled {
+  cursor: default;
+}
+
+.pet-simon-pad.is-p0 {
+  background: #22c55e;
+}
+
+.pet-simon-pad.is-p1 {
+  background: #ef4444;
+}
+
+.pet-simon-pad.is-p2 {
+  background: #3b82f6;
+}
+
+.pet-simon-pad.is-p3 {
+  background: #f59e0b;
+}
+
+/* 亮灯：提亮 + 轻微放大 + 白色光晕，透明窗口里也能一眼看见 */
+.pet-simon-pad.is-lit {
+  opacity: 1;
+  transform: scale(1.04);
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.9), 0 0 14px rgba(255, 255, 255, 0.85);
+}
+
+/* 按错：闪红 + 抖动，告诉玩家错在哪一位 */
+.pet-simon-pad.is-wrong {
+  opacity: 1;
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.6);
+  animation: pet-simon-shake 0.28s ease-in-out;
+}
+
+@keyframes pet-simon-shake {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  25% {
+    transform: translateX(-3px);
+  }
+  75% {
+    transform: translateX(3px);
+  }
+}
+
+/* 灯位序号：键盘 1-4 的提示，压在白字上做最小标识 */
+.pet-simon-num {
+  position: absolute;
+  left: 6px;
+  top: 4px;
+  font-size: 9px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.9);
+}
+
 /* ---- 右键菜单（V2：光标锚定 / 单层翻页 / 搜索式点播） ----
  * 设计见 docs/pending/桌宠右键菜单重设计方案.md
  * 关键点：一张卡片三个视图，动作列表只有「搜索 + 分类 + 扁平列表」，
