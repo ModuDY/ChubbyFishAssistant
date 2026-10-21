@@ -117,6 +117,99 @@ fn default_position(window: &WebviewWindow, w: f64, h: f64) -> Option<LogicalPos
     ))
 }
 
+/// 显示器的物理矩形 + 自己的 DPI 缩放（纯数据，便于脱离窗口单测）。
+#[derive(Clone, Copy, Debug)]
+struct MonitorRect {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    scale: f64,
+}
+
+impl MonitorRect {
+    fn right(&self) -> i32 {
+        self.x + self.w
+    }
+    fn bottom(&self) -> i32 {
+        self.y + self.h
+    }
+    /// 该显示器下，给定逻辑尺寸换算出的物理尺寸（DPI 感知的核心：
+    /// 同一逻辑尺寸在不同缩放率的屏上物理像素数不同）
+    fn physical_size(&self, logical_w: f64, logical_h: f64) -> (i32, i32) {
+        (
+            (logical_w * self.scale).round() as i32,
+            (logical_h * self.scale).round() as i32,
+        )
+    }
+}
+
+/// 两矩形重叠面积（无重叠为 0）。
+fn overlap_area(a: (i32, i32, i32, i32), b: MonitorRect) -> i64 {
+    let (ax, ay, aw, ah) = a;
+    let left = ax.max(b.x);
+    let top = ay.max(b.y);
+    let right = (ax + aw).min(b.right());
+    let bottom = (ay + ah).min(b.bottom());
+    if right <= left || bottom <= top {
+        return 0;
+    }
+    (right - left) as i64 * (bottom - top) as i64
+}
+
+/// 夹紧算法的纯函数内核（不碰窗口系统）。
+///
+/// **DPI 口径（2026-10-21 修复）**：物理尺寸必须用**目标显示器自己的** scale_factor
+/// 换算，而不是窗口当前所在屏的。混合 DPI 多屏（如 1.0 + 1.5）下把桌宠拖到另一块屏后，
+/// 旧的 `window.scale_factor()` 会拿到源屏的缩放率，算出的 `pw/ph` 偏大或偏小，
+/// 贴边时被多推/少推一段——表现为「拖到副屏靠右，露出去一截」或「明明还没到边就停住」。
+///
+/// **选屏口径**：取与窗口重叠面积最大的显示器，而不是「左上角落在哪个屏」。
+/// 后者在窗口被拖到半出屏外（左上角已在屏外）时会整块跳回主屏。
+/// 全都不重叠时取中心点最近的屏，避免窗口彻底失联。
+fn clamp_origin_to_monitors(
+    logical_w: f64,
+    logical_h: f64,
+    x: i32,
+    y: i32,
+    monitors: &[MonitorRect],
+) -> (i32, i32) {
+    if monitors.is_empty() {
+        return (x, y);
+    }
+    // 每个候选屏按自己的 DPI 算物理尺寸，再比重叠面积
+    let mut best: Option<(i64, MonitorRect)> = None;
+    for m in monitors {
+        let (pw, ph) = m.physical_size(logical_w, logical_h);
+        let area = overlap_area((x, y, pw, ph), *m);
+        if best.map_or(true, |(a, _)| area > a) {
+            best = Some((area, *m));
+        }
+    }
+    let monitor = match best {
+        Some((area, m)) if area > 0 => m,
+        // 完全在屏幕外：按窗口中心与各屏中心的距离取最近的一个
+        _ => {
+            let (pw, ph) = monitors[0].physical_size(logical_w, logical_h);
+            let (cx, cy) = (x + pw / 2, y + ph / 2);
+            *monitors
+                .iter()
+                .min_by_key(|m| {
+                    let dx = (cx - (m.x + m.w / 2)) as i64;
+                    let dy = (cy - (m.y + m.h / 2)) as i64;
+                    dx * dx + dy * dy
+                })
+                .unwrap_or(&monitors[0])
+        }
+    };
+
+    let (pw, ph) = monitor.physical_size(logical_w, logical_h);
+    // 窗口比显示器还大时（极端 DPI + 最大缩放），以显示器左上角为准
+    let max_x = (monitor.right() - pw).max(monitor.x);
+    let max_y = (monitor.bottom() - ph).max(monitor.y);
+    (x.clamp(monitor.x, max_x), y.clamp(monitor.y, max_y))
+}
+
 /// 把窗口左上角夹紧到「所在显示器」的可见范围内。
 ///
 /// 为什么需要：`MENU_SPACE` 加宽后窗口更宽，用户记忆的 `pet_x` 若贴着屏幕右缘，
@@ -129,31 +222,23 @@ fn clamp_origin(
     logical_w: f64,
     logical_h: f64,
 ) -> (i32, i32) {
-    let sf = window.scale_factor().unwrap_or(1.0);
-    let pw = (logical_w * sf).round() as i32;
-    let ph = (logical_h * sf).round() as i32;
-
-    let target = window
+    let monitors: Vec<MonitorRect> = window
         .available_monitors()
-        .ok()
-        .and_then(|mons| {
-            mons.into_iter().find(|m| {
-                let p = m.position();
-                let s = m.size();
-                x >= p.x && y >= p.y && x < p.x + s.width as i32 && y < p.y + s.height as i32
-            })
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| MonitorRect {
+            x: m.position().x,
+            y: m.position().y,
+            w: m.size().width as i32,
+            h: m.size().height as i32,
+            // 关键：每块屏取自己的缩放率，后续按它换算物理尺寸
+            scale: m.scale_factor(),
         })
-        .or_else(|| window.primary_monitor().ok().flatten());
-
-    let Some(monitor) = target else {
+        .collect();
+    if monitors.is_empty() {
         return (x, y);
-    };
-    let pos = monitor.position();
-    let size = monitor.size();
-    // 窗口比显示器还大时（极端 DPI + 最大缩放），以显示器左上角为准
-    let max_x = (pos.x + size.width as i32 - pw).max(pos.x);
-    let max_y = (pos.y + size.height as i32 - ph).max(pos.y);
-    (x.clamp(pos.x, max_x), y.clamp(pos.y, max_y))
+    }
+    clamp_origin_to_monitors(logical_w, logical_h, x, y, &monitors)
 }
 
 /// 按设置应用窗口状态：尺寸、位置、置顶、显隐。
@@ -2028,5 +2113,97 @@ mod say_tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].role, "assistant");
         assert_eq!(out[0].content, "我记住了");
+    }
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::*;
+
+    fn mono(x: i32, y: i32, w: i32, h: i32, scale: f64) -> MonitorRect {
+        MonitorRect { x, y, w, h, scale }
+    }
+
+    /// 单屏 1.0：贴右缘不该越界，也不该被多推
+    #[test]
+    fn single_monitor_clamps_to_right_edge() {
+        let mons = [mono(0, 0, 1920, 1080, 1.0)];
+        // 逻辑 532 宽 -> 物理 532；max_x = 1920 - 532 = 1388
+        let (x, y) = clamp_origin_to_monitors(532.0, 408.0, 5000, 5000, &mons);
+        assert_eq!(x, 1388);
+        assert_eq!(y, 1080 - 408);
+    }
+
+    /// 回归（本次修复的核心）：混合 DPI 双屏。
+    /// 副屏 1.5 在右侧，窗口逻辑宽 532 -> 副屏物理宽 798。
+    /// 旧实现用窗口当前屏（1.0）算成 532，导致允许窗口伸出去 266px。
+    #[test]
+    fn mixed_dpi_uses_target_monitor_scale() {
+        let mons = [
+            mono(0, 0, 1920, 1080, 1.0),
+            mono(1920, 0, 2560, 1440, 1.5),
+        ];
+        // 窗口已完全落在副屏内、且贴到最右
+        let (x, _) = clamp_origin_to_monitors(532.0, 408.0, 99999, 100, &mons);
+        // 副屏物理宽 532*1.5=798；右边界 1920+2560=4480；max_x=4480-798=3682
+        assert_eq!(x, 3682, "必须按目标屏 1.5 算物理宽，否则会伸出屏幕 266px");
+    }
+
+    /// 反向锁死：把副屏的 scale 也填成 1.0（等价于旧实现「所有屏共用窗口当前
+    /// 屏的缩放率」），同一输入必须算出**错的**结果 —— 证明上面那条测试真的
+    /// 在防这个 bug，而不是碰巧通过。
+    #[test]
+    fn shared_scale_reproduces_old_overshoot() {
+        let shared = [
+            mono(0, 0, 1920, 1080, 1.0),
+            // 旧实现口径：副屏也用源屏的 1.0
+            mono(1920, 0, 2560, 1440, 1.0),
+        ];
+        let (x, _) = clamp_origin_to_monitors(532.0, 408.0, 99999, 100, &shared);
+        // 1.0 算出的 max_x = 4480 - 532 = 3948，比正确的 3682 多出 266px 越界
+        assert_eq!(x, 3948);
+        assert!(
+            x > 3682,
+            "旧口径会让窗口伸出副屏 266 像素——这正是被修掉的缺陷"
+        );
+    }
+
+    /// 拖到副屏但还没到边：不能被无谓地挪动（避免"自己跳一下"）
+    #[test]
+    fn mixed_dpi_inside_bounds_is_untouched() {
+        let mons = [
+            mono(0, 0, 1920, 1080, 1.0),
+            mono(1920, 0, 2560, 1440, 1.5),
+        ];
+        let (x, y) = clamp_origin_to_monitors(532.0, 408.0, 2200, 500, &mons);
+        assert_eq!((x, y), (2200, 500));
+    }
+
+    /// 选屏按重叠面积：左上角已在主屏外、但窗口大部分在副屏时，
+    /// 仍应留在副屏（旧实现按左上角判定会甩回主屏）
+    #[test]
+    fn picks_monitor_by_overlap_area_not_top_left() {
+        let mons = [
+            mono(0, 0, 1920, 1080, 1.0),
+            mono(1920, 0, 2560, 1440, 1.5),
+        ];
+        // 左上角 x=1900 落在主屏内，但窗口 798 宽中只有 20px 在主屏
+        let (x, _) = clamp_origin_to_monitors(532.0, 408.0, 1900, 100, &mons);
+        assert!(x >= 1920, "应按重叠面积选副屏，而不是按左上角留在主屏");
+    }
+
+    /// 完全在屏幕外（拔掉显示器后恢复记忆位置）：取最近的屏，不能原样返回
+    #[test]
+    fn fully_offscreen_snaps_to_nearest_monitor() {
+        let mons = [mono(0, 0, 1920, 1080, 1.0)];
+        let (x, y) = clamp_origin_to_monitors(532.0, 408.0, 9999, 9999, &mons);
+        assert!(x <= 1920 - 532);
+        assert!(y <= 1080 - 408);
+    }
+
+    /// 空显示器列表：原样返回，不 panic
+    #[test]
+    fn no_monitors_returns_input() {
+        assert_eq!(clamp_origin_to_monitors(532.0, 408.0, 7, 9, &[]), (7, 9));
     }
 }
