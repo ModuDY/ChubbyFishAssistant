@@ -9,7 +9,7 @@
  * 1. 以**光标**为锚点，默认落在右下；
  * 2. 右/下空间不足时向另一侧翻转；
  * 3. 最后夹紧在窗口内（尺寸用实测值，不再估值）；
- * 4. 若与角色包围盒重叠超过 30%，整体换到角色另一侧。
+ * 4. 只要与角色包围盒重叠，整体换到角色另一侧。
  */
 
 export type Point = { x: number; y: number };
@@ -20,8 +20,14 @@ export type Rect = { left: number; top: number; width: number; height: number };
 export const MENU_EDGE = 8;
 /** 卡片与光标之间的间距（px）；翻转后同样保持该间距 */
 export const MENU_OFFSET = 6;
-/** 与角色包围盒重叠超过该比例即换边 */
-export const PET_OVERLAP_LIMIT = 0.3;
+/**
+ * 卡片与角色包围盒之间的最小间距（px）。
+ *
+ * 曾经按「重叠面积 > 卡片面积 30% 才换边」判定，但角色是**竖条**、卡片也是竖卡，
+ * 一条边切进去 66px 只占卡片面积约 12%，阈值不触发——而视觉上正好是"半张脸被压住"，
+ * 是最刺眼的那种侵入。面积比例对细长侵入天然不敏感，故改成「碰一下就躲」。
+ */
+export const PET_GAP = 10;
 
 export type MenuPlacement = {
   left: number;
@@ -80,11 +86,20 @@ export function placeMenu(
   }
   top = clamp(top, MENU_EDGE, bottomLimit);
 
-  if (petRect && overlapArea({ left, top, width: w, height: h }, petRect) > w * h * PET_OVERLAP_LIMIT) {
-    const rightOfPet = petRect.left + petRect.width + MENU_OFFSET;
-    const leftOfPet = petRect.left - MENU_OFFSET - w;
+  // 角色避让：只要真正碰上就换边（含 PET_GAP 间距），不再按面积比例判定
+  const overlapsPet = petRect
+    ? overlapArea(
+        { left: left - PET_GAP, top, width: w + PET_GAP * 2, height: h },
+        petRect,
+      ) > 0
+    : false;
+
+  if (petRect && overlapsPet) {
+    const rightOfPet = petRect.left + petRect.width + PET_GAP;
+    const leftOfPet = petRect.left - PET_GAP - w;
     const fitsRight = rightOfPet <= rightLimit;
     const fitsLeft = leftOfPet >= MENU_EDGE;
+    // 两侧都能站时选**更宽**的那侧：卡片贴得越少越不容易压到角色的头发/裙摆边缘
     const roomRight = viewport.width - (petRect.left + petRect.width);
     const roomLeft = petRect.left;
     const next = fitsRight && (!fitsLeft || roomRight >= roomLeft)

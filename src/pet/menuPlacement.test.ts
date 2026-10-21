@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { MENU_EDGE, placeMenu } from './menuPlacement';
+import { MENU_EDGE, MENU_OFFSET, PET_GAP, placeMenu } from './menuPlacement';
 
 const VIEWPORT = { width: 800, height: 600 };
 const SIZE = { width: 216, height: 320 };
@@ -33,17 +33,40 @@ describe('placeMenu —— 光标锚点与翻转', () => {
 });
 
 describe('placeMenu —— 角色避让', () => {
-  it('与角色重叠超过 30% 时换到角色另一侧', () => {
+  it('与角色重叠时换到角色另一侧，并留出 PET_GAP', () => {
     const pet = { left: 0, top: 0, width: 300, height: 600 };
     const p = placeMenu({ x: 100, y: 300 }, SIZE, VIEWPORT, pet);
-    expect(p.left).toBe(pet.left + pet.width + 6);
+    expect(p.left).toBe(pet.left + pet.width + PET_GAP);
   });
 
   it('角色在右侧时改为向左让位', () => {
     const pet = { left: 500, top: 0, width: 300, height: 600 };
     const p = placeMenu({ x: 560, y: 300 }, SIZE, VIEWPORT, pet);
     expect(p.flippedX).toBe(true);
-    expect(p.left).toBe(pet.left - 6 - SIZE.width);
+    expect(p.left).toBe(pet.left - PET_GAP - SIZE.width);
+  });
+
+  /**
+   * 回归（2026-10-21，用户截图）：角色竖条只被切进 66px——
+   * 占卡片总面积约 12%，旧阈值 30% 因此不触发，视觉上是"半张脸被菜单压住"。
+   */
+  it('细长侵入（仅切进一条边、面积占比很小）也必须让开', () => {
+    // 真实实测：窗口 532×409，卡片 216×325，角色热区 left=78 width=144
+    const viewport = { width: 532, height: 409 };
+    const pet = { left: 78, top: 208, width: 144, height: 144 };
+    const p = placeMenu({ x: 150, y: 280 }, { width: 216, height: 325 }, viewport, pet);
+
+    // 卡片不得与角色水平方向有任何交叠
+    const cardRight = p.left + 216;
+    const gap = Math.max(p.left - (pet.left + pet.width), pet.left - cardRight);
+    expect(gap).toBeGreaterThanOrEqual(PET_GAP);
+  });
+
+  it('未真正碰到角色时保持光标锚点不动（不该为了避让而乱跳）', () => {
+    const pet = { left: 600, top: 400, width: 100, height: 100 };
+    const p = placeMenu({ x: 100, y: 100 }, SIZE, VIEWPORT, pet);
+    expect(p.left).toBe(100 + MENU_OFFSET);
+    expect(p.top).toBe(100 + MENU_OFFSET);
   });
 
   it('任何位置下卡片都完整落在窗口内', () => {
