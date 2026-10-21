@@ -319,7 +319,7 @@ export const api = {
     say: (
       prompt: string,
       context?: string | null,
-      trigger?: 'user' | 'auto',
+      trigger?: 'user' | 'auto' | 'proactive',
       history?: Array<{ role: 'user' | 'assistant'; content: string }> | null,
       mode?: 'chat' | 'monologue',
     ) =>

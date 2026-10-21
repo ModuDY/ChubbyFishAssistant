@@ -450,6 +450,33 @@ pub struct Settings {
     /// 不是完整聊天归档。
     #[serde(default)]
     pub pet_memory_turns: Option<u32>,
+    // ── 语音（P11）：默认全部关闭，不加载音色、不发声 ──
+    /// TTS 总开关（None/false = 关）。默认关是刻意的：突然出声比多一个气泡
+    /// 侵入性强得多，必须由用户显式打开。
+    #[serde(default)]
+    pub pet_tts: Option<bool>,
+    /// 是否朗读事件自动点评（None/false = 否）。与总开关分开：打开声音不等于允许自言自语。
+    #[serde(default)]
+    pub pet_tts_auto: Option<bool>,
+    /// 是否朗读时间主动问候（None/false = 否）。与主动开口档位分开：显示文字不等于出声。
+    #[serde(default)]
+    pub pet_tts_proactive: Option<bool>,
+    /// 音色 voiceURI（None/空 = 自动取第一个本地中文音色）
+    #[serde(default)]
+    pub pet_tts_voice: Option<String>,
+    /// 语速（None = 1.0，夹到 0.8~1.4）
+    #[serde(default)]
+    pub pet_tts_rate: Option<f32>,
+    /// 音量（None = 0.8，夹到 0~1）
+    #[serde(default)]
+    pub pet_tts_volume: Option<f32>,
+    // ── 时间驱动主动开口（P12）：默认 off ──
+    /// off / local / ai；None 等价 off。local 只用本地短句，不依赖网关。
+    #[serde(default)]
+    pub pet_proactive_mode: Option<String>,
+    /// 自动发言每日上限（时间问候 + 事件自动点评共用；None = 4，夹到 0~12）
+    #[serde(default)]
+    pub pet_proactive_daily: Option<u32>,
 }
 
 fn default_api_port() -> u16 {

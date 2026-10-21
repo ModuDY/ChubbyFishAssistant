@@ -10,8 +10,11 @@ import type {
   AppKey,
   Settings as SettingsType,
   PetAiMode,
+  PetProactiveMode,
   EvolutionMetrics,
 } from '../types';
+import { localChineseVoices } from '../pet/tts';
+import { previewSpeech } from '../pet/usePetSpeak';
 
 /**
  * 通用设置面板：外观 / 语言 / 通用与通知 / 代理相关配置。
@@ -39,6 +42,38 @@ export default function GeneralSettingsPanel() {
   const [modelOptions, setModelOptions] = useState<string[]>([]);
   // 自我进化 P1：网关观测快照（只读，10s 轮询；网关未运行时不显示）
   const [metrics, setMetrics] = useState<EvolutionMetrics | null>(null);
+  // P11：本地中文音色（进入设置分区才枚举；首次 getVoices 常为空，等 voiceschanged）
+  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
+  // 枚举是否已出结果（区分「还没加载完」与「确实没有中文语音包」）
+  const [voicesChecked, setVoicesChecked] = useState(false);
+
+  useEffect(() => {
+    if (typeof window.speechSynthesis === 'undefined') {
+      setVoicesChecked(true);
+      return;
+    }
+    const synth = window.speechSynthesis;
+    let stopped = false;
+    const load = () => {
+      if (stopped) return;
+      const list = localChineseVoices(synth.getVoices());
+      setVoices(list);
+      if (list.length > 0) setVoicesChecked(true);
+    };
+    load();
+    synth.addEventListener('voiceschanged', load);
+    // 3 秒兜底：某些环境 voiceschanged 永不触发，不能让下拉永远为空
+    const timer = window.setTimeout(() => {
+      if (stopped) return;
+      load();
+      setVoicesChecked(true);
+    }, 3000);
+    return () => {
+      stopped = true;
+      synth.removeEventListener('voiceschanged', load);
+      window.clearTimeout(timer);
+    };
+  }, []);
 
   useEffect(() => {
     void api.pet
@@ -657,6 +692,169 @@ export default function GeneralSettingsPanel() {
             </p>
             <p className="text-xs text-slate-400">
               拖到哪记到哪（500ms 去抖后落盘）；双击桌宠可呼出主窗口。
+            </p>
+          </div>
+        </div>
+      </section>
+
+      {/* 桌宠声音与主动开口（P11 / P12）：朗读默认关、自动内容默认只显示气泡 */}
+      <section className="card p-4">
+        <h3 className="mb-1 font-medium">桌宠声音与主动开口</h3>
+        <p className="mb-3 text-xs text-slate-400">
+          朗读使用 Windows 自带语音包，不联网、不消耗额度，默认关闭；打开朗读<b>不会</b>启用自动发言。
+          自动内容（事件点评 / 时间问候）默认只显示气泡，需要单独允许才会朗读。
+        </p>
+        <div className="grid gap-x-8 gap-y-3 text-sm sm:grid-cols-2">
+          <div className="space-y-3">
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.pet_tts ?? false}
+                disabled={voicesChecked && voices.length === 0}
+                onChange={(e) => update('pet_tts', e.target.checked)}
+              />
+              朗读桌宠的话（总开关）
+            </label>
+            {voicesChecked && voices.length === 0 ? (
+              <p className="text-xs text-amber-600 dark:text-amber-500">
+                未检测到本地中文语音包，声音功能不可用（气泡不受影响）。可在 Windows
+                「设置 → 时间和语言 → 语言和区域」安装中文语音。
+              </p>
+            ) : null}
+            <div>
+              <label className="label">音色</label>
+              <select
+                value={form.pet_tts_voice ?? ''}
+                disabled={!form.pet_tts}
+                onChange={(e) => update('pet_tts_voice', e.target.value || null)}
+                className="input w-56"
+              >
+                <option value="">自动（第一个本地中文音色）</option>
+                {voices.map((v) => (
+                  <option key={v.voiceURI} value={v.voiceURI}>
+                    {v.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="label">语速</label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="range"
+                  min={0.8}
+                  max={1.4}
+                  step={0.05}
+                  disabled={!form.pet_tts}
+                  value={form.pet_tts_rate ?? 1}
+                  onChange={(e) => update('pet_tts_rate', Number(e.target.value))}
+                  className="w-40"
+                />
+                <span className="text-xs text-slate-400">
+                  {(form.pet_tts_rate ?? 1).toFixed(2)}×
+                </span>
+              </div>
+            </div>
+            <div>
+              <label className="label">音量</label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  disabled={!form.pet_tts}
+                  value={form.pet_tts_volume ?? 0.8}
+                  onChange={(e) => update('pet_tts_volume', Number(e.target.value))}
+                  className="w-40"
+                />
+                <span className="text-xs text-slate-400">
+                  {Math.round((form.pet_tts_volume ?? 0.8) * 100)}%
+                </span>
+                <button
+                  type="button"
+                  className="btn-outline !px-2.5 !py-1 text-xs"
+                  disabled={!form.pet_tts || voices.length === 0}
+                  onClick={() => {
+                    const ok = previewSpeech(
+                      form.pet_tts_voice ?? null,
+                      form.pet_tts_rate ?? 1,
+                      form.pet_tts_volume ?? 0.8,
+                    );
+                    if (!ok) toast('error', '未检测到可用音色，声音功能已降级（气泡不受影响）');
+                  }}
+                >
+                  试听
+                </button>
+              </div>
+              <p className="text-xs text-slate-400 mt-1">
+                切换耳机 / 蓝牙后可能无声，点「试听」确认；失败不会影响气泡。
+              </p>
+            </div>
+            <div>
+              <label className="label">朗读自动内容</label>
+              <div className="space-y-2">
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={form.pet_tts_auto ?? false}
+                    disabled={!(form.pet_tts ?? false)}
+                    onChange={(e) => update('pet_tts_auto', e.target.checked)}
+                  />
+                  事件自动点评
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={form.pet_tts_proactive ?? false}
+                    disabled={!(form.pet_tts ?? false)}
+                    onChange={(e) => update('pet_tts_proactive', e.target.checked)}
+                  />
+                  时间主动问候
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            <div>
+              <label className="label">主动开口</label>
+              <select
+                value={form.pet_proactive_mode ?? 'off'}
+                onChange={(e) => update('pet_proactive_mode', e.target.value as PetProactiveMode)}
+                className="input w-56"
+              >
+                <option value="off">关闭（默认）</option>
+                <option value="local">本地短句（不耗额度）</option>
+                <option value="ai">AI 独白（需网关运行）</option>
+              </select>
+              <p className="text-xs text-slate-400 mt-1">
+                只在早上 / 中午 / 晚上各问候一次，进入时段后第一次有空时开口；
+                错过不补，23–5 点不发声。与「AI 对话」档位相互独立。
+              </p>
+            </div>
+            <div>
+              <label className="label">每日自动发言上限</label>
+              <input
+                type="number"
+                min={0}
+                max={12}
+                value={form.pet_proactive_daily ?? 4}
+                onChange={(e) =>
+                  update(
+                    'pet_proactive_daily',
+                    Math.min(12, Math.max(0, Math.round(Number(e.target.value) || 0))),
+                  )
+                }
+                className="input w-24"
+              />
+              <p className="text-xs text-slate-400 mt-1">
+                时间问候与事件自动点评共用这份配额，默认 4 次（0~12）；用户主动对话不计入。
+                右键菜单「今天别主动说话」可临时全部静音，跨重启仍保持。
+              </p>
+            </div>
+            <p className="text-xs text-slate-400">
+              自动内容在窗口隐藏、输入条打开、对局中、拖拽中或正在说话时一律让位。
             </p>
           </div>
         </div>

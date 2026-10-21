@@ -13,8 +13,13 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { api } from '../lib/tauri';
 
+/** 发言来源：与 Rust `pet-say-start.trigger` 同一口径 */
+export type SayTrigger = 'user' | 'auto' | 'proactive';
+
 export type SayState = {
   sessionId: number;
+  /** 本次发言的触发来源（按 sessionId 保留，完成态朗读据此判定来源） */
+  trigger: SayTrigger;
   /** 流式中（气泡不自动消失，等待流结束） */
   streaming: boolean;
   text: string;
@@ -50,9 +55,19 @@ export function usePetSay(opts: Options) {
   const [say, setSay] = useState<SayState>(null);
   /** 已接受的最大 sessionId（单调递增，永不重置）：小于等于它的事件一律丢弃 */
   const activeRef = useRef(0);
+  /**
+   * 当前会话的触发来源：`pet-say-done` 不带 trigger，必须按 sessionId 保留。
+   * 不能用「最近一次触发」的全局变量，新会话会把它覆盖。
+   */
+  const triggerRef = useRef<SayTrigger>('user');
+  /** 已发起但尚未收到 pet-say-start 的来源（事件可能先于 invoke 返回到达） */
+  const pendingTriggerRef = useRef<SayTrigger>('user');
   const reasoningSeenRef = useRef(false);
   const optsRef = useRef(opts);
   optsRef.current = opts;
+
+  const normalizeTrigger = (raw?: string): SayTrigger =>
+    raw === 'auto' || raw === 'proactive' ? raw : 'user';
 
   useEffect(() => {
     let disposed = false;
@@ -68,9 +83,11 @@ export function usePetSay(opts: Options) {
     on<StartPayload>('pet-say-start', (p) => {
       if (p.sessionId <= activeRef.current) return;
       activeRef.current = p.sessionId;
+      triggerRef.current = normalizeTrigger(p.trigger ?? pendingTriggerRef.current);
       reasoningSeenRef.current = false;
       setSay((cur) => ({
         sessionId: p.sessionId,
+        trigger: triggerRef.current,
         streaming: true,
         text: cur?.text ?? '',
         thinking: cur?.thinking ?? '',
@@ -109,6 +126,7 @@ export function usePetSay(opts: Options) {
       if (p.sessionId !== activeRef.current) return;
       setSay({
         sessionId: p.sessionId,
+        trigger: triggerRef.current,
         streaming: false,
         text: p.text ?? '',
         thinking: p.reasoning ?? '',
@@ -136,9 +154,11 @@ export function usePetSay(opts: Options) {
     async (
       prompt: string,
       context?: string | null,
-      trigger: 'user' | 'auto' = 'user',
+      trigger: SayTrigger = 'user',
       opts?: { history?: SayTurn[]; mode?: 'chat' | 'monologue' },
     ) => {
+      // 先记住来源：pet-say-start 可能先于 invoke 返回到达（事件里没带也能对上）
+      pendingTriggerRef.current = trigger;
       try {
         const id = await api.pet.say(
           prompt,
@@ -151,8 +171,9 @@ export function usePetSay(opts: Options) {
         // 这里不要再覆盖状态，否则会把已收到的 delta 清空
         if (id > activeRef.current) {
           activeRef.current = id;
+          triggerRef.current = trigger;
           reasoningSeenRef.current = false;
-          setSay({ sessionId: id, streaming: true, text: '', thinking: '' });
+          setSay({ sessionId: id, trigger, streaming: true, text: '', thinking: '' });
         }
         return true;
       } catch (e) {

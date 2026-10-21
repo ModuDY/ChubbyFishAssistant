@@ -515,7 +515,26 @@ export interface Settings {
   pet_long_memory?: boolean | null;
   /** 长期记忆保留条数上限（null = 40） */
   pet_memory_turns?: number | null;
+  /** TTS 总开关（null/false = 关，默认不出声） */
+  pet_tts?: boolean | null;
+  /** 朗读事件自动点评（null/false = 否） */
+  pet_tts_auto?: boolean | null;
+  /** 朗读时间主动问候（null/false = 否） */
+  pet_tts_proactive?: boolean | null;
+  /** 音色 voiceURI（null/空 = 自动取第一个本地中文音色） */
+  pet_tts_voice?: string | null;
+  /** 语速（null = 1.0，0.8~1.4） */
+  pet_tts_rate?: number | null;
+  /** 音量（null = 0.8，0~1） */
+  pet_tts_volume?: number | null;
+  /** 时间主动开口档位（null = off） */
+  pet_proactive_mode?: PetProactiveMode | null;
+  /** 自动发言每日上限（null = 4，0~12；与事件自动点评共用） */
+  pet_proactive_daily?: number | null;
 }
+
+/** 时间主动开口档位：off 关 / local 只用本地短句 / ai 允许 AI 独白（失败回落本地） */
+export type PetProactiveMode = 'off' | 'local' | 'ai';
 
 /**
  * 桌宠 AI 对话档位（P3）：
@@ -555,6 +574,22 @@ export interface PetStatus {
   longMemory?: boolean;
   /** 长期记忆保留的轮数上限 */
   memoryTurns?: number;
+  /** P11：TTS 总开关 */
+  tts?: boolean;
+  /** P11：朗读事件自动点评 */
+  ttsAuto?: boolean;
+  /** P11：朗读时间主动问候 */
+  ttsProactive?: boolean;
+  /** P11：音色 voiceURI（空 = 自动取本地中文音色） */
+  ttsVoice?: string;
+  /** P11：语速（0.8~1.4） */
+  ttsRate?: number;
+  /** P11：音量（0~1） */
+  ttsVolume?: number;
+  /** P12：时间主动开口档位 */
+  proactiveMode?: PetProactiveMode;
+  /** P12：自动发言每日上限 */
+  proactiveDaily?: number;
 }
 
 /** F-74：会话域（WorkBuddy = ~/.workbuddy，CodeBuddy = ~/.codebuddy） */

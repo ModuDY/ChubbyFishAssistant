@@ -12,6 +12,7 @@
 import { useCallback, useEffect, useRef } from 'react';
 import { api } from '../lib/tauri';
 import type { PetSignalType } from './usePetEvents';
+import type { PetAutoPolicy } from './autoPolicy';
 
 /** auto 档允许触发点评的信号（其余 working/thinking/pace/... 一律不触发） */
 export const AUTO_TRIGGER_TYPES: ReadonlySet<PetSignalType> = new Set<PetSignalType>([
@@ -37,6 +38,9 @@ type Options = {
   enabled: boolean;
   /** 「别打扰」判定：正在流式 / 拖拽中 / 窗口隐藏 / 正在播瞬态动作 */
   isBusy: () => boolean;
+  /** 统一自动发言策略：每日配额与「今天别主动说话」与时间问候共用 */
+  policy: PetAutoPolicy;
+  dailyCap: number;
   startSay: (prompt: string, context?: string | null, trigger?: 'user' | 'auto') => Promise<boolean>;
 };
 
@@ -73,12 +77,15 @@ export function usePetAutoSay(opts: Options) {
   const maybeSay = useCallback((prompt: string, context?: string | null) => {
     const o = optsRef.current;
     if (!o.enabled || !gatewayUpRef.current || o.isBusy()) return;
+    // 统一策略：今天已闭嘴 / 深夜 / 当日配额用尽 → 直接安静
+    if (!o.policy.canSpeak(o.dailyCap)) return;
     const now = Date.now();
     const gap = AUTO_GAP_MS + Math.random() * AUTO_JITTER_MS;
     if (lastRef.current && now - lastRef.current < gap) return;
     // 过闸后再掷骰子：大部分事件只是安静播动作，偶尔才接一句话
     if (Math.random() > AUTO_PROBABILITY) return;
     lastRef.current = now;
+    o.policy.noteSpoken();
     void o.startSay(prompt, context ?? null, 'auto');
   }, []);
 

@@ -53,7 +53,11 @@ import {
 } from './petChatTypes';
 import { usePetAutoSay, AUTO_TRIGGER_TYPES } from './usePetAutoSay';
 import { usePetGatewayEvents } from './usePetGatewayEvents';
-import type { PetAiMode } from '../types';
+import { usePetSpeak } from './usePetSpeak';
+import { buildProactivePrompt, pickGreeting, PetAutoPolicy } from './autoPolicy';
+import { usePetProactive } from './usePetProactive';
+import type { TimeSlot } from './flavor';
+import type { PetAiMode, PetProactiveMode } from '../types';
 import './pet.css';
 
 /** 单击与双击的判定窗口（ms）：小于该间隔的第二次按下视为双击 */
@@ -134,6 +138,16 @@ type PetUpdatePayload = {
   gatewayRunning?: boolean;
   /** P5：网关活动联动开关（设置页改完即时下发；设计 §6.5） */
   gatewayLink?: boolean;
+  /** P11：TTS 总开关 / 两类自动内容朗读许可 / 音色 / 语速 / 音量 */
+  tts?: boolean;
+  ttsAuto?: boolean;
+  ttsProactive?: boolean;
+  ttsVoice?: string;
+  ttsRate?: number;
+  ttsVolume?: number;
+  /** P12：时间主动开口档位与每日上限 */
+  proactiveMode?: PetProactiveMode;
+  proactiveDaily?: number;
 };
 
 /**
@@ -231,6 +245,17 @@ export default function PetRoot() {
   const [sleepMinutes, setSleepMinutes] = useState(5);
   /** AI 对话档位（P3；Rust 下发，默认 off = 只用本地台词） */
   const [aiMode, setAiMode] = useState<PetAiMode>('off');
+  /** P11：语音设置（默认全关；关闭时不加载音色，也不发声） */
+  const [ttsEnabled, setTtsEnabled] = useState(false);
+  const [ttsAuto, setTtsAuto] = useState(false);
+  const [ttsProactive, setTtsProactive] = useState(false);
+  const [ttsVoice, setTtsVoice] = useState('');
+  const [ttsRate, setTtsRate] = useState(1);
+  const [ttsVolume, setTtsVolume] = useState(0.8);
+  /** P12：时间主动开口档位 / 每日配额 / 今日是否已闭嘴 */
+  const [proactiveMode, setProactiveMode] = useState<PetProactiveMode>('off');
+  const [proactiveDaily, setProactiveDaily] = useState(4);
+  const [silencedToday, setSilencedToday] = useState(false);
   /** 角色可见包围盒（首帧 alpha 采样得出，窗口百分比）；null = 尚未测量 */
   const [hitBox, setHitBox] = useState<SpriteBox | null>(null);
 
@@ -279,7 +304,12 @@ export default function PetRoot() {
   /** 最近一次业务事件摘要（供 AI 回复的"背景"） */
   const lastEventSummaryRef = useRef<string | undefined>(undefined);
   /** 最近一次发言的触发来源：决定失败时是否回落本地台词（自动档静默，避免刷屏） */
-  const lastTriggerRef = useRef<'user' | 'auto'>('user');
+  const lastTriggerRef = useRef<'user' | 'auto' | 'proactive'>('user');
+  /** P12：自动发言统一策略（跨重启持久化日期/计数/静音/事件去重） */
+  const policyRef = useRef<PetAutoPolicy | null>(null);
+  if (!policyRef.current) policyRef.current = new PetAutoPolicy();
+  /** P12：AI 独白失败时要回落的那句本地问候（只对本次请求有效） */
+  const proactiveFallbackRef = useRef<string | null>(null);
   /**
    * 游戏解说请求：被拒（5s 独白节流 / 当日上限 / 网关未启动）时静默。
    * 本地台词已经在 `playTransient` 里说过，再补一句反而是重复刷屏。
@@ -293,6 +323,10 @@ export default function PetRoot() {
   const petAtRef = useRef(0);
   /** 鼠标是否停在角色热区内 + 起始时刻（悬停抚摸判定） */
   const hoverRef = useRef<{ inside: boolean; since: number }>({ inside: false, since: 0 });
+  /** P12：跨重启恢复「今天别主动说话」标记（只读本地策略，不碰业务数据） */
+  useEffect(() => {
+    setSilencedToday(policyRef.current!.silencedToday());
+  }, []);
   /** 拖拽轨迹（算松手速度 → 决定是否"被甩出去"） */
   const dragTrackRef = useRef<{ t: number; x: number; y: number; speed: number } | null>(null);
   /** 当天已播过的节日动作（节日轮播用；键 `YYYY-MM-DD#festival` → 已播动作） */
@@ -422,9 +456,32 @@ export default function PetRoot() {
     [clearSadTimer, showBubble],
   );
 
-  /* ------------------------- AI 发言（P3） ------------------------- */
+  /* ------------------------- AI 发言（P3） / 语音（P11） ------------------------- */
+  /**
+   * 语音仲裁：隐藏 / 拖拽 / 输入条 / 对局中一律停声，且不开始新的朗读。
+   * 这里只做"物理上不该出声"的判定；"哪类内容可以读"由 tts.ts 的权限表决定。
+   */
+  const { speak, cancel: cancelSpeech } = usePetSpeak({
+    flags: { enabled: ttsEnabled, auto: ttsAuto, proactive: ttsProactive },
+    voiceUri: ttsVoice || null,
+    rate: ttsRate,
+    volume: ttsVolume,
+    blocked: paused || dragging || chatOpen || activeGame !== null,
+  });
+
   const handleSayFallback = useCallback(
     (reason: string) => {
+      // P12：AI 独白失败 → 回落本地问候（设计稿要求：网关不可用也能说上一句）
+      if (lastTriggerRef.current === 'proactive') {
+        const line = proactiveFallbackRef.current;
+        proactiveFallbackRef.current = null;
+        // 「今天别主动说话」期间不再补本地问候（请求可能刚被按下静音）
+        if (line && !policyRef.current!.silencedToday()) {
+          showBubble(line);
+          speak('proactive', line);
+        }
+        return;
+      }
       // 游戏解说被节流/限流拒掉属于预期内：本地台词已说过，不再补一句
       if (silentSayRef.current) return;
       // 档位关闭/网关未启动等"预期内"的拒绝不提示；主动触发给一句本地台词兜底，
@@ -433,7 +490,7 @@ export default function PetRoot() {
       if (reason.includes('未开启')) return;
       showBubble(pickLine('idle', lastLineRef.current));
     },
-    [showBubble],
+    [showBubble, speak],
   );
 
   const { say, startSay, cancelSay } = usePetSay({
@@ -495,23 +552,73 @@ export default function PetRoot() {
   );
 
   /** 自动点评（auto 档）：节流 + 「别打扰」判定都在 usePetAutoSay 内 */
+  const autoSayBusy = () =>
+    pausedRef.current ||
+    !bubbleEnabled ||
+    draggingRef.current ||
+    !!transientRef.current ||
+    !!sayRef.current?.streaming ||
+    // 用户正在打字/对局时不自动点评：会把输入条顶掉、或让气泡压住出招按钮
+    chatOpenRef.current ||
+    activeGameRef.current !== null ||
+    document.hidden;
+
   const { say: autoSay } = usePetAutoSay({
     enabled: aiMode === 'auto',
-    isBusy: () =>
-      pausedRef.current ||
-      !bubbleEnabled ||
-      draggingRef.current ||
-      !!transientRef.current ||
-      !!sayRef.current?.streaming ||
-      // 用户正在打字/对局时不自动点评：会把输入条顶掉、或让气泡压住出招按钮
-      chatOpenRef.current ||
-      activeGameRef.current !== null ||
-      document.hidden,
+    isBusy: autoSayBusy,
+    policy: policyRef.current!,
+    dailyCap: proactiveDaily,
     startSay: (prompt, context, trigger) => {
       lastTriggerRef.current = trigger ?? 'auto';
       return startSay(prompt, context, trigger);
     },
   });
+
+  /**
+   * 时间问候（P12）：local 档只说本地短句，ai 档让模型随口一句、失败回落本地。
+   * 无论哪档，占用配额与去重都在 usePetProactive 里完成，这里只管内容。
+   */
+  const handleGreet = useCallback(
+    (slot: TimeSlot) => {
+      const line = pickGreeting(slot);
+      if (proactiveMode === 'ai') {
+        lastTriggerRef.current = 'proactive';
+        proactiveFallbackRef.current = line;
+        void startSay(buildProactivePrompt(slot), null, 'proactive');
+        return;
+      }
+      // 本地档：先按时段语义播对应动作（刷牙/早餐/午餐/晚餐），再说一句；不依赖网关
+      playTransient('idle', line, pickSlotAction(slot));
+      speak('proactive', line);
+    },
+    [proactiveMode, playTransient, startSay, speak],
+  );
+
+  usePetProactive({
+    mode: proactiveMode,
+    dailyCap: proactiveDaily,
+    policy: policyRef.current!,
+    isBusy: autoSayBusy,
+    onGreet: handleGreet,
+  });
+
+  /**
+   * P12：一键「今天别主动说话」。
+   *
+   * 只压制**自动内容**（时间问候 / 事件点评 / 对应 TTS），用户主动对话与系统通知照常；
+   * 状态写进 PetAutoPolicy，跨重启仍生效，跨天自动解除。
+   */
+  const toggleSilence = useCallback(() => {
+    const policy = policyRef.current!;
+    const next = !policy.silencedToday();
+    policy.setSilenced(next);
+    setSilencedToday(next);
+    if (next) {
+      // 已经开口的自动内容立刻闭嘴；正在进行的用户对话不受影响
+      cancelSpeech();
+      proactiveFallbackRef.current = null;
+    }
+  }, [cancelSpeech]);
 
   /* ------------------------- 业务事件 → 状态 ------------------------- */
   /**
@@ -650,6 +757,23 @@ export default function PetRoot() {
           chatHistoryRef.current = [];
         }
       }
+      // P11：语音设置即时生效；关掉总开关时立刻停声（不让已排队的句子继续念）
+      if (typeof patch.tts === 'boolean') {
+        setTtsEnabled(patch.tts);
+        if (!patch.tts) cancelSpeech();
+      }
+      if (typeof patch.ttsAuto === 'boolean') setTtsAuto(patch.ttsAuto);
+      if (typeof patch.ttsProactive === 'boolean') setTtsProactive(patch.ttsProactive);
+      if (typeof patch.ttsVoice === 'string') setTtsVoice(patch.ttsVoice);
+      if (typeof patch.ttsRate === 'number') setTtsRate(patch.ttsRate);
+      if (typeof patch.ttsVolume === 'number') setTtsVolume(patch.ttsVolume);
+      // P12：主动开口档位 / 每日配额（改完立即生效）
+      if (patch.proactiveMode === 'off' || patch.proactiveMode === 'local' || patch.proactiveMode === 'ai') {
+        setProactiveMode(patch.proactiveMode);
+      }
+      if (typeof patch.proactiveDaily === 'number') {
+        setProactiveDaily(Math.min(12, Math.max(0, Math.round(patch.proactiveDaily))));
+      }
     };
 
     void api.pet
@@ -667,6 +791,14 @@ export default function PetRoot() {
           easterEgg: s.easterEgg,
           easterEggMinutes: s.easterEggMinutes,
           longMemory: s.longMemory,
+          tts: s.tts,
+          ttsAuto: s.ttsAuto,
+          ttsProactive: s.ttsProactive,
+          ttsVoice: s.ttsVoice,
+          ttsRate: s.ttsRate,
+          ttsVolume: s.ttsVolume,
+          proactiveMode: s.proactiveMode,
+          proactiveDaily: s.proactiveDaily,
         });
       })
       .catch(() => {
@@ -694,6 +826,8 @@ export default function PetRoot() {
       if (disposed) return;
       const p = event.payload;
       if (!p?.title && !p?.body) return;
+      // P11：通知是操作结果，比闲聊重要——到达时立即停掉普通台词朗读
+      cancelSpeech();
       noticeSeqRef.current += 1;
       const seq = noticeSeqRef.current;
       setNotice({
@@ -750,16 +884,24 @@ export default function PetRoot() {
     if (!finalText) return;
     if (recordedSayRef.current === say.sessionId) return;
     recordedSayRef.current = say.sessionId;
+    // P11：完成态按**本会话来源**提交朗读（turn 级 trigger 已由 usePetSay 按 sessionId 保留）。
+    // 只读最终正文：思考链、工具状态与流式 delta 都不进语音。
+    if (say.trigger === 'user') {
+      speak('manual', finalText);
+    } else if (!policyRef.current!.silencedToday()) {
+      // 「今天别主动说话」在请求飞行途中被按下：回应到达后也只显示气泡、不出声
+      speak(say.trigger === 'auto' ? 'auto' : 'proactive', finalText);
+    }
     // 只记「用户对话」的答复，不记自动点评（auto 档独白）。
     // 独白是"看见你在签到就随口说一句"，与对话上下文无关；混进历史会把随机台词
     // 当成模型说过的话送给下一轮，长期记忆一开还会被永久存下来。
-    if (lastTriggerRef.current !== 'user') return;
+    if (say.trigger !== 'user') return;
     chatHistoryRef.current = appendTurn(chatHistoryRef.current, {
       role: 'assistant',
       content: finalText,
     });
     persistMemory();
-  }, [say, persistMemory]);
+  }, [say, persistMemory, speak]);
 
   /* ------------------- AI 发言 ↔ 核心态 / 气泡 ------------------- */
   useEffect(() => {
@@ -1624,6 +1766,7 @@ export default function PetRoot() {
           placement={placement}
           cardRef={menuCardRef}
           aiMode={aiMode}
+          proactiveMode={proactiveMode}
           gatewayRunning={gatewayRunning}
           actions={ACTION_LIST}
           recents={recentActions}
@@ -1644,6 +1787,8 @@ export default function PetRoot() {
             sayNow();
           }}
           onToggleGateway={() => toggleGateway(gatewayRunning)}
+          proactiveSilenced={silencedToday}
+          onToggleSilence={toggleSilence}
           onInteract={interact}
           onPlayGame={() => {
             closeMenu();

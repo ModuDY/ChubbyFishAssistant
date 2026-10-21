@@ -24,9 +24,10 @@ import {
   Search,
   Shuffle,
   Sparkles,
+  VolumeX,
   X,
 } from 'lucide-react';
-import type { PetAiMode } from '../types';
+import type { PetAiMode, PetProactiveMode } from '../types';
 import type { PetAction } from './actions';
 import type { PetTransientKind } from './petState';
 import { INTERACTIONS } from './interaction';
@@ -42,6 +43,12 @@ export type PetMenuProps = {
   placement: MenuPlacement;
   cardRef: RefObject<HTMLDivElement>;
   aiMode: PetAiMode;
+  /** P12：时间主动开口档位（off 时不显示「今天别主动说话」） */
+  proactiveMode: PetProactiveMode;
+  /** P12：今天是否已被「今天别主动说话」压住 */
+  proactiveSilenced: boolean;
+  /** P12：一键闭嘴 / 恢复（当天，跨重启保持） */
+  onToggleSilence: () => void;
   gatewayRunning: boolean;
   actions: PetAction[];
   recents: string[];
@@ -135,7 +142,7 @@ export default function PetMenu(props: PetMenuProps) {
 /* ------------------------------ L1 快菜单 ------------------------------ */
 
 function QuickMenu(props: PetMenuProps) {
-  const { aiMode, gatewayRunning } = props;
+  const { aiMode, gatewayRunning, proactiveMode, proactiveSilenced } = props;
   return (
     <div className="pet-menu-body">
       <div className="pet-menu-pills">
@@ -172,6 +179,14 @@ function QuickMenu(props: PetMenuProps) {
             <span>让它自己说一句</span>
           </button>
         </>
+      ) : null}
+
+      {proactiveMode !== 'off' ? (
+        <button type="button" className="pet-menu-item" data-nav onClick={props.onToggleSilence}>
+          <VolumeX className="pet-menu-icon" aria-hidden />
+          <span>{proactiveSilenced ? '恢复主动说话' : '今天别主动说话'}</span>
+          {proactiveSilenced ? <span className="pet-menu-state">已静音</span> : null}
+        </button>
       ) : null}
 
       <button type="button" className="pet-menu-item" data-nav onClick={props.onCheckin}>

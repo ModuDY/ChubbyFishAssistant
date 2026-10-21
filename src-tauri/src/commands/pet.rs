@@ -483,6 +483,16 @@ pub fn apply_settings(app: &AppHandle) {
         "easterEggMinutes": settings.pet_easter_egg_minutes.unwrap_or(1),
         // 长期记忆：改完立即生效（开=读回历史，关=清空内存与磁盘）
         "longMemory": memory_enabled(&settings),
+        // P11 语音：总开关 / 两类自动内容的朗读许可 / 音色与音调参数
+        "tts": settings.pet_tts.unwrap_or(false),
+        "ttsAuto": settings.pet_tts_auto.unwrap_or(false),
+        "ttsProactive": settings.pet_tts_proactive.unwrap_or(false),
+        "ttsVoice": settings.pet_tts_voice.clone().unwrap_or_default(),
+        "ttsRate": tts_rate(&settings),
+        "ttsVolume": tts_volume(&settings),
+        // P12 主动开口：档位与每日上限（与事件自动点评共用配额）
+        "proactiveMode": proactive_mode(&settings),
+        "proactiveDaily": proactive_daily(&settings),
         }),
     );
 }
@@ -570,7 +580,42 @@ pub fn pet_status(app: AppHandle) -> serde_json::Value {
         // 长期记忆：默认关（隐私优先）。前端据此决定是否加载/写回历史
         "longMemory": settings.pet_long_memory.unwrap_or(false),
         "memoryTurns": memory_turns(&settings),
+        // P11 语音（默认关；关闭时不加载音色）
+        "tts": settings.pet_tts.unwrap_or(false),
+        "ttsAuto": settings.pet_tts_auto.unwrap_or(false),
+        "ttsProactive": settings.pet_tts_proactive.unwrap_or(false),
+        "ttsVoice": settings.pet_tts_voice.clone().unwrap_or_default(),
+        "ttsRate": tts_rate(&settings),
+        "ttsVolume": tts_volume(&settings),
+        // P12 主动开口（默认 off）
+        "proactiveMode": proactive_mode(&settings),
+        "proactiveDaily": proactive_daily(&settings),
     })
+}
+
+/// 语速归一化（0.8~1.4）：前端 `speechSynthesis` 只接受这个区间，越界设置会让
+/// 声音快得听不清或慢得拖沓，统一在这里夹一次，前后端不必各夹一遍。
+fn tts_rate(settings: &crate::models::Settings) -> f32 {
+    settings.pet_tts_rate.unwrap_or(1.0).clamp(0.8, 1.4)
+}
+
+/// 音量归一化（0~1）
+fn tts_volume(settings: &crate::models::Settings) -> f32 {
+    settings.pet_tts_volume.unwrap_or(0.8).clamp(0.0, 1.0)
+}
+
+/// 主动开口档位：未知值一律回落 off（宁可不说，也不要因为脏配置突然出声）
+fn proactive_mode(settings: &crate::models::Settings) -> String {
+    match settings.pet_proactive_mode.as_deref() {
+        Some("local") => "local".into(),
+        Some("ai") => "ai".into(),
+        _ => "off".into(),
+    }
+}
+
+/// 自动发言每日上限（0~12，默认 4）；0 = 允许手动关闭自动内容
+fn proactive_daily(settings: &crate::models::Settings) -> u32 {
+    settings.pet_proactive_daily.unwrap_or(4).min(12)
 }
 
 /// 记录当前窗口位置（前端在 `moved` 事件去抖 500ms 后调用，无参数）。
@@ -2106,6 +2151,11 @@ pub async fn pet_say(
     let trig = trigger.unwrap_or_else(|| "user".into());
     if trig == "auto" && ai_mode != "auto" {
         return Err("自动点评未开启".into());
+    }
+    // 时间主动开口（P12）：只认 pet_proactive_mode=ai 这一档；oversight 由前端调度，
+    // 这里再挡一道，避免调用方绕过设置直接触发。
+    if trig == "proactive" && proactive_mode(&settings) != "ai" {
+        return Err("主动开口未开启".into());
     }
     // 对话模式由调用方声明；未知值保守按独白处理（更省 token）
     let is_chat = mode.as_deref() == Some("chat");
