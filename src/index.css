@@ -246,6 +246,13 @@ html.dark a:focus-visible {
     radial-gradient(120% 95% at 50% 0%, #142440 0%, #0a1424 55%, #04070f 100%);
 }
 
+/* 视频壁纸：读文件与解码的那几百毫秒还没画面。
+   这里用中性深底而不是内置场景的浅蓝 —— 后者会让人以为"开屏闪了一块别的图"（实测反馈）。
+   预览图一到位就会盖住这一层，所以它只在最前面露一小会儿。 */
+.wp-layer[data-kind='we-video'] .wp-base {
+  background: #0a111c;
+}
+
 /* 浅色主题：同一套场景换成"浅海"配色 —— 深蓝底配白面板会把整个界面压得发灰，
    浅色主题下应该是"阳光照到水面"的观感，而不是把深色壁纸硬垫在白卡下面。
    ⚠️ 色阶必须比直觉更饱和、鲸鱼必须比直觉更实：白面板 + 白遮罩叠在一起，
@@ -849,6 +856,19 @@ html.dark[data-wkind='we'][data-wallpaper='on'] .card {
 
 /* 视频开屏期间隐藏加载壳里的转圈，避免与底部提示重复 */
 html[data-boot='video'] .boot-veil {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* 视频开屏期间整个应用外壳先藏起来。
+   视频开屏是透明的（要露出壁纸视频），挡不住后面的界面 —— 不藏的话界面会在视频播到
+   一半时整片冒出来，观感就是"没播完就进页面"。壁纸层在 .app-shell 之外，不受影响。
+   开屏进入淡出时摘掉 data-boot，外壳用同样时长淡入，两者交叉。 */
+.app-shell {
+  transition: opacity 420ms ease;
+}
+
+html[data-boot='video'] .app-shell {
   opacity: 0;
   pointer-events: none;
 }

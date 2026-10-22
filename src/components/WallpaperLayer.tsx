@@ -207,7 +207,8 @@ export default function WallpaperLayer() {
   const declaredKind = target?.kind ?? weKind ?? null;
   const wantWe = kind === 'we' && !failed;
   const weScene = wantWe && declaredKind === 'scene' && !!target;
-  const weVideo = wantWe && declaredKind === 'video' && !!videoUrl;
+  /** 知道是视频壁纸就成立 —— 不等 blob URL 就绪：否则"读文件那几百毫秒"里会露出内置场景底色 */
+  const wantVideo = wantWe && declaredKind === 'video';
   // WE 模式下不拿内置场景当垫底：场景/视频之外的（web、未知）才回落
   const cssFallback = !wantWe || (declaredKind !== 'scene' && declaredKind !== 'video');
 
@@ -232,20 +233,23 @@ export default function WallpaperLayer() {
           />
         </div>
       )}
-      {weVideo && (
+      {wantVideo && (
         <>
+          {/* 预览图先垫着：视频还在读/解码的那几百毫秒不至于露出一块空底色 */}
           {poster && !videoReady && (
             <div className="wp-poster" style={{ backgroundImage: `url("${poster}")` }} />
           )}
-          <video
-            className={`wp-video${videoReady ? ' wp-video--ready' : ''}`}
-            src={videoUrl ?? undefined}
-            autoPlay
-            muted
-            loop
-            playsInline
-            onCanPlay={() => setVideoReady(true)}
-          />
+          {videoUrl && (
+            <video
+              className={`wp-video${videoReady ? ' wp-video--ready' : ''}`}
+              src={videoUrl}
+              autoPlay
+              muted
+              loop
+              playsInline
+              onCanPlay={() => setVideoReady(true)}
+            />
+          )}
         </>
       )}
       {cssFallback && (

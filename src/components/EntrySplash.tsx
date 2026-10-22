@@ -88,8 +88,13 @@ export default function EntrySplash({ ready }: { ready: boolean }) {
   // 否则它会从透明开屏底下透出来，和底部的进度提示重复。
   useEffect(() => {
     const el = document.documentElement;
-    // 视频形态与"待定"形态都不盖背景，加载壳里的转圈同样要藏
-    const active = enabled && (overVideo || undecided) && phase !== 'gone';
+    /**
+     * 视频/待定形态下开屏层是透明的（要露出壁纸视频），所以**它挡不住后面的主界面** ——
+     * 界面一就绪（通常 300ms 内）就会整片出现在视频上，观感正是"视频没播完就进页面"。
+     * 因此这里额外给 <html> 挂 data-boot，由样式表把 .app-shell 压成透明：
+     * 视频播完 → 进入 leaving 时立刻摘掉标记，界面用 420ms 淡入，与开屏淡出形成交叉。
+     */
+    const active = enabled && (overVideo || undecided) && phase === 'show';
     if (active) el.dataset.boot = 'video';
     else delete el.dataset.boot;
     return () => {
@@ -134,6 +139,18 @@ export default function EntrySplash({ ready }: { ready: boolean }) {
 
       const v = videoEl();
       const dur = v && Number.isFinite(v.duration) ? v.duration : 0;
+
+      // 视频形态但视频还没就绪（要先把几 MB 的 mp4 读成 blob，再等解码出时长）：
+      // **必须等**，不能落到下面的非视频分支 —— 那会在 900ms 就放行，
+      // 于是主界面盖在还没开始播的视频上（实测症状：开头一块浅蓝底、进去后视频才接着播）。
+      if (overVideoRef.current && (!v || dur <= 0)) {
+        if (elapsed >= MAX_VIDEO_BOOT_MS) {
+          finish();
+          return;
+        }
+        window.setTimeout(tick, 120);
+        return;
+      }
 
       if (v && dur > 0) {
         const atEnd = v.currentTime >= dur - 0.12;
