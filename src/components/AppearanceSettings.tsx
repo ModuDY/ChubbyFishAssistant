@@ -37,7 +37,10 @@ function WeThumb({ item, active }: { item: WeWallpaper; active: boolean }) {
   return (
     <button
       type="button"
-      onClick={() => setAppearance({ kind: 'we', weId: item.id, wallpaper: true })}
+      onClick={() =>
+        // 连类型一起记住：启动时壁纸库还没扫完，靠它才能第一帧就选对渲染分支
+        setAppearance({ kind: 'we', weId: item.id, weKind: item.kind, wallpaper: true })
+      }
       title={`${item.title}${item.workshop ? '（创意工坊）' : '（本机工程）'}`}
       className={`group relative overflow-hidden rounded-lg border text-left transition ${
         active

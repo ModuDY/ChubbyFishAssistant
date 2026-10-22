@@ -59,6 +59,13 @@ export interface Appearance {
   scene: SceneId;
   /** 选中的 WE 壁纸目录名（kind==='we' 时生效） */
   weId: string | null;
+  /**
+   * 选中那张壁纸的类型（scene / video / web）。
+   * 为什么要存：启动瞬间壁纸库还没扫完（扫描要读注册表与多个 Steam 库），
+   * 只靠 weId 无法判断该挂 WebGL 还是 <video>，界面会先闪一下内置场景再切过去。
+   * 把类型一起持久化，开屏与壁纸层就能第一帧走对分支。
+   */
+  weKind: string | null;
   glassLevel: GlassLevel;
   glass: Record<GlassSurface, GlassSurfaceConfig>;
   fx: FxConfig;
@@ -107,6 +114,7 @@ export const APPEARANCE_DEFAULTS: Appearance = {
   kind: 'css',
   scene: 'deep-sea',
   weId: null,
+  weKind: null,
   glassLevel: 'soft',
   glass: defaultGlass(),
   fx: { enabled: true, click: true, trail: true, sparks: true, dust: true, intensity: 1 },
@@ -171,6 +179,7 @@ export function sanitizeAppearance(raw: unknown): Appearance {
     kind: src.kind === 'we' ? 'we' : 'css',
     scene,
     weId: typeof src.weId === 'string' && src.weId ? src.weId : null,
+    weKind: typeof src.weKind === 'string' && src.weKind ? src.weKind : null,
     glassLevel,
     glass: sanitizeGlass(src.glass),
     fx: {

@@ -18,7 +18,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useAppearance } from '../lib/appearance';
 import type { SceneId } from '../lib/appearance';
 import { useWeLibrary } from '../lib/useWeLibrary';
-import { weVideoUrl } from '../lib/we';
+import { wePreviewUrl, weVideoUrl } from '../lib/we';
 import SceneWallpaper from './SceneWallpaper';
 
 /** 气泡参数表：写死而不用 Math.random —— 渲染必须确定性，否则每次重挂载都跳一次 */
@@ -156,10 +156,14 @@ function CssSceneArt({ scene }: { scene: SceneId }) {
 }
 
 export default function WallpaperLayer() {
-  const { wallpaper, kind, scene, weId } = useAppearance();
+  const { wallpaper, kind, scene, weId, weKind } = useAppearance();
   const lib = useWeLibrary(wallpaper && kind === 'we');
   const [failed, setFailed] = useState<string | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  /** 视频首帧是否已经可以显示（4K 解码要几百毫秒，直接上屏会先黑一下） */
+  const [videoReady, setVideoReady] = useState(false);
+  /** 预览图：视频就绪前先垫着，避免开屏那段变成纯黑 */
+  const [poster, setPoster] = useState<string | null>(null);
 
   const target = useMemo(
     () => lib.data?.items.find((w) => w.id === weId) ?? null,
@@ -171,13 +175,18 @@ export default function WallpaperLayer() {
     setFailed(null);
   }, [weId]);
 
-  // 视频类壁纸：读整段 mp4 生成 blob URL
+  // 视频类壁纸：读整段 mp4 生成 blob URL，同时取预览图垫底
   useEffect(() => {
     let alive = true;
     setVideoUrl(null);
+    setVideoReady(false);
+    setPoster(null);
     if (kind === 'we' && target?.kind === 'video' && !failed) {
       void weVideoUrl(target).then((url) => {
         if (alive) setVideoUrl(url);
+      });
+      void wePreviewUrl(target).then((url) => {
+        if (alive) setPoster(url);
       });
     }
     return () => {
@@ -187,10 +196,13 @@ export default function WallpaperLayer() {
 
   if (!wallpaper) return null;
 
-  const usingWe = kind === 'we' && target && !failed;
-  const weScene = usingWe && target.kind === 'scene';
-  const weVideo = usingWe && target.kind === 'video' && videoUrl;
-  const cssFallback = !weScene && !weVideo;
+  // 壁纸库还没扫完时用持久化下来的类型先定分支（否则会先闪一整张内置场景再切走）
+  const declaredKind = target?.kind ?? weKind ?? null;
+  const wantWe = kind === 'we' && !failed;
+  const weScene = wantWe && declaredKind === 'scene' && !!target;
+  const weVideo = wantWe && declaredKind === 'video' && !!videoUrl;
+  // WE 模式下不拿内置场景当垫底：场景/视频之外的（web、未知）才回落
+  const cssFallback = !wantWe || (declaredKind !== 'scene' && declaredKind !== 'video');
 
   return (
     <div
@@ -214,7 +226,20 @@ export default function WallpaperLayer() {
         </div>
       )}
       {weVideo && (
-        <video className="wp-video" src={videoUrl} autoPlay muted loop playsInline />
+        <>
+          {poster && !videoReady && (
+            <div className="wp-poster" style={{ backgroundImage: `url("${poster}")` }} />
+          )}
+          <video
+            className={`wp-video${videoReady ? ' wp-video--ready' : ''}`}
+            src={videoUrl ?? undefined}
+            autoPlay
+            muted
+            loop
+            playsInline
+            onCanPlay={() => setVideoReady(true)}
+          />
+        </>
       )}
       {cssFallback && (
         <>

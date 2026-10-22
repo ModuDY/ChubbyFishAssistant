@@ -118,7 +118,8 @@ export default function App() {
   // 这样登录/加载态也已经能看到场景，不会"先白一下再变壁纸"
   const shell = !ready ? (
     <div className="app-shell flex h-full items-center justify-center bg-slate-100 dark:bg-zinc-950">
-      <div className="flex flex-col items-center gap-3">
+      {/* boot-veil：视频壁纸开屏时隐藏这枚转圈，避免和底部进度提示重复（见 index.css） */}
+      <div className="boot-veil flex flex-col items-center gap-3">
         {initError ? (
           <>
             <p role="alert" className="max-w-lg break-words px-4 text-sm text-red-600">初始化失败：{initError}</p>

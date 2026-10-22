@@ -1,17 +1,24 @@
 /**
  * 进应用动画（开屏）。
  *
+ * 两种形态：
+ * - **视频壁纸形态**：当前选中的是本机 Wallpaper Engine 视频壁纸时，开屏不再盖渐变，
+ *   而是**露出壁纸层自己那个 `<video>`**，只叠一条极简的进度提示。
+ *   关键：复用同一路视频，**不另开播放器** —— 否则开屏那份和主界面那份是两个解码器、
+ *   两个播放位置，切换时必然跳帧；复用之后"开机动画 → 桌面壁纸"是同一帧连续播下去。
+ * - **默认形态**：内置场景 / 非视频壁纸时，仍用原来的渐变开屏。
+ *
  * 三条硬约束：
- * 1. **绝不拖慢启动**：最短展示 900ms（低于这个数字动画自己都播不完，会闪一下），
- *    到点立刻淡出；无论 `ready` 何时就绪都不额外等待。
- * 2. **可跳过**：点任意处、按任意键立即结束（用户已经不耐烦时不要跟他抢时间）。
- * 3. **失败即让路**：`prefers-reduced-motion` 或用户在设置里关掉 ⇒ 直接不渲染，
- *    主界面照常出现。开屏只做装饰，不承载任何加载逻辑。
+ * 1. **绝不拖慢启动**：最短展示 900ms，到点立刻淡出；无论 `ready` 何时就绪都不额外等待。
+ * 2. **可跳过**：点任意处、按任意键立即结束。
+ * 3. **失败即让路**：`prefers-reduced-motion` 或设置里关掉 ⇒ 直接不渲染；
+ *    初始化卡住超过 4 秒也强制退场，把错误与重试按钮让出来。
  */
 
 import { useEffect, useRef, useState } from 'react';
 import petAvatar from '../assets/brand/pet-avatar.png';
 import { useAppearance } from '../lib/appearance';
+import { useWeLibrary } from '../lib/useWeLibrary';
 import { APP_NAME } from '../lib/about';
 
 /** 最短展示时长：低于动画自身时长（约 0.62s + 0.56s 延迟）会看到"闪一下" */
@@ -31,7 +38,14 @@ function prefersReducedMotion(): boolean {
 }
 
 export default function EntrySplash({ ready }: { ready: boolean }) {
-  const { entryAnim } = useAppearance();
+  const { entryAnim, kind, weId, weKind, wallpaper } = useAppearance();
+  const lib = useWeLibrary(wallpaper && kind === 'we' && entryAnim);
+  const target = lib.data?.items.find((w) => w.id === weId) ?? null;
+  /** 视频壁纸：开屏让位给壁纸层里的那个 video。
+      用持久化的 weKind 兜底 —— 刚启动时壁纸库还没扫完，等它就等于先闪一下渐变开屏。 */
+  const declaredKind = target?.kind ?? weKind ?? null;
+  const overVideo = kind === 'we' && declaredKind === 'video';
+
   const enabled = entryAnim && !prefersReducedMotion();
   const [phase, setPhase] = useState<'show' | 'leaving' | 'gone'>(
     enabled ? 'show' : 'gone',
@@ -45,6 +59,18 @@ export default function EntrySplash({ ready }: { ready: boolean }) {
   useEffect(() => {
     mountedAt.current = Date.now();
   }, []);
+
+  // 告诉样式表"现在开屏是视频形态"：加载壳里的转圈要藏起来，
+  // 否则它会从透明开屏底下透出来，和底部的进度提示重复。
+  useEffect(() => {
+    const el = document.documentElement;
+    const active = enabled && overVideo && phase !== 'gone';
+    if (active) el.dataset.boot = 'video';
+    else delete el.dataset.boot;
+    return () => {
+      delete el.dataset.boot;
+    };
+  }, [enabled, overVideo, phase]);
 
   useEffect(() => {
     if (!enabled) return;
@@ -88,12 +114,29 @@ export default function EntrySplash({ ready }: { ready: boolean }) {
 
   if (phase === 'gone') return null;
 
+  const cls = [
+    'entry-splash',
+    overVideo ? 'entry-splash--video' : '',
+    phase === 'leaving' ? 'entry-splash--leaving' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+
+  // 视频形态：不盖背景，只在底部放一枚很小的品牌标 + 流动进度线
+  if (overVideo) {
+    return (
+      <div className={cls} role="presentation" aria-hidden>
+        <div className="entry-video-foot">
+          <img className="entry-video-avatar" src={petAvatar} alt="" draggable={false} />
+          <span className="entry-video-name">{APP_NAME}</span>
+          <span className="entry-bar entry-bar--video" />
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div
-      className={`entry-splash${phase === 'leaving' ? ' entry-splash--leaving' : ''}`}
-      role="presentation"
-      aria-hidden
-    >
+    <div className={cls} role="presentation" aria-hidden>
       <div className="entry-inner">
         <span className="entry-ring entry-ring--outer" />
         <span className="entry-ring" />
