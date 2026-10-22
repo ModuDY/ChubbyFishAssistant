@@ -87,9 +87,11 @@ function Slider({
 }) {
   return (
     <label className={`block ${disabled ? 'opacity-45' : ''}`}>
-      <span className="flex items-baseline justify-between text-xs text-slate-500 dark:text-zinc-400">
+      {/* 标签与数值贴在一起：弹框里每列只有两三百像素，justify-between 会把两者
+          甩到两端，看起来像两段不相干的文字 */}
+      <span className="flex items-baseline gap-1.5 text-xs text-slate-500 dark:text-zinc-400">
         <span>{label}</span>
-        <span className="tabular-nums">
+        <span className="tabular-nums font-medium text-slate-600 dark:text-zinc-300">
           {value}
           {suffix}
         </span>
@@ -251,7 +253,7 @@ export default function AppearanceSettings() {
           </select>
         </label>
 
-        <div className="space-y-3">
+        <div className="grid gap-3 sm:grid-cols-2">
           {GLASS_SURFACES.map((s) => {
             const cfg = a.glass[s.id as GlassSurface];
             const resolved = resolveSurface(a, s.id);
@@ -282,34 +284,41 @@ export default function AppearanceSettings() {
                     跟随全局
                   </label>
                 </div>
-                <div className="mt-2 grid gap-2 sm:grid-cols-2">
-                  <Slider
-                    label="模糊"
-                    value={cfg.inherit ? resolved.blur : cfg.blur}
-                    min={0}
-                    max={40}
-                    suffix="px"
-                    disabled={!a.wallpaper || cfg.inherit || s.id === 'card'}
-                    onChange={(v) =>
-                      setAppearance({
-                        glass: { ...a.glass, [s.id]: { ...cfg, blur: v } },
-                      })
-                    }
-                  />
-                  <Slider
-                    label="不透明度"
-                    value={Math.round((cfg.inherit ? resolved.alpha : cfg.alpha) * 100)}
-                    min={20}
-                    max={100}
-                    suffix="%"
-                    disabled={!a.wallpaper || cfg.inherit}
-                    onChange={(v) =>
-                      setAppearance({
-                        glass: { ...a.glass, [s.id]: { ...cfg, alpha: v / 100 } },
-                      })
-                    }
-                  />
-                </div>
+                {cfg.inherit ? (
+                  <p className="mt-2 text-[11px] text-slate-400">
+                    跟随全局：模糊 {resolved.blur}px · 不透明度{' '}
+                    {Math.round(resolved.alpha * 100)}%
+                  </p>
+                ) : (
+                  <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                    <Slider
+                      label="模糊"
+                      value={cfg.blur}
+                      min={0}
+                      max={40}
+                      suffix="px"
+                      disabled={!a.wallpaper || s.id === 'card'}
+                      onChange={(v) =>
+                        setAppearance({
+                          glass: { ...a.glass, [s.id]: { ...cfg, blur: v } },
+                        })
+                      }
+                    />
+                    <Slider
+                      label="不透明度"
+                      value={Math.round(cfg.alpha * 100)}
+                      min={20}
+                      max={100}
+                      suffix="%"
+                      disabled={!a.wallpaper}
+                      onChange={(v) =>
+                        setAppearance({
+                          glass: { ...a.glass, [s.id]: { ...cfg, alpha: v / 100 } },
+                        })
+                      }
+                    />
+                  </div>
+                )}
                 {s.id === 'card' && (
                   <p className="mt-1 text-[11px] text-slate-400">
                     卡片刻意不加背景模糊：壁纸在动，一页十来张卡片逐帧重算模糊太贵。

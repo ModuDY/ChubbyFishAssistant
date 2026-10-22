@@ -1,4 +1,5 @@
 import { type ReactNode, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { X } from 'lucide-react';
 import { cn } from '../lib/cn';
 
@@ -127,7 +128,11 @@ export function Modal({
   }, [open, onClose]);
 
   if (!open) return null;
-  return (
+  // 必须 portal 到 body：弹框的调用点可能在带了 `backdrop-filter` / `transform` 的容器里
+  // （例如 SystemDialog 挂在侧栏 <aside> 内），那类属性会让该容器变成 `position: fixed`
+  // 后代的**包含块**，弹框就会被压进那个容器的尺寸里（实测被挤进 208px 宽的侧栏）。
+  // 挂到 body 之后，弹框的定位基准永远是视口。
+  return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
       <div className={`card relative z-10 w-full ${widthClass ?? (size === '2xl' ? 'max-w-[78rem]' : size === 'xl' ? 'max-w-4xl' : size === 'lg' ? 'max-w-2xl' : 'max-w-lg')} animate-fade-in p-5 shadow-xl`} role="dialog" aria-modal="true">
@@ -140,7 +145,8 @@ export function Modal({
         <div className={`text-sm text-slate-600 dark:text-zinc-300 ${bodyClass ?? ''}`}>{children}</div>
         {footer && <div className="mt-5 flex justify-end gap-2">{footer}</div>}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
