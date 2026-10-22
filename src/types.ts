@@ -2,6 +2,8 @@
 // 嵌套对象（CheckinOpts / LogsOpts / Settings）的字段必须保持 snake_case。
 
 export type ViewKey =
+  // 工作台（跨应用固定入口，默认首屏；见 docs/pending/工作台-工作流-知识库方案.md §4）
+  | 'workbench'
   | 'dashboard'
   | 'accounts'
   | 'checkin'
@@ -1939,3 +1941,54 @@ export interface AccountBackupPreview {
     will_add: boolean;
   }[];
 }
+
+// ---- 工作台（P0）----
+// 口径见 `docs/pending/工作台-工作流-知识库方案.md` §4：
+// - 工作台是**跨应用固定入口**，不归属任何单个应用菜单；
+// - 布局存 `settings.workbench_layout`（KV 文档，不新增表）；
+// - 待办区块由**规则表自动生成**，用户不维护待办实体。
+
+/** 工作台区块 key（与 `pages/workbench/widgets` 注册表 key 一一对应） */
+export type WorkbenchWidgetKey = 'status' | 'todos' | 'actions' | 'recent' | 'capture';
+
+/** 单个区块的布局项：hidden 隐藏、span 占几列（1~3） */
+export interface WorkbenchWidgetLayout {
+  key: WorkbenchWidgetKey;
+  /** 栅格占列数；Tailwind JIT 需字面量类名，见 widgets 注册表 spanClass 映射 */
+  span: 1 | 2 | 3;
+  hidden: boolean;
+}
+
+/** 布局文档（存 `settings.workbench_layout`）；version 用于将来语义迁移，缺失按 1 处理 */
+export interface WorkbenchLayout {
+  version: number;
+  widgets: WorkbenchWidgetLayout[];
+}
+
+/** 待办/提醒项：由规则从既有数据推导，不含用户手写内容 */
+export interface WorkbenchTodo {
+  /** 稳定 id（规则 key + 目标对象），用于 React key 与"已忽略"记忆 */
+  id: string;
+  /** 一句话描述（面向"今天要做什么"，不是指标名） */
+  title: string;
+  /** 补充说明（为什么提醒 / 影响范围） */
+  detail?: string;
+  /** danger = 需要立刻处理；warn = 尽快；info = 提示 */
+  tone: 'danger' | 'warn' | 'info';
+  /** 一键动作按钮文案；null = 纯提示不可点击 */
+  actionLabel: string | null;
+  /** 动作类型：前端按类型分派到既有 api，不接受通用命令字符串（避免任意命令调用） */
+  action:
+    | { kind: 'nav'; view: ViewKey }
+    | { kind: 'renew_jwt' }
+    | { kind: 'checkin'; platform: 'trae' | 'buddy' | 'qoder' }
+    | { kind: 'start_api' }
+    | { kind: 'install_cert' }
+    | null;
+}
+
+/** 快速捕获的输入意图（输入框前缀语法分流：`?` 问知识库、`/` 走命令、其余存笔记） */
+export type CaptureIntent =
+  | { kind: 'note'; text: string }
+  | { kind: 'ask'; text: string }
+  | { kind: 'command'; text: string };

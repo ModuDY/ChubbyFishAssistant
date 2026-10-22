@@ -23,6 +23,7 @@ pub mod trae_apps;
 pub mod updater;
 pub mod usage_history;
 pub mod wallpaper;
+pub mod workbench;
 pub mod wb_config;
 pub mod workbuddy;
 pub mod workbuddy_stats;

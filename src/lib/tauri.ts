@@ -59,6 +59,7 @@ import type {
   CustomModel,
   WorkBuddyAccountView,
   WorkBuddyEnvCheck,
+  WorkbenchLayout,
   WorkBuddyScanResult,
   WorkBuddySettings,
   WbCreditsResult,
@@ -1018,6 +1019,17 @@ export const api = {
     metricsV2: () => invoke<EvolutionMetricsV2>('evolution_metrics_v2'),
     // P2 影子模式历史；P1.5 恒返回 enabled=false 与空列表
     history: () => invoke<EvolutionHistory>('evolution_history'),
+  },
+  /**
+   * 工作台（P0）：只有布局读写，不改任何业务数据。
+   * 待办/提醒由前端规则从既有 store 数据推导，零额外 IPC——
+   * 新增一条"今天该做X"的规则只需改前端，不必动 Rust。
+   */
+  workbench: {
+    layoutGet: () => invoke<WorkbenchLayout>('workbench_layout_get'),
+    layoutSet: (layout: WorkbenchLayout) =>
+      invoke<void>('workbench_layout_set', { layout }),
+    layoutReset: () => invoke<WorkbenchLayout>('workbench_layout_reset'),
   },
   updater: {
     check: () => invoke<UpdateCheckResult>('update_check'),

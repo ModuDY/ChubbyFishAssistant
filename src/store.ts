@@ -3,6 +3,8 @@ import { APP_NAME } from './lib/about';
 import { api, type CheckinProgressEvent } from './lib/tauri';
 import { createStartupSlice } from './store/startup';
 import type { StartupSlice } from './store/startupTypes';
+import { createWorkbenchSlice } from './store/workbench';
+import type { WorkbenchSlice } from './store/workbenchTypes';
 import { withMinDelay } from './lib/delay';
 import type {
   AccountView,
@@ -69,7 +71,7 @@ export interface LogQuery {
   limit?: number;
 }
 
-export interface AppState extends StartupSlice {
+export interface AppState extends StartupSlice, WorkbenchSlice {
   view: ViewKey;
   /** 侧边栏应用切换（trae = 现有菜单；buddy = 后期扩展置灰；doubao = 豆包页） */
   activeApp: AppKey;
@@ -310,7 +312,10 @@ function armCheckinWatchdog() {
 
 export const useAppStore = create<AppState>((set, get, store) => ({
   ...createStartupSlice(set, get, store),
-  view: 'dashboard',
+  ...createWorkbenchSlice(set, get, store),
+  // 默认首屏改为工作台（P0）：每天打开先看到"今天要做什么"，
+  // 而不是各平台概览的运维数字。想回旧行为在系统设置里改 default_view 即可。
+  view: 'workbench',
   activeApp: 'trae',
   env: null,
   certInstalled: false,

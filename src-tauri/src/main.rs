@@ -479,6 +479,10 @@ fn main() {
             commands::qoder::qoder_env_reset_items,
             commands::qoder::qoder_env_reset,
             tasks::scheduler::scheduler_status,
+            // 工作台（P0）：布局读写（待办由前端规则从既有 store 数据推导，无后端命令）
+            commands::workbench::workbench_layout_get,
+            commands::workbench::workbench_layout_set,
+            commands::workbench::workbench_layout_reset,
         ])
         .setup(|app| {
             let state = app.state::<AppState>();

@@ -53,12 +53,14 @@ ai-work-assistant/
 ├── docs/                         # user-manual / tech-framework / product-design / backlog（唯一待办；原五份分析文档 2026-09-13 归并删除，原文在 git 历史）
 ├── src/                          # 前端
 │   ├── App.tsx                   # 外壳（TitleBar + Sidebar + TopBar + 页面切换 + Toaster）
-│   ├── store.ts + store/          # Zustand 单一状态源；startup slice 管理初始化/重试/存储健康，其余业务逐步拆分
-│   ├── types.ts                  # 与 Rust DTO 对齐（snake_case）
+│   ├── store.ts + store/          # Zustand 单一状态源；startup slice 管理初始化/重试/存储健康，workbench slice 管工作台布局，其余业务逐步拆分
+│   ├── types.ts                  # 与 Rust DTO 对齐（snake_case）；工作台类型（WorkbenchLayout/WorkbenchTodo/CaptureIntent）也在本文件
 │   ├── lib/                      # tauri.ts(invoke 封装+事件订阅) / themes.ts(主题) / appearance.ts(壁纸·玻璃·开屏，localStorage) / delay.ts(withMinDelay) / cn.ts / about.ts / useIsDark.ts
+│   │                             #   workbenchTodos.ts(工作台待办规则引擎，纯函数；改规则只改这里，不动 Rust)
 │   ├── components/               # TitleBar/Sidebar/TopBar/Toaster/PageHeader/SetupGuide/ui + SystemDialog(系统设置+系统日志弹框)/GeneralSettingsPanel/AboutDialog
 │   │                             #   WallpaperLayer(场景壁纸层，fixed z-index:-2，纯CSS+SVG) / EntrySplash(进应用动画)
 │   └── pages/                    # Dashboard / Accounts(661行编排 + accounts/ 16 个拆分子组件) / Checkin / Logs / ApiService / Settings
+│   │                             #   workbench/（Workbench.tsx + widgets/registry.tsx + 5 个区块：状态/待办/一键动作/最近/快速捕获）
 │   │                             #   dashboard/ 积分看板（platform 参数化：credits 视图=Trae 页、buddy-credits 视图=Buddy 页、qoder-credits 视图=Qoder 页替换旧 QoderCredits；KpiRow/CreditsTab/TokensTab/ExpiryTab/adapters）
 │   │                             #   buddy/（BuddyOverview/BuddyAccounts/BuddyCheckin/BuddyApiService/BuddySettings）
 ├── scripts/                      # dev-tauri.mjs(tauri 脚本入口) / sync_version.mjs / rename_release.mjs / package_portable.mjs / gen_asset_base64.mjs

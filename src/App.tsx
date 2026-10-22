@@ -9,6 +9,7 @@ import EntrySplash from './components/EntrySplash';
 import EffectsHost from './components/EffectsHost';
 import { useAppStore } from './store';
 import { resolveTheme } from './lib/themes';
+import Workbench from './pages/workbench/Workbench';
 import Dashboard from './pages/Dashboard';
 import Accounts from './pages/Accounts';
 import Checkin from './pages/Checkin';
@@ -36,6 +37,10 @@ import TraeWorkMigrationGuide from './components/TraeWorkMigrationGuide';
 
 function renderView(view: string) {
   switch (view) {
+    // 工作台：跨应用固定入口（默认首屏）。注意本 switch 的 default 回落
+    // Dashboard，新增 ViewKey 忘了加 case 会**静默显示概览页**而不是报错。
+    case 'workbench':
+      return <Workbench />;
     case 'dashboard':
       return <Dashboard />;
     case 'accounts':

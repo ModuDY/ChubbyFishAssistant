@@ -130,6 +130,21 @@ export default function Sidebar({
   return (
     <aside className="app-sidebar flex w-52 shrink-0 flex-col border-r border-slate-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
       <nav className="flex-1 space-y-1 p-3">
+        {/* 工作台固定在菜单最上方且**不随 activeApp 变化**：它是跨应用的今日入口，
+            塞进 NAV/BUDDY_NAV 会在切应用时消失（方案 §4.3） */}
+        <button
+          onClick={() => onNav('workbench')}
+          className={cn(
+            'flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition active:scale-[0.98]',
+            view === 'workbench'
+              ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
+              : 'text-slate-600 hover:bg-slate-100 dark:text-zinc-400 dark:hover:bg-zinc-800',
+          )}
+        >
+          <LayoutGrid size={17} />
+          工作台
+        </button>
+        <div className="my-2 border-t border-slate-200 dark:border-zinc-800" />
         {nav.map((item) => {
           const Icon = item.icon;
           const active = view === item.key;
