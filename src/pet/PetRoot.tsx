@@ -844,19 +844,38 @@ export default function PetRoot() {
       if (disposed) un();
     });
 
-    // 页面变隐藏时补暂停；变可见时**仅当窗口真在显示**才解除暂停
-    // （避免页面误报 hidden 后再也没人把它恢复回来 → 角色一直"消失"而气泡还在）
-    const onVisibility = () => {
-      if (document.hidden) {
-        setPaused(true);
-        return;
-      }
+    /**
+     * 可见性纠偏。
+     *
+     * 窗口可见性的**真源是 Rust**（watchdog 每 1s 对账并下发 pet-update），
+     * 这里只做两件事：① 页面报 hidden 时先省电停解码；② 用 Rust 的结论兜住误报。
+     *
+     * 为什么必须兜：`document.hidden` 在 WebView2 里会因窗口被遮挡/最小化而置位，
+     * 但「恢复」不一定伴随 visibilitychange(visible)。旧实现一旦收到 hidden 就
+     * setPaused(true)，若之后既没有 visible 事件、Rust 那边又因为"期望=实际"不发
+     * pet-update，`paused` 就永久停在 true —— 角色一动不动，点一下（手势触发 play）才活。
+     * 现在 hidden 之后补一次延迟复核，且请求失败按"可见"处理（宁可多播一段，不要冻住）。
+     */
+    const syncPausedFromRust = () => {
       void api.pet
         .status()
         .then((s) => {
-          if (!disposed && s.visible) setPaused(false);
+          if (!disposed) setPaused(!s.visible);
         })
-        .catch(() => {});
+        .catch(() => {
+          // 读不到就按可见运行：Rust 的 watchdog 会在下一轮把真实可见性再推一次
+          if (!disposed && !document.hidden) setPaused(false);
+        });
+    };
+
+    const onVisibility = () => {
+      if (document.hidden) {
+        setPaused(true);
+        // 遮挡/最小化可能只来 hidden 不来 visible：2s 后按 Rust 的结论纠一次
+        window.setTimeout(syncPausedFromRust, 2000);
+        return;
+      }
+      syncPausedFromRust();
     };
     document.addEventListener('visibilitychange', onVisibility);
 

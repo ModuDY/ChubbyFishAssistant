@@ -254,18 +254,31 @@ export default function PetSprite({
   }, [paused, applyAction, measure, playWithRetry]);
 
   /**
-   * 自愈守卫：窗口可见且未暂停，却长时间拿不到可播放帧（readyState < 2 或 videoWidth=0）
-   * → 强制重载并重播一次。触发场景：切动作时解码失败、恢复显示时缓冲未就绪；
-   * 没有这一步，角色会一直"消失"而气泡照常显示。
+   * 自愈守卫（每 3s 巡检一次），覆盖两类「角色不动」：
+   *
+   * 1. **拿不到可播放帧**（readyState < 2 或 videoWidth=0）→ 强制 load + 重播。
+   * 2. **帧是好的，但视频处于暂停态**（`video.paused === true` 而 React 侧的 paused 为 false）
+   *    → 只补一次 play。这是用户实际遇到的那一类：`play()` 被拒（窗口刚 show、
+   *    合成器未就绪、被全屏应用遮挡后 WebView 挂起媒体）时 `playWithRetry` 最多试 6 次就放弃，
+   *    此后 readyState 一直是好的、画面停在最后一帧 —— 表现为「桌宠一动不动，点它一下才活」。
+   *    点一下之所以能救：点击触发动作切换（playKey 变化），DOM 事件属于用户手势，
+   *    `play()` 因此被放行。
+   *
+   * 说明：这条守卫以前只看 readyState，恰恰在最需要它的那种状态（帧好但暂停）里直接 return，
+   * 等于失效。现在把「是否真的在播」也纳入判据。
    */
   useEffect(() => {
     const timer = window.setInterval(() => {
       const video = videoRef.current;
       if (!video || pausedRef.current) return;
+
       if (video.readyState >= 2 && video.videoWidth > 0) {
         healedRef.current = false;
+        // 帧可用却没在播 ⇒ 补 play（不 load，避免清掉当前帧导致再闪一下）
+        if (video.paused) playWithRetry();
         return;
       }
+
       if (healedRef.current) return;
       healedRef.current = true;
       try {
