@@ -55,8 +55,9 @@ ai-work-assistant/
 │   ├── App.tsx                   # 外壳（TitleBar + Sidebar + TopBar + 页面切换 + Toaster）
 │   ├── store.ts + store/          # Zustand 单一状态源；startup slice 管理初始化/重试/存储健康，其余业务逐步拆分
 │   ├── types.ts                  # 与 Rust DTO 对齐（snake_case）
-│   ├── lib/                      # tauri.ts(invoke 封装+事件订阅) / themes.ts(主题) / delay.ts(withMinDelay) / cn.ts / about.ts / useIsDark.ts
+│   ├── lib/                      # tauri.ts(invoke 封装+事件订阅) / themes.ts(主题) / appearance.ts(壁纸·玻璃·开屏，localStorage) / delay.ts(withMinDelay) / cn.ts / about.ts / useIsDark.ts
 │   ├── components/               # TitleBar/Sidebar/TopBar/Toaster/PageHeader/SetupGuide/ui + SystemDialog(系统设置+系统日志弹框)/GeneralSettingsPanel/AboutDialog
+│   │                             #   WallpaperLayer(场景壁纸层，fixed z-index:-2，纯CSS+SVG) / EntrySplash(进应用动画)
 │   └── pages/                    # Dashboard / Accounts(661行编排 + accounts/ 16 个拆分子组件) / Checkin / Logs / ApiService / Settings
 │   │                             #   dashboard/ 积分看板（platform 参数化：credits 视图=Trae 页、buddy-credits 视图=Buddy 页、qoder-credits 视图=Qoder 页替换旧 QoderCredits；KpiRow/CreditsTab/TokensTab/ExpiryTab/adapters）
 │   │                             #   buddy/（BuddyOverview/BuddyAccounts/BuddyCheckin/BuddyApiService/BuddySettings）

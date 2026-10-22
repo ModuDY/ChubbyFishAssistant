@@ -58,7 +58,7 @@ export default function TitleBar() {
   return (
     <>
       <div
-        className="flex h-9 shrink-0 items-center justify-between border-b border-slate-200 bg-slate-50 pl-3 pr-1 dark:border-zinc-800 dark:bg-zinc-950"
+        className="app-titlebar flex h-9 shrink-0 items-center justify-between border-b border-slate-200 bg-slate-50 pl-3 pr-1 dark:border-zinc-800 dark:bg-zinc-950"
       >
         <button type="button" className="flex items-center gap-2" onMouseDown={(e) => e.stopPropagation()} onClick={() => setShowBackup(true)} aria-label={APP_NAME}>
           <BrandMark />

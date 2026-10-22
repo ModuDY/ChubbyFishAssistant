@@ -76,6 +76,26 @@ html.dark[data-theme='tech-blue'] {
   --c-zinc-100: 194 217 250;
 }
 
+/* 海雾蓝（浅色）：与大肥鱼壁纸配套的浅色主题，蓝味更像"浅海"而不是"冷灰" */
+html[data-theme='azure-mist'] {
+  color-scheme: light;
+  --c-slate-50: 246 250 254;
+  --c-slate-100: 233 242 251;
+  --c-slate-200: 213 228 244;
+  --c-slate-300: 178 203 228;
+}
+
+/* 深海蓝鲸（深色）：深水蓝底 + 冷调前景，配「深海鲸游」壁纸 */
+html.dark[data-theme='deep-sea'] {
+  color-scheme: dark;
+  --c-zinc-950: 5 12 24;
+  --c-zinc-900: 10 21 38;
+  --c-zinc-800: 17 34 58;
+  --c-zinc-700: 28 52 86;
+  --c-zinc-200: 212 231 252;
+  --c-zinc-100: 188 214 247;
+}
+
 html,
 body,
 #root {
@@ -158,5 +178,614 @@ html.dark a:focus-visible {
   /* 数据表行悬浮反馈（统一 Logs 表既有手感，浅色 slate-50 / 深色 zinc-800/40） */
   .row-hover {
     @apply transition-colors hover:bg-slate-50/80 dark:hover:bg-zinc-800/40;
+  }
+}
+
+/* ============================================================================
+   外观增强：壁纸层 / 液态玻璃 / 进应用动画
+   ----------------------------------------------------------------------------
+   开关全部走 <html> 的 data 属性（data-wallpaper / data-scene / data-glass），
+   与主题（data-theme）同一套「属性驱动样式」的做法，组件侧不各自维护状态。
+
+   三条硬约束：
+   1. 壁纸层 z-index 为负 —— 不进布局流，App 骨架一行不用改。
+   2. 只在 `html[data-wallpaper='on']` 下接管背景；关闭时这份样式整体不生效，
+      观感与改造前逐像素一致（可回退）。
+   3. 动效只用 transform / opacity；全屏 `filter: blur()` 不进逐帧动画。
+   ============================================================================ */
+
+:root {
+  /* JS 会覆盖这两个值（src/lib/appearance.ts），这里是缺省兜底 */
+  --wp-blur: 10px;
+  --wp-alpha: 0.72;
+}
+
+/* ---------- 壁纸层 ---------- */
+
+.wp-layer {
+  position: fixed;
+  inset: 0;
+  z-index: -2;
+  overflow: hidden;
+  pointer-events: none;
+  contain: strict;
+}
+
+.wp-base {
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(120% 90% at 50% -10%, #1d3f74 0%, #122a4d 38%, #0a1830 70%, #060e1e 100%);
+}
+
+/* 场景：极光海面 */
+.wp-layer[data-scene='aurora'] .wp-base {
+  background:
+    radial-gradient(130% 100% at 20% 0%, #16224a 0%, #0d1533 45%, #070b1c 100%);
+}
+
+/* 场景：深渊微光 */
+.wp-layer[data-scene='abyss'] .wp-base {
+  background:
+    radial-gradient(120% 95% at 50% 0%, #0b1528 0%, #050a14 55%, #02040a 100%);
+}
+
+/* 浅色主题：同一套场景换成"浅海"配色 —— 深蓝底配白面板会把整个界面压得发灰，
+   浅色主题下应该是"阳光照到水面"的观感，而不是把深色壁纸硬垫在白卡下面。 */
+html:not(.dark)[data-wallpaper='on'] .wp-base {
+  background:
+    radial-gradient(120% 90% at 50% -10%, #cfe6fb 0%, #b7d6f2 36%, #93bde4 68%, #6f9fce 100%);
+}
+
+html:not(.dark)[data-wallpaper='on'] .wp-layer[data-scene='aurora'] .wp-base {
+  background:
+    radial-gradient(130% 100% at 20% 0%, #d8ecff 0%, #b9d9f6 45%, #8fb8dd 100%);
+}
+
+html:not(.dark)[data-wallpaper='on'] .wp-layer[data-scene='abyss'] .wp-base {
+  background:
+    radial-gradient(120% 95% at 50% 0%, #dceaf7 0%, #b6cee4 55%, #8fadc9 100%);
+}
+
+html:not(.dark)[data-wallpaper='on'] .wp-vignette {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.45) 0%, rgba(255, 255, 255, 0) 24%),
+    radial-gradient(120% 80% at 50% 120%, rgba(120, 160, 200, 0.35) 0%, rgba(120, 160, 200, 0) 62%);
+}
+
+html:not(.dark)[data-wallpaper='on'] .wp-whale {
+  opacity: 0.26;
+}
+
+html:not(.dark)[data-wallpaper='on'] .wp-ray {
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.55) 0%,
+    rgba(214, 236, 255, 0.28) 45%,
+    rgba(214, 236, 255, 0) 100%
+  );
+}
+
+html:not(.dark)[data-wallpaper='on'] .wp-bubble {
+  background: radial-gradient(
+    circle at 32% 28%,
+    rgba(255, 255, 255, 0.95) 0%,
+    rgba(190, 224, 250, 0.5) 42%,
+    rgba(160, 200, 235, 0.12) 100%
+  );
+}
+
+/* 顶底压暗：保证任何壁纸上前景文字都有对比度 */
+.wp-vignette {
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(180deg, rgba(6, 12, 24, 0.55) 0%, rgba(6, 12, 24, 0) 22%),
+    radial-gradient(120% 80% at 50% 120%, rgba(2, 6, 14, 0.6) 0%, rgba(2, 6, 14, 0) 60%);
+}
+
+/* 光柱：三条斜向渐变带，缓慢摆动（transform 合成，不重绘） */
+.wp-rays {
+  position: absolute;
+  inset: -20% -10% 0 -10%;
+  overflow: hidden;
+}
+
+.wp-ray {
+  position: absolute;
+  top: -30%;
+  width: 16vw;
+  height: 150%;
+  transform-origin: 50% 0;
+  background: linear-gradient(
+    180deg,
+    rgba(140, 200, 255, 0.16) 0%,
+    rgba(110, 175, 245, 0.07) 45%,
+    rgba(110, 175, 245, 0) 100%
+  );
+  will-change: transform, opacity;
+  animation: wp-ray-sway 26s ease-in-out infinite;
+}
+
+.wp-ray--a {
+  left: 14%;
+  transform: skewX(-12deg);
+}
+
+.wp-ray--b {
+  left: 46%;
+  width: 11vw;
+  animation-duration: 34s;
+  animation-direction: reverse;
+  opacity: 0.8;
+  transform: skewX(-9deg);
+}
+
+.wp-ray--c {
+  left: 74%;
+  width: 20vw;
+  animation-duration: 41s;
+  opacity: 0.65;
+  transform: skewX(-15deg);
+}
+
+@keyframes wp-ray-sway {
+  0%,
+  100% {
+    transform: skewX(-12deg) translate3d(-2vw, 0, 0);
+    opacity: 0.55;
+  }
+  50% {
+    transform: skewX(-12deg) translate3d(3vw, 0, 0);
+    opacity: 0.9;
+  }
+}
+
+/* 气泡：自下而上匀速漂浮 */
+.wp-bubbles {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+.wp-bubble {
+  position: absolute;
+  bottom: -6vh;
+  border-radius: 999px;
+  background: radial-gradient(
+    circle at 32% 28%,
+    rgba(220, 240, 255, 0.9) 0%,
+    rgba(150, 205, 250, 0.4) 42%,
+    rgba(120, 180, 240, 0.08) 100%
+  );
+  box-shadow: inset 0 0 0 1px rgba(190, 225, 255, 0.22);
+  opacity: 0;
+  will-change: transform, opacity;
+  animation-name: wp-bubble-rise;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+}
+
+@keyframes wp-bubble-rise {
+  0% {
+    transform: translate3d(0, 0, 0) scale(0.85);
+    opacity: 0;
+  }
+  12% {
+    opacity: 0.75;
+  }
+  80% {
+    opacity: 0.5;
+  }
+  100% {
+    transform: translate3d(2.2vw, -118vh, 0) scale(1.15);
+    opacity: 0;
+  }
+}
+
+/* 大肥鱼：右侧缓浮，尾鳍轻摆。
+   尺寸与透明度都刻意收敛 —— 它是背景的陈设，不是主角：
+   太亮太大会从卡片缝里抢走注意力（放大到 34vw / 0.5 时实测很吵）。 */
+.wp-whale {
+  position: absolute;
+  right: 5vw;
+  bottom: 6vh;
+  width: min(24vw, 340px);
+  height: auto;
+  opacity: 0.32;
+  filter: drop-shadow(0 18px 34px rgba(6, 20, 44, 0.5));
+  will-change: transform;
+  animation: wp-whale-float 18s ease-in-out infinite;
+}
+
+.wp-whale-tail {
+  transform-origin: 74px 82px;
+  animation: wp-whale-tail 5.5s ease-in-out infinite;
+}
+
+.wp-whale-spout {
+  animation: wp-whale-spout 6.5s ease-in-out infinite;
+}
+
+@keyframes wp-whale-float {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) rotate(-1.5deg);
+  }
+  50% {
+    transform: translate3d(-1.6vw, -3vh, 0) rotate(1.5deg);
+  }
+}
+
+@keyframes wp-whale-tail {
+  0%,
+  100% {
+    transform: rotate(-6deg);
+  }
+  50% {
+    transform: rotate(7deg);
+  }
+}
+
+@keyframes wp-whale-spout {
+  0%,
+  100% {
+    opacity: 0.18;
+    transform: translateY(0);
+  }
+  40% {
+    opacity: 0.62;
+    transform: translateY(-5px);
+  }
+}
+
+/* 场景：极光带（大面柔光缓慢漂移） */
+.wp-aurora-wrap {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+.wp-aurora {
+  position: absolute;
+  border-radius: 999px;
+  /* 模糊量刻意压到 34px：46px 会把整条极光稀释成一层灰雾（实测几乎看不见），
+     34px 既保住"柔"的观感，又留得住青绿/紫的色相 */
+  filter: blur(34px);
+  opacity: 0.72;
+  will-change: transform;
+  animation: wp-aurora-drift 30s ease-in-out infinite;
+}
+
+.wp-aurora--a {
+  left: -12%;
+  top: -16%;
+  width: 62vw;
+  height: 46vh;
+  background: linear-gradient(115deg, rgba(64, 224, 190, 0.85), rgba(56, 132, 255, 0.3));
+}
+
+.wp-aurora--b {
+  right: -16%;
+  top: -4%;
+  width: 58vw;
+  height: 40vh;
+  background: linear-gradient(115deg, rgba(146, 116, 255, 0.78), rgba(56, 189, 248, 0.3));
+  animation-duration: 38s;
+  animation-direction: reverse;
+}
+
+.wp-aurora--c {
+  left: 18%;
+  top: 20%;
+  width: 48vw;
+  height: 30vh;
+  background: linear-gradient(115deg, rgba(56, 189, 248, 0.58), rgba(147, 197, 253, 0.2));
+  animation-duration: 46s;
+  opacity: 0.55;
+}
+
+@keyframes wp-aurora-drift {
+  0%,
+  100% {
+    transform: translate3d(-3vw, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(4vw, 3vh, 0) scale(1.08);
+  }
+}
+
+/* 场景：浮尘 */
+.wp-dust-wrap {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+.wp-dust {
+  position: absolute;
+  bottom: -4vh;
+  border-radius: 999px;
+  background: rgba(160, 210, 255, 0.75);
+  opacity: 0;
+  will-change: transform, opacity;
+  animation-name: wp-bubble-rise;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+}
+
+/* ---------- 液态玻璃 ---------- */
+
+/* html 兜底底色：壁纸层是 fixed 定位，橡皮筋回弹/短文档时露出的就是这一层，
+   所以它必须跟着深浅走，否则浅色主题下会从边缘漏出一条深色边。 */
+html[data-wallpaper='on'] {
+  background-color: #cfe6fb;
+}
+
+html.dark[data-wallpaper='on'] {
+  background-color: #050a14;
+}
+
+html[data-wallpaper='on'] body {
+  background-color: transparent;
+}
+
+/* 主壳：让壁纸透出来（关掉壁纸时这条不生效，保持原样） */
+html[data-wallpaper='on'] .app-shell {
+  background-color: transparent;
+}
+
+/* 玻璃面·模糊组：只有三个结构性大面板吃 backdrop-filter。
+   为什么卡片不吃：`backdrop-filter` 在背景**变化时**要重算模糊，而壁纸是持续动的
+   （气泡上浮、鲸鱼漂浮）。一张页面十来张卡片各自重算，等于把最贵的一档逐帧跑十遍；
+   而卡片底下本来就是柔和的渐变，模糊与否肉眼几乎无差。 */
+html[data-wallpaper='on'] .app-titlebar,
+html[data-wallpaper='on'] .app-topbar,
+html[data-wallpaper='on'] .app-sidebar {
+  background-color: rgba(255, 255, 255, var(--wp-alpha));
+  -webkit-backdrop-filter: blur(var(--wp-blur)) saturate(1.35);
+  backdrop-filter: blur(var(--wp-blur)) saturate(1.35);
+}
+
+html.dark[data-wallpaper='on'] .app-titlebar,
+html.dark[data-wallpaper='on'] .app-topbar,
+html.dark[data-wallpaper='on'] .app-sidebar {
+  background-color: rgba(11, 19, 34, var(--wp-alpha));
+}
+
+/* 玻璃面·半透组：卡片只做半透明，不加模糊 */
+html[data-wallpaper='on'] .card {
+  background-color: rgba(255, 255, 255, calc(var(--wp-alpha) * 1.06));
+}
+
+html.dark[data-wallpaper='on'] .card {
+  background-color: rgba(13, 22, 38, calc(var(--wp-alpha) * 1.06));
+}
+
+/* glass=off：明确退回实心面板（不是"不写"，是写回不透明 + 去掉模糊） */
+html[data-wallpaper='on'][data-glass='off'] .app-titlebar,
+html[data-wallpaper='on'][data-glass='off'] .app-topbar,
+html[data-wallpaper='on'][data-glass='off'] .app-sidebar,
+html[data-wallpaper='on'][data-glass='off'] .card {
+  background-color: rgb(255 255 255);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+html.dark[data-wallpaper='on'][data-glass='off'] .app-titlebar,
+html.dark[data-wallpaper='on'][data-glass='off'] .app-topbar,
+html.dark[data-wallpaper='on'][data-glass='off'] .app-sidebar,
+html.dark[data-wallpaper='on'][data-glass='off'] .card {
+  background-color: rgb(9 9 11);
+}
+
+/* 内容区轻纱：壁纸之上压一层淡色，正文直接落在壁纸上时也能读。
+   用 `background-image` 而不是 `::before` 铺：这是 `overflow: auto` 的滚动容器，
+   绝对定位的伪元素会**跟着内容一起滚走**（滚到下面就没纱了），而元素自身的背景
+   默认固定在 padding box 上，不随滚动移动。 */
+html[data-wallpaper='on'] .app-content {
+  background-image: linear-gradient(
+    180deg,
+    rgba(248, 250, 252, 0.42) 0%,
+    rgba(248, 250, 252, 0.2) 40%,
+    rgba(248, 250, 252, 0.1) 100%
+  );
+}
+
+html.dark[data-wallpaper='on'] .app-content {
+  background-image: linear-gradient(
+    180deg,
+    rgba(8, 14, 26, 0.5) 0%,
+    rgba(8, 14, 26, 0.28) 40%,
+    rgba(8, 14, 26, 0.14) 100%
+  );
+}
+
+/* ---------- 进应用动画 ---------- */
+
+.entry-splash {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background:
+    radial-gradient(90% 70% at 50% 42%, #16325c 0%, #0c1d38 46%, #060e1e 100%);
+  animation: entry-fade-in 0.42s ease-out both;
+}
+
+.entry-splash--leaving {
+  animation: entry-fade-out 0.44s cubic-bezier(0.4, 0, 1, 1) both;
+  pointer-events: none;
+}
+
+@keyframes entry-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes entry-fade-out {
+  from {
+    opacity: 1;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: scale(1.04);
+  }
+}
+
+.entry-inner {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+}
+
+/* 头像：淡入 + 轻微上浮 */
+.entry-avatar {
+  width: 84px;
+  height: 84px;
+  object-fit: contain;
+  opacity: 0;
+  animation: entry-avatar-in 0.62s cubic-bezier(0.22, 1, 0.36, 1) 0.08s both;
+  filter: drop-shadow(0 12px 28px rgba(56, 132, 255, 0.42));
+  will-change: transform, opacity;
+  z-index: 1;
+}
+
+@keyframes entry-avatar-in {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.86);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* 双环：反向旋转，纯 transform */
+.entry-ring {
+  position: absolute;
+  top: 42px;
+  left: 50%;
+  width: 118px;
+  height: 118px;
+  margin: -59px 0 0 -59px;
+  border-radius: 999px;
+  border: 1.5px solid rgba(120, 185, 255, 0.28);
+  border-top-color: rgba(150, 210, 255, 0.85);
+  will-change: transform;
+  animation: entry-ring-spin 1.9s linear infinite;
+}
+
+.entry-ring--outer {
+  width: 148px;
+  height: 148px;
+  margin: -74px 0 0 -74px;
+  border-color: rgba(90, 150, 235, 0.14);
+  border-bottom-color: rgba(120, 185, 255, 0.55);
+  animation-duration: 2.8s;
+  animation-direction: reverse;
+}
+
+@keyframes entry-ring-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.entry-title {
+  color: #e8f3ff;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  opacity: 0;
+  animation: entry-rise 0.5s ease-out 0.34s both;
+}
+
+.entry-sub {
+  color: rgba(168, 200, 240, 0.72);
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  opacity: 0;
+  animation: entry-rise 0.5s ease-out 0.46s both;
+}
+
+@keyframes entry-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* 进度条：不确定态流光，告诉用户"在做事"而不是"卡住" */
+.entry-bar {
+  position: relative;
+  width: 168px;
+  height: 2px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(120, 170, 235, 0.16);
+  opacity: 0;
+  animation: entry-rise 0.5s ease-out 0.56s both;
+}
+
+.entry-bar::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  width: 42%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(120, 190, 255, 0), rgba(160, 215, 255, 0.95), rgba(120, 190, 255, 0));
+  will-change: transform;
+  animation: entry-bar-run 1.35s ease-in-out infinite;
+}
+
+@keyframes entry-bar-run {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(340%);
+  }
+}
+
+/* 无障碍：系统要求减弱动效 ⇒ 壁纸与开屏全部静止（内容照常显示，不丢功能） */
+@media (prefers-reduced-motion: reduce) {
+  .wp-ray,
+  .wp-bubble,
+  .wp-dust,
+  .wp-whale,
+  .wp-whale-tail,
+  .wp-whale-spout,
+  .wp-aurora {
+    animation: none !important;
+  }
+
+  .entry-splash,
+  .entry-splash--leaving,
+  .entry-avatar,
+  .entry-title,
+  .entry-sub,
+  .entry-bar {
+    animation: none !important;
+    opacity: 1;
+  }
+
+  .entry-ring,
+  .entry-bar::after {
+    animation: none !important;
   }
 }

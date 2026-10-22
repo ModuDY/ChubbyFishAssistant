@@ -4,6 +4,8 @@ import Sidebar from './components/Sidebar';
 import TopBar from './components/TopBar';
 import Toaster from './components/Toaster';
 import StorageHealthBanner from './components/StorageHealthBanner';
+import WallpaperLayer from './components/WallpaperLayer';
+import EntrySplash from './components/EntrySplash';
 import { useAppStore } from './store';
 import { resolveTheme } from './lib/themes';
 import Dashboard from './pages/Dashboard';
@@ -111,35 +113,34 @@ export default function App() {
     return () => mq.removeEventListener('change', apply);
   }, [settings?.theme]);
 
-  if (!ready) {
-    return (
-      <div className="flex h-full items-center justify-center bg-slate-100 dark:bg-zinc-950">
-        <div className="flex flex-col items-center gap-3">
-          {initError ? (
-            <>
-              <p role="alert" className="max-w-lg break-words px-4 text-sm text-red-600">初始化失败：{initError}</p>
-              <button className="btn-primary" onClick={() => void init().catch(() => {})}>重试</button>
-            </>
-          ) : (
-            <>
-              <div className="h-8 w-8 animate-spin rounded-full border-3 border-zinc-400 border-t-transparent" />
-              <span className="text-sm text-slate-500">正在加载…</span>
-            </>
-          )}
-        </div>
+  // 壁纸层必须挂在最外层且始终在场（关闭时组件自身返回 null），
+  // 这样登录/加载态也已经能看到场景，不会"先白一下再变壁纸"
+  const shell = !ready ? (
+    <div className="app-shell flex h-full items-center justify-center bg-slate-100 dark:bg-zinc-950">
+      <div className="flex flex-col items-center gap-3">
+        {initError ? (
+          <>
+            <p role="alert" className="max-w-lg break-words px-4 text-sm text-red-600">初始化失败：{initError}</p>
+            <button className="btn-primary" onClick={() => void init().catch(() => {})}>重试</button>
+          </>
+        ) : (
+          <>
+            <div className="h-8 w-8 animate-spin rounded-full border-3 border-zinc-400 border-t-transparent" />
+            <span className="text-sm text-slate-500">正在加载…</span>
+          </>
+        )}
       </div>
-    );
-  }
-
-  return (
-    <div className="flex h-full flex-col bg-slate-100 text-slate-800 dark:bg-zinc-950 dark:text-zinc-100">
+    </div>
+  ) : (
+    <div className="app-shell flex h-full flex-col bg-slate-100 text-slate-800 dark:bg-zinc-950 dark:text-zinc-100">
       <TitleBar />
       <StorageHealthBanner />
       <div className="flex min-h-0 flex-1">
         <Sidebar view={view} onNav={setView} />
         <main className="relative flex min-w-0 flex-1 flex-col">
           <TopBar />
-          <div className="relative min-h-0 flex-1 overflow-auto p-5">{renderView(view)}</div>
+          {/* app-content：壁纸开启时由样式表在此铺一层轻纱，保证正文对比度 */}
+          <div className="app-content relative min-h-0 flex-1 overflow-auto p-5">{renderView(view)}</div>
         </main>
       </div>
       <Toaster />
@@ -148,5 +149,13 @@ export default function App() {
       {/* Trae 双应用合并升级引导（首启有迁移报告时弹出，关闭落标记后不再展示） */}
       <TraeWorkMigrationGuide />
     </div>
+  );
+
+  return (
+    <>
+      <WallpaperLayer />
+      {shell}
+      <EntrySplash ready={ready} />
+    </>
   );
 }

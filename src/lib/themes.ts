@@ -9,11 +9,13 @@ export interface ThemeDef {
 /** 全部主题（顺序即左下角轮询切换顺序） */
 export const THEMES: ThemeDef[] = [
   { id: 'graphite', name: '石墨灰（浅色）', dark: false },
+  { id: 'azure-mist', name: '海雾蓝（浅色）', dark: false },
   { id: 'charcoal', name: '炭黑（深色）', dark: true },
   { id: 'violet-night', name: '暗夜紫', dark: true },
   { id: 'ink-green', name: '墨绿', dark: true },
   { id: 'amber-night', name: '琥珀暖夜', dark: true },
   { id: 'tech-blue', name: '科技蓝', dark: true },
+  { id: 'deep-sea', name: '深海蓝鲸', dark: true },
 ];
 
 export const DEFAULT_THEME = 'charcoal';

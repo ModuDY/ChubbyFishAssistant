@@ -4,6 +4,15 @@ import { useAppStore } from '../store';
 import { withMinDelay } from '../lib/delay';
 import { api } from '../lib/tauri';
 import { THEMES } from '../lib/themes';
+import {
+  GLASS_LEVELS,
+  SCENES,
+  glassBlur,
+  setAppearance,
+  useAppearance,
+  type GlassLevel,
+  type SceneId,
+} from '../lib/appearance';
 import { APP_TABS } from './Sidebar';
 import { ICON_CHOICES, resolveAppIcon, DEFAULT_APP_ICONS } from '../lib/appIcons';
 import type {
@@ -13,8 +22,8 @@ import type {
   PetProactiveMode,
   EvolutionMetrics,
 } from '../types';
-import { localChineseVoices } from '../pet/tts';
-import { previewSpeech } from '../pet/usePetSpeak';
+import { DEFAULT_VOICE_ID, EDGE_VOICES, localChineseVoices } from '../pet/tts';
+import { previewVoice } from '../pet/usePetSpeak';
 
 /**
  * 通用设置面板：外观 / 语言 / 通用与通知 / 代理相关配置。
@@ -29,6 +38,8 @@ export default function GeneralSettingsPanel() {
 
   const [form, setForm] = useState<SettingsType | null>(null);
   const [saving, setSaving] = useState(false);
+  // 壁纸 / 玻璃 / 开屏：设备本地偏好，独立于 Settings 表单（改动即时生效）
+  const appearance = useAppearance();
   // 开机自启（T11）：注册表 Run 项即时生效，不随「保存设置」提交
   const [autostart, setAutostart] = useState(false);
   const [autostartBusy, setAutostartBusy] = useState(false);
@@ -229,6 +240,74 @@ export default function GeneralSettingsPanel() {
             </select>
           </div>
         </div>
+      </section>
+
+      {/* 壁纸与动效：设备本地的纯视觉偏好，改完立即生效（不走「保存设置」） */}
+      <section className="card p-4">
+        <h3 className="mb-1 font-medium">壁纸与动效</h3>
+        <p className="mb-3 text-xs text-slate-400">
+          场景壁纸常驻在界面最底层，玻璃面板透过它取色。<b>改动即时生效</b>，并保存在本机
+          （只影响外观，不参与账号备份与同步）。
+        </p>
+
+        <label className="mb-3 flex items-center gap-2">
+          <input
+            type="checkbox"
+            checked={appearance.wallpaper}
+            onChange={(e) => setAppearance({ wallpaper: e.target.checked })}
+          />
+          <span>启用场景壁纸</span>
+          <span className="text-xs text-slate-400">（关掉后界面与改造前完全一致）</span>
+        </label>
+
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div>
+            <label className="label">场景</label>
+            <select
+              value={appearance.scene}
+              disabled={!appearance.wallpaper}
+              onChange={(e) => setAppearance({ scene: e.target.value as SceneId })}
+              className="input disabled:opacity-50"
+            >
+              {SCENES.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.name}
+                </option>
+              ))}
+            </select>
+            <p className="mt-1 text-xs text-slate-400">
+              {SCENES.find((s) => s.id === appearance.scene)?.hint}
+            </p>
+          </div>
+          <div>
+            <label className="label">玻璃强度</label>
+            <select
+              value={appearance.glass}
+              disabled={!appearance.wallpaper}
+              onChange={(e) => setAppearance({ glass: e.target.value as GlassLevel })}
+              className="input disabled:opacity-50"
+            >
+              {GLASS_LEVELS.map((g) => (
+                <option key={g.id} value={g.id}>
+                  {g.name}
+                </option>
+              ))}
+            </select>
+            <p className="mt-1 text-xs text-slate-400">
+              面板模糊 {glassBlur(appearance.glass)}px；强度越高壁纸越透，文字对比度越低。
+            </p>
+          </div>
+        </div>
+
+        <label className="mt-3 flex items-center gap-2">
+          <input
+            type="checkbox"
+            checked={appearance.entryAnim}
+            onChange={(e) => setAppearance({ entryAnim: e.target.checked })}
+          />
+          <span>进应用动画</span>
+          <span className="text-xs text-slate-400">（开屏约 1 秒，点任意处可跳过）</span>
+        </label>
       </section>
 
       {/* 应用显示（侧边栏应用 Tab：固定应用单选 + 显示勾选 + 行首图标点击换图标） */}
@@ -701,8 +780,10 @@ export default function GeneralSettingsPanel() {
       <section className="card p-4">
         <h3 className="mb-1 font-medium">桌宠声音与主动开口</h3>
         <p className="mb-3 text-xs text-slate-400">
-          朗读使用 Windows 自带语音包，不联网、不消耗额度，默认关闭；打开朗读<b>不会</b>启用自动发言。
-          自动内容（事件点评 / 时间问候）默认只显示气泡，需要单独允许才会朗读。
+          默认使用在线 Edge 神经语音（晓伊），音质明显好于 Windows 自带语音包；需要联网，
+          会把这一句朗读文本发给微软语音服务。断网或合成失败时自动回退本地中文音色。
+          朗读默认关闭，打开朗读<b>不会</b>启用自动发言；自动内容（事件点评 / 时间问候）
+          默认只显示气泡，需要单独允许才会朗读。
         </p>
         <div className="grid gap-x-8 gap-y-3 text-sm sm:grid-cols-2">
           <div className="space-y-3">
@@ -710,32 +791,43 @@ export default function GeneralSettingsPanel() {
               <input
                 type="checkbox"
                 checked={form.pet_tts ?? false}
-                disabled={voicesChecked && voices.length === 0}
                 onChange={(e) => update('pet_tts', e.target.checked)}
               />
               朗读桌宠的话（总开关）
             </label>
             {voicesChecked && voices.length === 0 ? (
               <p className="text-xs text-amber-600 dark:text-amber-500">
-                未检测到本地中文语音包，声音功能不可用（气泡不受影响）。可在 Windows
-                「设置 → 时间和语言 → 语言和区域」安装中文语音。
+                未检测到本地中文语音包：在线音色仍可用，断网时会静音（气泡不受影响）。
+                可在 Windows「设置 → 时间和语言 → 语言和区域」安装中文语音作为离线兜底。
               </p>
             ) : null}
             <div>
               <label className="label">音色</label>
               <select
-                value={form.pet_tts_voice ?? ''}
+                value={form.pet_tts_voice || DEFAULT_VOICE_ID}
                 disabled={!form.pet_tts}
-                onChange={(e) => update('pet_tts_voice', e.target.value || null)}
-                className="input w-56"
+                onChange={(e) => update('pet_tts_voice', e.target.value)}
+                className="input w-64"
               >
-                <option value="">自动（第一个本地中文音色）</option>
-                {voices.map((v) => (
-                  <option key={v.voiceURI} value={v.voiceURI}>
-                    {v.name}
-                  </option>
-                ))}
+                <optgroup label="在线 · Edge 神经语音（需联网）">
+                  {EDGE_VOICES.map((v) => (
+                    <option key={v.id} value={v.id}>
+                      {v.label}
+                    </option>
+                  ))}
+                </optgroup>
+                <optgroup label="本地 · Windows 语音包">
+                  <option value="local-auto">自动（第一个本地中文音色）</option>
+                  {voices.map((v) => (
+                    <option key={v.voiceURI} value={v.voiceURI}>
+                      {v.name}
+                    </option>
+                  ))}
+                </optgroup>
               </select>
+              <p className="text-xs text-slate-400 mt-1">
+                02 活泼本音为原声；03 元气少女音调略高、语速稍快。
+              </p>
             </div>
             <div>
               <label className="label">语速</label>
@@ -774,21 +866,24 @@ export default function GeneralSettingsPanel() {
                 <button
                   type="button"
                   className="btn-outline !px-2.5 !py-1 text-xs"
-                  disabled={!form.pet_tts || voices.length === 0}
+                  disabled={!form.pet_tts}
                   onClick={() => {
-                    const ok = previewSpeech(
-                      form.pet_tts_voice ?? null,
+                    void previewVoice(
+                      form.pet_tts_voice || DEFAULT_VOICE_ID,
                       form.pet_tts_rate ?? 1,
                       form.pet_tts_volume ?? 0.8,
-                    );
-                    if (!ok) toast('error', '未检测到可用音色，声音功能已降级（气泡不受影响）');
+                    )
+                      .then((ok) => {
+                        if (!ok) toast('error', '未检测到可用音色，声音功能已降级（气泡不受影响）');
+                      })
+                      .catch((e) => toast('error', `试听失败：${String(e)}`));
                   }}
                 >
                   试听
                 </button>
               </div>
               <p className="text-xs text-slate-400 mt-1">
-                切换耳机 / 蓝牙后可能无声，点「试听」确认；失败不会影响气泡。
+                在线音色试听需要联网；切换耳机 / 蓝牙后可能无声，点「试听」确认。
               </p>
             </div>
             <div>
