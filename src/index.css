@@ -211,68 +211,84 @@ html.dark a:focus-visible {
   contain: strict;
 }
 
+/* 深色底：比"看着舒服"的一档再亮约 40%。
+   界面本身是深色面板 + 深色卡片，壁纸若按第一直觉压到 #0a1830，
+   白卡缝里剩下的就是"纯黑界面"——功能等于没生效。 */
 .wp-base {
   position: absolute;
   inset: 0;
   background:
-    radial-gradient(120% 90% at 50% -10%, #1d3f74 0%, #122a4d 38%, #0a1830 70%, #060e1e 100%);
+    radial-gradient(120% 90% at 50% -10%, #3d7cbe 0%, #27568a 34%, #16304f 68%, #0a1a2f 100%);
 }
 
 /* 场景：极光海面 */
 .wp-layer[data-scene='aurora'] .wp-base {
   background:
-    radial-gradient(130% 100% at 20% 0%, #16224a 0%, #0d1533 45%, #070b1c 100%);
+    radial-gradient(130% 100% at 20% 0%, #22315f 0%, #141f45 45%, #080d1f 100%);
 }
 
 /* 场景：深渊微光 */
 .wp-layer[data-scene='abyss'] .wp-base {
   background:
-    radial-gradient(120% 95% at 50% 0%, #0b1528 0%, #050a14 55%, #02040a 100%);
+    radial-gradient(120% 95% at 50% 0%, #142440 0%, #0a1424 55%, #04070f 100%);
 }
 
 /* 浅色主题：同一套场景换成"浅海"配色 —— 深蓝底配白面板会把整个界面压得发灰，
-   浅色主题下应该是"阳光照到水面"的观感，而不是把深色壁纸硬垫在白卡下面。 */
+   浅色主题下应该是"阳光照到水面"的观感，而不是把深色壁纸硬垫在白卡下面。
+   ⚠️ 色阶必须比直觉更饱和、鲸鱼必须比直觉更实：白面板 + 白遮罩叠在一起，
+   浅到 #cfe6fb 那一档时整层壁纸会退化成"界面有点发蓝"，用户会认为功能没生效
+   （实测：浅色主题下 0.26 透明度的鲸鱼在白卡缝里完全看不见）。 */
 html:not(.dark)[data-wallpaper='on'] .wp-base {
   background:
-    radial-gradient(120% 90% at 50% -10%, #cfe6fb 0%, #b7d6f2 36%, #93bde4 68%, #6f9fce 100%);
+    radial-gradient(120% 90% at 50% -10%, #cfe7fb 0%, #a8cdec 30%, #6fa6d2 68%, #3f7cad 100%);
 }
 
 html:not(.dark)[data-wallpaper='on'] .wp-layer[data-scene='aurora'] .wp-base {
   background:
-    radial-gradient(130% 100% at 20% 0%, #d8ecff 0%, #b9d9f6 45%, #8fb8dd 100%);
+    radial-gradient(130% 100% at 20% 0%, #d3e9ff 0%, #a9cdf0 42%, #6f9fd0 100%);
 }
 
 html:not(.dark)[data-wallpaper='on'] .wp-layer[data-scene='abyss'] .wp-base {
   background:
-    radial-gradient(120% 95% at 50% 0%, #dceaf7 0%, #b6cee4 55%, #8fadc9 100%);
+    radial-gradient(120% 95% at 50% 0%, #c7dcee 0%, #93b4d2 52%, #5f88ab 100%);
 }
 
 html:not(.dark)[data-wallpaper='on'] .wp-vignette {
   background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.45) 0%, rgba(255, 255, 255, 0) 24%),
-    radial-gradient(120% 80% at 50% 120%, rgba(120, 160, 200, 0.35) 0%, rgba(120, 160, 200, 0) 62%);
+    linear-gradient(180deg, rgba(255, 255, 255, 0.34) 0%, rgba(255, 255, 255, 0) 22%),
+    radial-gradient(120% 80% at 50% 122%, rgba(56, 104, 152, 0.42) 0%, rgba(56, 104, 152, 0) 62%);
 }
 
+/* 鲸鱼：浅色下要"看得见是一条鱼"，同时不能压过正文。
+   它常年落在右下角的卡片区里，透过 0.66 的白卡后只剩约 1/3 的可见度 ⇒ 源透明度要够高。 */
 html:not(.dark)[data-wallpaper='on'] .wp-whale {
-  opacity: 0.26;
+  opacity: 0.72;
+  filter: drop-shadow(0 16px 30px rgba(24, 68, 116, 0.38));
 }
 
+/* 光柱：浅色下改成"更亮的水面透光"，白里带一点青 */
 html:not(.dark)[data-wallpaper='on'] .wp-ray {
   background: linear-gradient(
     180deg,
-    rgba(255, 255, 255, 0.55) 0%,
-    rgba(214, 236, 255, 0.28) 45%,
-    rgba(214, 236, 255, 0) 100%
+    rgba(255, 255, 255, 0.85) 0%,
+    rgba(228, 245, 255, 0.42) 45%,
+    rgba(228, 245, 255, 0) 100%
   );
 }
 
+/* 气泡：浅色底上纯白气泡等于隐身 —— 改成"白心 + 蓝边"才有体积 */
 html:not(.dark)[data-wallpaper='on'] .wp-bubble {
   background: radial-gradient(
     circle at 32% 28%,
-    rgba(255, 255, 255, 0.95) 0%,
-    rgba(190, 224, 250, 0.5) 42%,
-    rgba(160, 200, 235, 0.12) 100%
+    rgba(255, 255, 255, 0.98) 0%,
+    rgba(150, 198, 236, 0.62) 46%,
+    rgba(88, 143, 194, 0.22) 100%
   );
+  box-shadow: inset 0 0 0 1px rgba(56, 110, 165, 0.4);
+}
+
+html:not(.dark)[data-wallpaper='on'] .wp-dust {
+  background: rgba(74, 126, 176, 0.6);
 }
 
 /* 顶底压暗：保证任何壁纸上前景文字都有对比度 */
@@ -280,8 +296,8 @@ html:not(.dark)[data-wallpaper='on'] .wp-bubble {
   position: absolute;
   inset: 0;
   background:
-    linear-gradient(180deg, rgba(6, 12, 24, 0.55) 0%, rgba(6, 12, 24, 0) 22%),
-    radial-gradient(120% 80% at 50% 120%, rgba(2, 6, 14, 0.6) 0%, rgba(2, 6, 14, 0) 60%);
+    linear-gradient(180deg, rgba(6, 12, 24, 0.4) 0%, rgba(6, 12, 24, 0) 20%),
+    radial-gradient(120% 80% at 50% 122%, rgba(2, 6, 14, 0.45) 0%, rgba(2, 6, 14, 0) 60%);
 }
 
 /* 光柱：三条斜向渐变带，缓慢摆动（transform 合成，不重绘） */
@@ -392,7 +408,7 @@ html:not(.dark)[data-wallpaper='on'] .wp-bubble {
   bottom: 6vh;
   width: min(24vw, 340px);
   height: auto;
-  opacity: 0.32;
+  opacity: 0.42;
   filter: drop-shadow(0 18px 34px rgba(6, 20, 44, 0.5));
   will-change: transform;
   animation: wp-whale-float 18s ease-in-out infinite;
@@ -553,13 +569,16 @@ html.dark[data-wallpaper='on'] .app-sidebar {
   background-color: rgba(11, 19, 34, var(--wp-alpha));
 }
 
-/* 玻璃面·半透组：卡片只做半透明，不加模糊 */
+/* 玻璃面·半透组：卡片只做半透明，不加模糊。
+   浅色档刻意比深色更透一档：白卡叠在浅蓝壁纸上，0.76 的不透明度足够把壁纸压成
+   "界面有点发蓝"，卡片底下的鲸鱼会完全消失。0.66 仍能把 slate-600 的正文衬在
+   7:1 以上对比度，但壁纸的形体读得出来。 */
 html[data-wallpaper='on'] .card {
-  background-color: rgba(255, 255, 255, calc(var(--wp-alpha) * 1.06));
+  background-color: rgba(255, 255, 255, calc(var(--wp-alpha) * 0.92));
 }
 
 html.dark[data-wallpaper='on'] .card {
-  background-color: rgba(13, 22, 38, calc(var(--wp-alpha) * 1.06));
+  background-color: rgba(13, 22, 38, calc(var(--wp-alpha) * 0.98));
 }
 
 /* glass=off：明确退回实心面板（不是"不写"，是写回不透明 + 去掉模糊） */
@@ -586,18 +605,18 @@ html.dark[data-wallpaper='on'][data-glass='off'] .card {
 html[data-wallpaper='on'] .app-content {
   background-image: linear-gradient(
     180deg,
-    rgba(248, 250, 252, 0.42) 0%,
-    rgba(248, 250, 252, 0.2) 40%,
-    rgba(248, 250, 252, 0.1) 100%
+    rgba(248, 250, 252, 0.3) 0%,
+    rgba(248, 250, 252, 0.14) 40%,
+    rgba(248, 250, 252, 0.06) 100%
   );
 }
 
 html.dark[data-wallpaper='on'] .app-content {
   background-image: linear-gradient(
     180deg,
-    rgba(8, 14, 26, 0.5) 0%,
-    rgba(8, 14, 26, 0.28) 40%,
-    rgba(8, 14, 26, 0.14) 100%
+    rgba(8, 14, 26, 0.34) 0%,
+    rgba(8, 14, 26, 0.2) 40%,
+    rgba(8, 14, 26, 0.1) 100%
   );
 }
 
