@@ -864,7 +864,11 @@ export default function GeneralSettingsPanel() {
                       .then((ok) => {
                         if (!ok) toast('error', '未检测到可用音色，声音功能已降级（气泡不受影响）');
                       })
-                      .catch((e) => toast('error', `试听失败：${String(e)}`));
+                      .catch((e) =>
+                        // 服务端也会把关 pet_tts 开关（审查 F3）：表单里刚打开但
+                        // 尚未保存时，Rust 侧读到的还是关闭态，会返回该错误
+                        toast('error', `试听失败：${String(e)}`),
+                      );
                   }}
                 >
                   试听

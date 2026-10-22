@@ -707,10 +707,17 @@ fn edge_client() -> Result<&'static EdgeTtsClient, String> {
 /// 协议变更时返回 Err，由前端回退本地语音；不会把错误弹到桌宠气泡里。
 #[tauri::command]
 pub async fn pet_tts_synth(
+    app: AppHandle,
     text: String,
     voice_id: String,
     rate: Option<f32>,
 ) -> Result<String, String> {
+    // 服务端把关 TTS 开关（审查 F3）：此前只靠前端在调用前判断，渲染层一旦
+    // 被绕过就能在开关关闭时仍把任意文本送到微软语音端点。与 pet_say 的
+    // pet_ai_mode 服务端校验同一口径（pet_tts 默认关）。
+    if !app.state::<AppState>().settings().pet_tts.unwrap_or(false) {
+        return Err("语音朗读未开启".into());
+    }
     let text = text.trim();
     if text.is_empty() {
         return Err("没有可朗读的文本".into());

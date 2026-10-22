@@ -57,6 +57,24 @@ fn is_safe_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// manifest 里 `file` 字段校验（审查 F2）：只允许相对 `videos/` 的普通文件名。
+/// 此前 `videos.join(file)` 接受 `../../x` 等形式——实际读取被 Tauri asset
+/// scope（tauri.conf.json 的 `pets/**` + canonicalize）挡住，但「文件存在性
+/// 探测」仍可越出 pets/ 目录，应在源头拒绝。
+fn is_safe_pack_file(file: &str) -> bool {
+    // 必须以 .webm 结尾且结尾前无 '.'（挡 "x.webm." 这类尾点/多扩展名变体）
+    let Some(stem) = file.strip_suffix(".webm") else { return false };
+    !stem.is_empty()
+        && !stem.contains('.')
+        && stem.len() <= 120
+        && !stem.contains(['\\', '/'])
+        && !stem.contains("..")
+        && !stem.starts_with('.')
+        && stem
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ' ' | '(' | ')'))
+}
+
 fn read_manifest(dir: &Path) -> Option<serde_json::Value> {
     let text = std::fs::read_to_string(dir.join("manifest.json")).ok()?;
     serde_json::from_str::<serde_json::Value>(&text).ok()
@@ -127,6 +145,11 @@ pub fn pet_pack_manifest(state: State<AppState>, id: String) -> Result<PackManif
         if action_id.is_empty() || file.is_empty() {
             continue;
         }
+        // 审查 F2：越界文件名（../、绝对路径、分隔符）一律按"动作缺失"跳过，
+        // 与文件不存在同语义——不中断整个包的加载
+        if !is_safe_pack_file(file) {
+            continue;
+        }
         let path = videos.join(file);
         if !path.is_file() {
             continue;
@@ -151,4 +174,30 @@ pub fn pet_pack_manifest(state: State<AppState>, id: String) -> Result<PackManif
         canvas: manifest.get("canvas").cloned().unwrap_or(serde_json::Value::Null),
         actions: out,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 审查 F2：file 字段白名单——越界/可疑名拒绝，普通素材名放行
+    #[test]
+    fn pack_file_whitelist() {
+        for bad in [
+            "../x.webm",
+            "..\\x.webm",
+            "a/b.webm",
+            "C:\\x.webm",
+            ".hidden.webm",
+            "..",
+            ".",
+            "",
+            "x.webm.",
+        ] {
+            assert!(!is_safe_pack_file(bad), "应拒绝 {bad:?}");
+        }
+        for good in ["idle-breathe.webm", "action 01 (v2).webm", "dance.webm"] {
+            assert!(is_safe_pack_file(good), "应放行 {good:?}");
+        }
+    }
 }

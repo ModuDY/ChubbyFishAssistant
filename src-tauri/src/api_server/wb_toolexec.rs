@@ -170,67 +170,48 @@ fn url_encode(s: &str) -> String {
 
 // ==================== SSRF 防护（抓取前 host 校验） ====================
 
-/// 抓取 URL 校验（SSRF 防护）：拒绝非 http/https、拒绝 IP 字面量私网/环回/
-/// 链路本地（127. / 10. / 192.168. / 172.16-31. / 169.254. / 0. / ::1 /
-/// fc/fd 开头 / fe80）、拒绝 host == "localhost"
+/// 抓取 URL 校验（SSRF 防护）：仅 http/https；host 判定基于 **WHATWG 解析后**的
+/// host（与 ureq 请求层同源，审查 F1）——不能用字符串切分：`http://127.0.0.1\@example.com`
+/// 在 WHATWG 里 host 是 `127.0.0.1`（`\` 等价 `/`），`rsplit('@')` 却会误读成
+/// `example.com`，形成校验与请求不一致的绕过；`localhost.` 带尾点同理。
 pub fn url_allowed(url: &str) -> Result<(), String> {
-    let lower = url.trim().to_lowercase();
-    let rest = if let Some(r) = lower.strip_prefix("http://") {
-        r
-    } else if let Some(r) = lower.strip_prefix("https://") {
-        r
-    } else {
+    let u = url::Url::parse(url.trim()).map_err(|_| "URL 格式无效".to_string())?;
+    if u.scheme() != "http" && u.scheme() != "https" {
         return Err("仅支持 http/https URL".into());
-    };
-    // authority：到第一个 / ? # 为止；剥离 userinfo（user@host）
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host_part = authority.rsplit('@').next().unwrap_or("");
-    // 剥端口：IPv6 字面量必须带 []（[::1]:8080），否则按首个 ':' 截断
-    let host = if host_part.starts_with('[') {
-        host_part[1..].split(']').next().unwrap_or("")
-    } else {
-        host_part.split(':').next().unwrap_or("")
-    };
-    if host_allowed(host) {
+    }
+    if u.host().map(host_allowed).unwrap_or(false) {
         Ok(())
     } else {
         Err("拒绝访问受限地址（SSRF 防护）".into())
     }
 }
 
-/// host 白名单判定（纯函数，供单测）：true = 允许抓取。
-/// 审查 P2：改用 url crate（与 ureq 请求层同源的 WHATWG 解析）精确识别
-/// IPv4 变体（十六进制 0x7f000001 / 八进制 0177.0.0.1 / 缺段 127.1 / 整型
-/// 2130706433），杜绝字符串前缀匹配的漏放与域名误伤（如 10.orbit.com）；
-/// 私网段按解析后的 Ipv4Addr / Ipv6Addr 精确比对；解析失败 fail-closed
-fn host_allowed(host: &str) -> bool {
-    let h = host.trim().to_lowercase();
-    if h.is_empty() {
-        return false;
-    }
-    // 调用方（url_allowed）已剥 [] 与端口；裸 IPv6 字面量（含 ':'）须补回括号才能解析
-    let target = if h.contains(':') && !h.starts_with('[') {
-        format!("http://[{h}]/")
-    } else {
-        format!("http://{h}/")
-    };
-    let Ok(u) = url::Url::parse(&target) else {
-        return false;
-    };
-    match u.host() {
-        Some(url::Host::Domain(d)) => !(d == "localhost" || d.ends_with(".localhost")),
-        Some(url::Host::Ipv4(ip)) => ipv4_allowed_ip(ip),
-        Some(url::Host::Ipv6(ip)) => ipv6_allowed_ip(ip),
-        None => false,
+/// host 白名单判定（解析后 host）：true = 允许抓取。
+/// 域名：拦 localhost / *.localhost / *.local / *.internal（含尾点归一）；
+/// IP 字面量按解析后的 Ipv4Addr / Ipv6Addr 网段精确比对——IPv4 变体
+///（十六进制 0x7f.1 / 八进制 0177.0.0.1 / 缺段 127.1 / 整型 2130706433）
+/// 由 WHATWG 解析统一归一，天然覆盖；解析失败 fail-closed
+fn host_allowed(host: url::Host<&str>) -> bool {
+    match host {
+        url::Host::Domain(d) => {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            !(d == "localhost"
+                || d.ends_with(".localhost")
+                || d.ends_with(".local")
+                || d.ends_with(".internal"))
+        }
+        url::Host::Ipv4(ip) => ipv4_allowed_ip(ip),
+        url::Host::Ipv6(ip) => ipv6_allowed_ip(ip),
     }
 }
 
-/// IPv4 私网/环回/链路本地/未指定判定（解析后按八位组精确比对）
+/// IPv4 私网/环回/链路本地/CGNAT/未指定判定（解析后按八位组精确比对）
 fn ipv4_allowed_ip(ip: std::net::Ipv4Addr) -> bool {
     let o = ip.octets();
     !(o[0] == 0
         || o[0] == 10
         || o[0] == 127
+        || (o[0] == 100 && (64..=127).contains(&o[1]))  // CGNAT 100.64/10（Tailscale 等内网段）
         || (o[0] == 169 && o[1] == 254)
         || (o[0] == 192 && o[1] == 168)
         || (o[0] == 172 && (16..=31).contains(&o[1])))
@@ -972,6 +953,30 @@ mod tests {
         for host in ["10.orbit.com", "127.example.com", "192.168.example.org"] {
             assert!(url_allowed(&format!("http://{host}/")).is_ok(), "应放行 {host}");
         }
+        // 审查 F1：解析差异绕过——WHATWG 把 '\' 当路径分隔，真实 host 是 127.0.0.1/
+        // 169.254.169.254，字符串 rsplit('@') 却会误读成 example.com（旧实现的洞）
+        for url in [
+            "http://127.0.0.1\\@example.com/",
+            "http://localhost\\@example.com/",
+            "http://169.254.169.254\\.example.com/",
+            // 尾点变体：host == "localhost." 未命中旧实现的 == 判定
+            "http://localhost./",
+            "http://127.0.0.1./",
+            "http://[::ffff:127.0.0.1]/",
+            "http://0x7f.1/",
+            "http://2130706433/",
+            "http://100.64.0.1/",
+            "http://[fd00::1]/",
+            "http://[fe80::1]/",
+        ] {
+            assert!(url_allowed(url).is_err(), "应拒绝 {url}");
+        }
+        // 尾点公网域名应正常放行（归一只影响受限名，不误伤正常站点）
+        assert!(url_allowed("http://example.com./").is_ok());
+        assert!(url_allowed("http://api.example.com:8443/x").is_ok());
+        // userinfo 语义保留：普通 user@host 剥离凭据后按 host 判定
+        assert!(url_allowed("https://user@example.com/").is_ok());
+        assert!(url_allowed("https://user:pass@example.com/").is_ok());
     }
 
     /// open_url 抓取受限地址在发起请求前即被拒绝（不触网）
