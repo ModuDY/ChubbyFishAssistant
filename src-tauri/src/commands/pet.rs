@@ -1838,6 +1838,21 @@ const NOTICE_HOLD_MS: u64 = 8000;
 /// 3. **不影响远程渠道**：Bark / 企业微信 / Server酱 与桌面通知互相独立，
 ///    手机端看不到桌宠，那几条推送照旧发送（见 `notify_all`）。
 pub fn notice_bubble(app: &AppHandle, title: &str, body: &str) {
+    notice_bubble_inner(app, title, body);
+}
+
+/// 前端可调用的气泡入口。
+///
+/// 为什么要它：`notify_all` 只覆盖 Rust 侧的后台/任务通知；界面上的提示走的是前端
+/// `pushToast`，那条线原先只有「应用内 Toast / 系统通知」两种出口，于是用户把
+/// 后台通知全换成气泡之后，通知栏里仍会冒出前端发的系统通知（实测 2026-10-22）。
+/// 有了这个命令，前端才能把「通知方式」也切到气泡。
+#[tauri::command]
+pub fn pet_notice(app: AppHandle, title: String, body: String) {
+    notice_bubble(&app, &title, &body);
+}
+
+fn notice_bubble_inner(app: &AppHandle, title: &str, body: &str) {
     let visible = pet_window(app)
         .and_then(|w| w.is_visible().ok())
         .unwrap_or(false);

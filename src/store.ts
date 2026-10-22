@@ -1,6 +1,5 @@
 import { create } from 'zustand';
 import { APP_NAME } from './lib/about';
-import { sendNotification } from '@tauri-apps/plugin-notification';
 import { api, type CheckinProgressEvent } from './lib/tauri';
 import { createStartupSlice } from './store/startup';
 import type { StartupSlice } from './store/startupTypes';
@@ -596,7 +595,9 @@ export const useAppStore = create<AppState>((set, get, store) => ({
       const settings = await api.misc.settingsGet();
       // notify 归一化：旧版本/数据迁移可能存入非枚举脏值（如空串），统一收敛为
       // 合法值，保证设置页下拉正确回显、pushToast 不再走兼容分支
-      const validNotify = ['toast', 'system', 'both', 'none'];
+      // system（系统通知）已停用：历史值一律改判为桌宠气泡，其余非法值回落 toast
+      if (settings.notify === 'system') settings.notify = 'pet';
+      const validNotify = ['toast', 'pet', 'both', 'none'];
       if (!validNotify.includes(settings.notify)) settings.notify = 'toast';
       // 侧边栏应用显示兜底：旧版本配置缺字段/脏值归一，固定应用非法回退 trae 且强制可见
       const validApps: AppKey[] = ['trae', 'buddy', 'qoder', 'doubao'];
@@ -1010,27 +1011,42 @@ export const useAppStore = create<AppState>((set, get, store) => ({
   },
 
   pushToast: (kind, msg) => {
-    // 通知方式兼容：仅 'none'/'system' 有特殊语义，其余值（含历史脏数据如中文标签）
-    // 一律按应用内 toast 处理，避免非枚举值把提示静默吞掉（表现为「点了没任何反应」）
-    const mode = get().settings?.notify ?? 'toast';
-    if (mode !== 'none' && mode !== 'system') {
-      if (mode !== 'toast' && mode !== 'both') {
-        console.info('[notify] 未知通知方式，已按 toast 处理:', mode);
-      }
+    /**
+     * 通知方式：`toast` 应用内 / `pet` 桌宠气泡 / `both` 两者 / `none` 不通知。
+     *
+     * 2026-10-22：**系统通知这一路已整体停用**。原先 `system` / `both` 会调
+     * `@tauri-apps/plugin-notification` 弹出 Windows 通知；但用户此前已把后台通知
+     * 全换成桌宠气泡（见 Rust `notify.rs` / `pet::notice_bubble`），前端这条线没跟着改，
+     * 于是通知栏里仍有系统通知。现在 `system` 按 `pet` 处理，`both` 表示
+     * 「Toast + 气泡」，历史值无需用户再手动改一遍。
+     */
+    const raw = get().settings?.notify ?? 'toast';
+    const mode = raw === 'system' ? 'pet' : raw;
+    const known = mode === 'toast' || mode === 'pet' || mode === 'both' || mode === 'none';
+    if (!known) console.info('[notify] 未知通知方式，已按 toast 处理:', raw);
+
+    const wantToast = mode === 'toast' || mode === 'both' || !known;
+    const wantPet = mode === 'pet' || mode === 'both';
+
+    const showToast = () => {
       const id = ++toastSeq;
       set((s) => ({ toasts: [...s.toasts, { id, kind, msg }] }));
       // F12：error 级驻留 10s（长错误文案需要阅读时间），其余维持 4.2s
       setTimeout(() => get().dismissToast(id), kind === 'error' ? 10_000 : 4200);
-    }
+    };
 
-    if (mode === 'system' || mode === 'both') {
-      // sendNotification v2 返回 void（fire-and-forget），用 try-catch 防御同步异常
-      try {
-        sendNotification({ title: APP_NAME, body: msg });
-        console.info('[notify] 系统通知已发送:', msg);
-      } catch (e) {
-        console.warn('[notify] sendNotification 异常:', e);
+    if (wantToast) showToast();
+
+    if (wantPet) {
+      // 桌宠没开就没有气泡载体 —— 退回 Toast，别让提示静默消失
+      if (!get().settings?.pet_enabled) {
+        if (!wantToast) showToast();
+        return;
       }
+      void api.pet.notice(APP_NAME, msg).catch((e) => {
+        console.warn('[notify] 桌宠气泡发送失败:', e);
+        if (!wantToast) showToast();
+      });
     }
   },
   dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),

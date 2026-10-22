@@ -300,6 +300,11 @@ export const api = {
     /** 重新加载桌宠窗口：画面空白 / 动画卡住时的一键自愈 */
     reload: () => invoke('pet_reload'),
     /**
+     * 让桌宠说一句气泡通知（取代系统通知）。
+     * 桌宠隐藏时 Rust 会先临时叫醒、到期还原；气泡时长由后端下发，前端别硬编码。
+     */
+    notice: (title: string, body: string) => invoke('pet_notice', { title, body }),
+    /**
      * 长期记忆（opt-in）：读回上次的对话历史。
      *
      * 未启用时返回空数组，**且在 Rust 侧顺带清除磁盘上的残留**，

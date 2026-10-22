@@ -434,11 +434,14 @@ export default function GeneralSettingsPanel() {
             <div>
               <label className="label">通知方式</label>
               <select value={form.notify} onChange={(e) => update('notify', e.target.value)} className="input">
+                <option value="pet">桌宠气泡</option>
                 <option value="toast">应用内 Toast</option>
-                <option value="system">系统通知</option>
-                <option value="both">Toast + 系统通知</option>
+                <option value="both">Toast + 桌宠气泡</option>
                 <option value="none">不通知</option>
               </select>
+              <p className="mt-1 text-xs text-slate-400">
+                系统通知已停用：界面提示与后台通知都只走桌宠气泡。桌宠未启用时自动退回 Toast。
+              </p>
             </div>
             <div>
               <label className="label">日志保留天数</label>

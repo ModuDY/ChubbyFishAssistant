@@ -198,6 +198,8 @@ fn main() {
             commands::pet::pet_focus_main,
             commands::pet::pet_reset_position,
             commands::pet::pet_reload,
+            // 前端「通知方式」切到桌宠气泡时的出口（系统通知已全面停用）
+            commands::pet::pet_notice,
             commands::pet::pet_set_hit_mask,
             commands::pet_pack::pet_pack_list,
             commands::pet_pack::pet_pack_manifest,
