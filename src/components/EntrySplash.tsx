@@ -37,6 +37,13 @@ const MAX_VISIBLE_MS = 4000;
  * 常见的"入场动画"型视频（本机那条 DeepSeek 的是 7 秒）。
  */
 const MAX_VIDEO_BOOT_MS = 10_000;
+/**
+ * 类型待定的最长等待：选了 WE 壁纸但还不知道是场景还是视频时（旧配置没存 weKind、
+ * 或库还没扫完）最多等这么久再退回渐变开屏。
+ * 冷启动第一次扫描要读注册表 + 多个 Steam 库 + 十几个 project.json，实测可能过 1 秒，
+ * 所以给到 2.5 秒；一旦自愈写入 weKind，后续启动不再走这条路径。
+ */
+const PENDING_MAX_MS = 2500;
 
 function prefersReducedMotion(): boolean {
   if (typeof window === 'undefined' || !window.matchMedia) return false;
@@ -51,6 +58,12 @@ export default function EntrySplash({ ready }: { ready: boolean }) {
       用持久化的 weKind 兜底 —— 刚启动时壁纸库还没扫完，等它就等于先闪一下渐变开屏。 */
   const declaredKind = target?.kind ?? weKind ?? null;
   const overVideo = kind === 'we' && declaredKind === 'video';
+  /**
+   * 选了 WE 壁纸、但类型还不知道（旧版选的老条目没有 weKind，启动时库也还没扫完）。
+   * 这时**不能**先按"非视频"走渐变开屏 —— 那正是"开头冒出别的动画、而且一闪就进"的成因。
+   * 先什么都不画（露出壁纸底色），最多等 1.5 秒让库给出结论。
+   */
+  const undecided = kind === 'we' && !declaredKind && lib.status !== 'ready';
 
   const enabled = entryAnim && !prefersReducedMotion();
   const [phase, setPhase] = useState<'show' | 'leaving' | 'gone'>(
@@ -63,6 +76,8 @@ export default function EntrySplash({ ready }: { ready: boolean }) {
   // effect 里要读最新的形态（壁纸库晚一点扫完会切到视频形态），用 ref 传出去
   const overVideoRef = useRef(overVideo);
   overVideoRef.current = overVideo;
+  const undecidedRef = useRef(undecided);
+  undecidedRef.current = undecided;
 
   // 组件挂载时就记时，避免 StrictMode 双调用时用 effect 里的新时间戳
   useEffect(() => {
@@ -73,13 +88,14 @@ export default function EntrySplash({ ready }: { ready: boolean }) {
   // 否则它会从透明开屏底下透出来，和底部的进度提示重复。
   useEffect(() => {
     const el = document.documentElement;
-    const active = enabled && overVideo && phase !== 'gone';
+    // 视频形态与"待定"形态都不盖背景，加载壳里的转圈同样要藏
+    const active = enabled && (overVideo || undecided) && phase !== 'gone';
     if (active) el.dataset.boot = 'video';
     else delete el.dataset.boot;
     return () => {
       delete el.dataset.boot;
     };
-  }, [enabled, overVideo, phase]);
+  }, [enabled, overVideo, undecided, phase]);
 
   useEffect(() => {
     if (!enabled) return;
@@ -112,6 +128,11 @@ export default function EntrySplash({ ready }: { ready: boolean }) {
     const tick = () => {
       if (stopped) return;
       const elapsed = Date.now() - mountedAt.current;
+      // 类型还没定（旧条目的 weKind 缺失 / 库还没扫完）：先别急着走
+      if (undecidedRef.current && elapsed < PENDING_MAX_MS) {
+        window.setTimeout(tick, 120);
+        return;
+      }
       const target = targetMs();
       // 未就绪时最多等 MAX_VISIBLE_MS：必须让用户看见「正在加载 / 初始化失败」
       const hardCap = readyRef.current ? Math.max(target, MAX_VIDEO_BOOT_MS) : MAX_VISIBLE_MS;
@@ -145,6 +166,13 @@ export default function EntrySplash({ ready }: { ready: boolean }) {
   ]
     .filter(Boolean)
     .join(' ');
+
+  // 类型待定：什么都别画（连品牌标也不放），只留底色，避免"先闪一段别的动画"
+  if (undecided && !overVideo) {
+    return (
+      <div className={`${cls} entry-splash--pending`} role="presentation" aria-hidden />
+    );
+  }
 
   // 视频形态：不盖背景，只在底部放一枚很小的品牌标 + 流动进度线
   if (overVideo) {

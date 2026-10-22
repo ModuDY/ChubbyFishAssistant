@@ -15,7 +15,7 @@
  */
 
 import { useEffect, useMemo, useState } from 'react';
-import { useAppearance } from '../lib/appearance';
+import { setAppearance, useAppearance } from '../lib/appearance';
 import type { SceneId } from '../lib/appearance';
 import { useWeLibrary } from '../lib/useWeLibrary';
 import { wePreviewUrl, weVideoUrl } from '../lib/we';
@@ -174,6 +174,13 @@ export default function WallpaperLayer() {
   useEffect(() => {
     setFailed(null);
   }, [weId]);
+
+  // 自愈：旧版本选中的条目没有 weKind（那时还没这个字段），库一扫出结果就补写回去。
+  // 不补的话每次启动都要等扫描才能判断该走视频还是场景，开屏会先闪一下别的动画。
+  useEffect(() => {
+    if (kind !== 'we' || !target) return;
+    if (target.kind !== weKind) setAppearance({ weKind: target.kind });
+  }, [kind, target, weKind]);
 
   // 视频类壁纸：读整段 mp4 生成 blob URL，同时取预览图垫底
   useEffect(() => {

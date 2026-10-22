@@ -829,6 +829,12 @@ html.dark[data-wkind='we'][data-wallpaper='on'] .card {
   text-shadow: 0 1px 6px rgba(0, 0, 0, 0.55);
 }
 
+/* 类型待定（选了 WE 壁纸但还没确认是场景还是视频）：透明，不要盖任何东西 */
+.entry-splash--pending {
+  background: none;
+  animation: none;
+}
+
 /* 视频形态下的进度线很窄，贴在名字后面。
    选择器带上前缀提高优先级：`.entry-bar` 的通用规则写在文件更后面，
    同优先级会被它盖回去（宽度/动画都会被重置）。 */
