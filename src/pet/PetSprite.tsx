@@ -13,6 +13,7 @@
  * 「气泡锚点」——否则热区等于整个窗口，点空白也会触发动作，气泡也会飘在窗口顶部。
  */
 import { useCallback, useEffect, useRef } from 'react';
+import { api } from '../lib/tauri';
 import { actionUrl } from './actions';
 import { isLoopAction } from './petState';
 
@@ -290,6 +291,79 @@ export default function PetSprite({
     }, 3000);
     return () => window.clearInterval(timer);
   }, [playWithRetry]);
+
+  /**
+   * 冻结现场快照：把"卡住那一刻"的真实状态落到 logs/app.log。
+   *
+   * 判据是 `currentTime` 连续两拍（约 4s）没有前进，且 React 侧认为本该在播。
+   * 仅靠 `video.paused` 判断不够 —— 解码器停摆时 `paused` 仍可能是 false。
+   *
+   * 记的是**能区分成因的字段**：
+   * - `paused=true`  ⇒ 播放被拒（可自愈，见上面的 3s 守卫）
+   * - `paused=false` 但时间不走 ⇒ 解码器/合成器停摆，常见于窗口被遮挡后 WebView 挂起
+   * - `hidden=true`  ⇒ 页面被判后台，Rust 的 visible 对账可能没跟上
+   * 一条经验：这三种在用户眼里都是"一动不动"，只有日志能分开。
+   */
+  useEffect(() => {
+    let lastT = -1;
+    let stalls = 0;
+    let frozenSince = 0;
+    let reported = false;
+
+    const timer = window.setInterval(() => {
+      const video = videoRef.current;
+      if (!video) return;
+      if (pausedRef.current) {
+        // 正常暂停期不计入冻结
+        lastT = -1;
+        stalls = 0;
+        reported = false;
+        frozenSince = 0;
+        return;
+      }
+      const t = video.currentTime;
+      if (lastT >= 0 && Math.abs(t - lastT) < 0.05) stalls += 1;
+      else stalls = 0;
+      lastT = t;
+
+      if (stalls >= 2 && !reported) {
+        reported = true;
+        frozenSince = Date.now() - stalls * 2000;
+        const err = video.error;
+        void api.pet
+          .diagLog(
+            JSON.stringify({
+              phase: 'frozen',
+              stalledSec: stalls * 2,
+              paused: video.paused,
+              readyState: video.readyState,
+              networkState: video.networkState,
+              currentTime: Number(t.toFixed(2)),
+              duration: Number.isFinite(video.duration) ? Number(video.duration.toFixed(2)) : null,
+              videoWidth: video.videoWidth,
+              action: video.dataset.action ?? null,
+              visibility: document.visibilityState,
+              hidden: document.hidden,
+              mediaError: err ? { code: err.code, message: err.message } : null,
+            }),
+          )
+          .catch(() => {});
+        return;
+      }
+
+      if (stalls === 0 && reported) {
+        // 恢复了：记一条时长，便于判断自愈是否及时
+        reported = false;
+        const forMs = frozenSince ? Date.now() - frozenSince : 0;
+        frozenSince = 0;
+        void api.pet
+          .diagLog(JSON.stringify({ phase: 'recovered', frozenMs: forMs, action: video.dataset.action ?? null }))
+          .catch(() => {});
+      }
+    }, 2000);
+
+    return () => window.clearInterval(timer);
+  }, []);
 
   // 卸载时清掉待执行的播放重试
   useEffect(

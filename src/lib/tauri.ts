@@ -304,6 +304,8 @@ export const api = {
      * 桌宠隐藏时 Rust 会先临时叫醒、到期还原；气泡时长由后端下发，前端别硬编码。
      */
     notice: (title: string, body: string) => invoke('pet_notice', { title, body }),
+    /** 上报一条桌宠诊断（落 logs/app.log，系统日志页可见） */
+    diagLog: (msg: string) => invoke('pet_diag_log', { msg }),
     /**
      * 长期记忆（opt-in）：读回上次的对话历史。
      *

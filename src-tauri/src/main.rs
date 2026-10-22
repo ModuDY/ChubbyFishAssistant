@@ -200,6 +200,8 @@ fn main() {
             commands::pet::pet_reload,
             // 前端「通知方式」切到桌宠气泡时的出口（系统通知已全面停用）
             commands::pet::pet_notice,
+            // 桌宠冻结现场上报（落到 logs/app.log，系统日志页可见）
+            commands::pet::pet_diag_log,
             commands::pet::pet_set_hit_mask,
             commands::pet_pack::pet_pack_list,
             commands::pet_pack::pet_pack_manifest,

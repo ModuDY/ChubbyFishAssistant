@@ -1852,6 +1852,20 @@ pub fn pet_notice(app: AppHandle, title: String, body: String) {
     notice_bubble(&app, &title, &body);
 }
 
+/// 桌宠前端上报诊断信息，落到 `logs/app.log`（系统日志页可见）。
+///
+/// 为什么需要：桌宠"一动不动"有两种完全不同的成因 —— 视频被暂停（可自愈）与
+/// 渲染进程被整体挂起（不可自愈）。两者在用户眼里长得一样，事后无从区分。
+/// 前端在检测到画面停住时把当时的真实状态（video.paused / readyState /
+/// visibilityState / 动作 id …）打一行进来，排查就不用再靠猜。
+#[tauri::command]
+pub fn pet_diag_log(app: AppHandle, msg: String) {
+    let data_dir = app.state::<AppState>().data_dir.clone();
+    // 单行化：前端可能带换行，日志按行解析，多行会打断格式
+    let one_line = msg.replace(['\r', '\n'], " ");
+    crate::fs_utils::app_log(&data_dir, &format!("[桌宠诊断] {one_line}"));
+}
+
 fn notice_bubble_inner(app: &AppHandle, title: &str, body: &str) {
     let visible = pet_window(app)
         .and_then(|w| w.is_visible().ok())
