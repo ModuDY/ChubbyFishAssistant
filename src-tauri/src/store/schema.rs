@@ -241,6 +241,29 @@ const DDL: &[&str] = &[
         explicit   INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
     )",
+    // 自我进化 L1.5 观测 2.0（docs/pending/自我进化方案.md §5.3）：
+    // 每分钟一行（账号维度），保留 7 天；池汇总读时由账号行聚合，不重复落盘。
+    // 主键 (minute_ts, pool, uid) = 同分钟重复 flush 幂等。
+    "CREATE TABLE IF NOT EXISTS evolution_metrics (
+        minute_ts   INTEGER NOT NULL,
+        pool        TEXT NOT NULL,
+        uid         TEXT NOT NULL,
+        ok          INTEGER NOT NULL DEFAULT 0,
+        upstream_5xx INTEGER NOT NULL DEFAULT 0,
+        timeout     INTEGER NOT NULL DEFAULT 0,
+        rate_limited INTEGER NOT NULL DEFAULT 0,
+        auth        INTEGER NOT NULL DEFAULT 0,
+        local_abort INTEGER NOT NULL DEFAULT 0,
+        p50_ttft    INTEGER NOT NULL DEFAULT 0,
+        p95_ttft    INTEGER NOT NULL DEFAULT 0,
+        p50_dur     INTEGER NOT NULL DEFAULT 0,
+        p95_dur     INTEGER NOT NULL DEFAULT 0,
+        tokens      INTEGER NOT NULL DEFAULT 0,
+        hedge_fired INTEGER NOT NULL DEFAULT 0,
+        hedge_won   INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (minute_ts, pool, uid)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_evolution_metrics_minute ON evolution_metrics(minute_ts)",
     "CREATE INDEX IF NOT EXISTS idx_credits_history_date ON credits_history(date)",
     "CREATE INDEX IF NOT EXISTS idx_wb_checkin_results_date ON wb_checkin_results(date)",
     "CREATE INDEX IF NOT EXISTS idx_checkin_results_day ON checkin_results(day)",

@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
+  DEFAULT_VOICE_ID,
+  EDGE_VOICES,
   SPEECH_MAX_CHARS,
   clipForSpeech,
+  isEdgeVoiceId,
   isSpeakableText,
   localChineseVoices,
   pickVoice,
@@ -80,6 +83,22 @@ describe('prepareSpeech', () => {
 
   it('短句原样保留中文标点', () => {
     expect(prepareSpeech('早呀，今天想干点什么？', 'proactive')).toBe('早呀，今天想干点什么？');
+  });
+});
+
+describe('Edge 音色白名单', () => {
+  it('提供 02 / 03 两档，默认 03 元气少女', () => {
+    expect(EDGE_VOICES.map((v) => v.id)).toEqual(['edge-xiaoyi', 'edge-xiaoyi-cute']);
+    expect(DEFAULT_VOICE_ID).toBe('edge-xiaoyi-cute');
+  });
+
+  it('只认白名单 ID，本地 voiceURI 不会被当成在线音色', () => {
+    expect(isEdgeVoiceId('edge-xiaoyi')).toBe(true);
+    expect(isEdgeVoiceId('edge-xiaoyi-cute')).toBe(true);
+    expect(isEdgeVoiceId('uri:Microsoft Huihui')).toBe(false);
+    expect(isEdgeVoiceId('local-auto')).toBe(false);
+    expect(isEdgeVoiceId('')).toBe(false);
+    expect(isEdgeVoiceId(null)).toBe(false);
   });
 });
 

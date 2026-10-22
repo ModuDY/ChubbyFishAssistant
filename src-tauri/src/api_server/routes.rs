@@ -1385,9 +1385,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             // 审查 M5：断连也是请求终局，补记一行失败用量（未取号 → "none"，
             // 与下方轮换耗尽收尾同口径），防用量页 requests 缺口
             if tx.is_closed() {
-                state.record_usage(
-                    false, &model, "none", &key_id, false, true,
-                    start_ts.elapsed().as_millis() as u64, 0, 0,
+                state.record_usage_client_abort(
+                    false, &model, "none", &key_id, true,
+                    start_ts.elapsed().as_millis() as u64,
                 );
                 return;
             }
@@ -1451,7 +1451,12 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                         ) {
                             Ok(w) => w,
                             Err(()) => {
-                                state.pool.note_error(&picked.uid, ErrKind::Server);
+                                // 冷却仍按 Server 处理，观测归因单列 timeout
+                                state.pool.note_error_as(
+                                    &picked.uid,
+                                    ErrKind::Server,
+                                    super::metrics::Outcome::Timeout,
+                                );
                                 *safe_lock(&state.last_error) =
                                     Some(format!("uid={} first-byte timeout(10s)", picked.uid));
                                 // 每请求终态单行（审查问题6）：首字超时 → 换号是中间态，
@@ -1580,6 +1585,12 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 // 空完成（影子风控/上游异常，issue #57）：不冷却、不透传，
                                 // 换号重试（收尾帧未发，重试流可在同一连接续传）
                                 empty_hits += 1;
+                                // 空完成不走 note_error，补一次上游故障归因
+                                state.metrics.record_attempt(
+                                    "trae",
+                                    &win_uid,
+                                    super::metrics::Outcome::Upstream5xx,
+                                );
                                 state.logger.log_request_ttfb(
                                     "trae", "POST", proto.log_path(), &model, stream,
                                     200, &win_uid, duration_ms, ttfb_ms, &key_name,
@@ -1669,9 +1680,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             );
                             converted = super::prompt::apply_degraded_system(&base);
                             if !super::wait_backoff_interruptible(200, || tx.is_closed()) {
-                                state.record_usage(
-                                    false, &model, &picked.uid, &key_id, false, stream,
-                                    start_ts.elapsed().as_millis() as u64, 0, 0,
+                                state.record_usage_client_abort(
+                                    false, &model, &picked.uid, &key_id, stream,
+                                    start_ts.elapsed().as_millis() as u64,
                                 );
                                 return;
                             }
@@ -1694,9 +1705,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 std::thread::sleep(std::time::Duration::from_millis(200));
                                 // 断连检测：重试等待期间客户端离开则终止（审查 M5：补记失败终态用量）
                                 if tx.is_closed() {
-                                    state.record_usage(
-                                        false, &model, &picked.uid, &key_id, false, stream,
-                                        start_ts.elapsed().as_millis() as u64, 0, 0,
+                                    state.record_usage_client_abort(
+                                        false, &model, &picked.uid, &key_id, stream,
+                                        start_ts.elapsed().as_millis() as u64,
                                     );
                                     return;
                                 }
@@ -1726,9 +1737,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 // 可中断 + 有时限的退避：客户端断连即刻退出，
                                 // 且不再为 40s/60s 级退避长期占用阻塞线程
                                 if !super::wait_backoff_interruptible(delay_ms, || tx.is_closed()) {
-                                    state.record_usage(
-                                        false, &model, &picked.uid, &key_id, false, stream,
-                                        start_ts.elapsed().as_millis() as u64, 0, 0,
+                                    state.record_usage_client_abort(
+                                        false, &model, &picked.uid, &key_id, stream,
+                                        start_ts.elapsed().as_millis() as u64,
                                     );
                                     return;
                                 }
@@ -2528,6 +2539,10 @@ fn settle_trae_hedge(
         return guard;
     };
     let hedge_uid = lease.uid.as_str();
+    // 观测 2.0：对冲触发/接管计数（只观测，不影响竞速结果）
+    state
+        .metrics
+        .record_hedge("trae", primary_uid, true, win.takeover);
     if win.takeover {
         state
             .logger

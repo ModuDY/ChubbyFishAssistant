@@ -10,7 +10,7 @@
 //! 文件末尾保留了渲染路线验证期的诊断命令（`?probe=1` 页面使用），不影响正式链路。
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -19,6 +19,8 @@ use tauri::{
 };
 
 use crate::state::AppState;
+
+use edge_tts_rust::{Boundary, EdgeTtsClient, SpeakOptions, DEFAULT_OUTPUT_FORMAT_MP3};
 
 #[cfg(test)]
 mod memory_tests {
@@ -487,7 +489,7 @@ pub fn apply_settings(app: &AppHandle) {
         "tts": settings.pet_tts.unwrap_or(false),
         "ttsAuto": settings.pet_tts_auto.unwrap_or(false),
         "ttsProactive": settings.pet_tts_proactive.unwrap_or(false),
-        "ttsVoice": settings.pet_tts_voice.clone().unwrap_or_default(),
+        "ttsVoice": tts_voice(&settings),
         "ttsRate": tts_rate(&settings),
         "ttsVolume": tts_volume(&settings),
         // P12 主动开口：档位与每日上限（与事件自动点评共用配额）
@@ -584,7 +586,7 @@ pub fn pet_status(app: AppHandle) -> serde_json::Value {
         "tts": settings.pet_tts.unwrap_or(false),
         "ttsAuto": settings.pet_tts_auto.unwrap_or(false),
         "ttsProactive": settings.pet_tts_proactive.unwrap_or(false),
-        "ttsVoice": settings.pet_tts_voice.clone().unwrap_or_default(),
+        "ttsVoice": tts_voice(&settings),
         "ttsRate": tts_rate(&settings),
         "ttsVolume": tts_volume(&settings),
         // P12 主动开口（默认 off）
@@ -616,6 +618,131 @@ fn proactive_mode(settings: &crate::models::Settings) -> String {
 /// 自动发言每日上限（0~12，默认 4）；0 = 允许手动关闭自动内容
 fn proactive_daily(settings: &crate::models::Settings) -> u32 {
     settings.pet_proactive_daily.unwrap_or(4).min(12)
+}
+
+/// 生效音色：未配置/空串统一回落在线「晓伊·元气少女」。
+/// 老版本保存过本地 voiceURI 的继续沿用，不会因为升级被强制改声。
+fn tts_voice(settings: &crate::models::Settings) -> String {
+    settings
+        .pet_tts_voice
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "edge-xiaoyi-cute".into())
+}
+
+/// Edge 音色白名单 → (Edge voice short-name, 基础语速百分比, 基础音调 Hz)。
+///
+/// 只接受固定 ID，不接受任意 voice/SSML 字符串：命令参数来自前端，
+/// 放任意值等于把 SSML 注入面暴露给页面。
+fn edge_voice_spec(voice_id: &str) -> Option<(&'static str, i32, i32)> {
+    match voice_id {
+        // 02 晓伊·活泼本音
+        "edge-xiaoyi" => Some(("zh-CN-XiaoyiNeural", 0, 0)),
+        // 03 晓伊·元气少女（提音高 + 提速）
+        "edge-xiaoyi-cute" => Some(("zh-CN-XiaoyiNeural", 6, 25)),
+        _ => None,
+    }
+}
+
+/// 用户语速（0.8~1.4 倍率）→ Edge SSML 的百分比偏移，叠加音色自带基础语速。
+/// 返回值夹在 -50~+100 之间，避免脏配置合成出听不懂的语速。
+fn edge_rate_percent(voice_id: &str, user_rate: f32) -> Option<i32> {
+    let (_, base, _) = edge_voice_spec(voice_id)?;
+    let pct = (((user_rate.clamp(0.8, 1.4) - 1.0) * 100.0).round() as i32 + base).clamp(-50, 100);
+    Some(pct)
+}
+
+#[cfg(test)]
+mod tts_tests {
+    use super::*;
+
+    /// 音色白名单是安全边界：未知 ID 必须拒绝，不能把任意 voice 名透传给微软。
+    #[test]
+    fn edge_voice_whitelist() {
+        assert_eq!(
+            edge_voice_spec("edge-xiaoyi"),
+            Some(("zh-CN-XiaoyiNeural", 0, 0))
+        );
+        assert_eq!(
+            edge_voice_spec("edge-xiaoyi-cute"),
+            Some(("zh-CN-XiaoyiNeural", 6, 25))
+        );
+        assert_eq!(edge_voice_spec("zh-CN-XiaoxiaoNeural"), None);
+        assert_eq!(edge_voice_spec(""), None);
+    }
+
+    /// 语速：倍率叠加音色基础语速，并把越界值夹回 -50~+100。
+    #[test]
+    fn edge_rate_percent_clamps() {
+        assert_eq!(edge_rate_percent("edge-xiaoyi", 1.0), Some(0));
+        assert_eq!(edge_rate_percent("edge-xiaoyi-cute", 1.0), Some(6));
+        assert_eq!(edge_rate_percent("edge-xiaoyi-cute", 1.2), Some(26));
+        assert_eq!(edge_rate_percent("edge-xiaoyi-cute", 0.8), Some(-14));
+        assert_eq!(edge_rate_percent("edge-xiaoyi-cute", 2.0), Some(46));
+        assert_eq!(edge_rate_percent("edge-xiaoyi-cute", 0.1), Some(-14));
+        assert_eq!(edge_rate_percent("not-a-voice", 1.0), None);
+    }
+}
+
+static EDGE_CLIENT: OnceLock<EdgeTtsClient> = OnceLock::new();
+
+/// 进程级 Edge 客户端单例：连接池可复用 WebSocket，第二句起省掉 TLS 握手。
+fn edge_client() -> Result<&'static EdgeTtsClient, String> {
+    if let Some(client) = EDGE_CLIENT.get() {
+        return Ok(client);
+    }
+    let client = EdgeTtsClient::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .receive_timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|e| format!("语音服务初始化失败：{e}"))?;
+    // 并发首调时可能有人先 set 成功，忽略失败并复用已存在的实例
+    let _ = EDGE_CLIENT.set(client);
+    EDGE_CLIENT.get().ok_or_else(|| "语音服务初始化失败".into())
+}
+
+/// Edge 在线神经语音合成：返回 base64 编码的 MP3。
+///
+/// 这是 P11 的在线音色通道（音质明显好于系统 SAPI）。断网、超时或微软侧
+/// 协议变更时返回 Err，由前端回退本地语音；不会把错误弹到桌宠气泡里。
+#[tauri::command]
+pub async fn pet_tts_synth(
+    text: String,
+    voice_id: String,
+    rate: Option<f32>,
+) -> Result<String, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("没有可朗读的文本".into());
+    }
+    // 桌宠单句上限 120 字（tts.ts），这里放宽到 300 只为容错，避免异常调用
+    if text.chars().count() > 300 {
+        return Err("朗读文本过长".into());
+    }
+    let (voice, _base_rate, pitch_hz) = edge_voice_spec(&voice_id).ok_or("未知音色")?;
+    // 用户语速是倍率，Edge 要的是百分比偏移；叠加音色自带的基础语速
+    let rate_pct = edge_rate_percent(&voice_id, rate.unwrap_or(1.0)).ok_or("未知音色")?;
+
+    // 复用全局客户端：内部带有 WebSocket 连接池，避免每句都重新 TLS 握手
+    let client = edge_client()?;
+    let options = SpeakOptions {
+        voice: voice.to_string(),
+        rate: format!("{rate_pct:+}%"),
+        volume: "+0%".into(),
+        pitch: format!("{pitch_hz:+}Hz"),
+        boundary: Boundary::Sentence,
+        output_format: DEFAULT_OUTPUT_FORMAT_MP3.into(),
+    };
+    let result = client
+        .synthesize(text.to_string(), options)
+        .await
+        .map_err(|e| format!("语音合成失败：{e}"))?;
+    if result.audio.is_empty() {
+        return Err("语音合成没有返回音频".into());
+    }
+
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    Ok(STANDARD.encode(result.audio))
 }
 
 /// 记录当前窗口位置（前端在 `moved` 事件去抖 500ms 后调用，无参数）。

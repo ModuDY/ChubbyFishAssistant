@@ -115,6 +115,11 @@ fn apply_taskbar_icon(window: &tauri::WebviewWindow) {
 }
 
 fn main() {
+    // rustls 同时启用了 ring（reqwest / Edge 语音）与 aws-lc-rs（tokio-rustls 默认），
+    // 不显式安装默认 CryptoProvider 时首次 TLS 连接会 panic；与 device_proxy 一致选 aws-lc-rs。
+    // install_default 幂等，重复安装会被忽略。
+    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     // 品牌迁移（老版本 Trae Work Assistant → AI Work 助手，现更名为「大肥鱼助手」；数据目录沿用旧名）：
     // 必须在 AppState::new 创建新数据目录之前执行；迁移为「复制」语义，
     // 旧数据目录原地保留（老应用可继续使用，两版并存），已迁移过则自动跳过
@@ -198,6 +203,8 @@ fn main() {
             commands::pet_pack::pet_pack_manifest,
             // 桌宠 AI 对话（P3）：进程内复用 API 网关，流式事件 pet-say-*
             commands::pet::pet_say,
+            // P11 在线神经语音：返回 base64 MP3，前端按语音仲裁层播放
+            commands::pet::pet_tts_synth,
             commands::pet::pet_memory_load,
             commands::pet::pet_memory_save,
             // P7 内联对话：输入期间强制整窗可交互（暂停点击穿透切换）+ 取得键盘焦点
@@ -287,6 +294,8 @@ fn main() {
             commands::api_server::api_server_stop,
             commands::api_server::api_server_status,
             commands::evolution::evolution_metrics,
+            commands::evolution::evolution_metrics_v2,
+            commands::evolution::evolution_history,
             commands::api_server::pool_list,
             commands::api_server::pool_set,
             commands::api_server::pool_status,
@@ -376,6 +385,9 @@ fn main() {
             commands::usage_history::usage_history_fetch,
             commands::usage_history::usage_sessions_query,
             commands::usage_history::trae_expired_ents,
+            // 壁纸库（本机 Wallpaper Engine 扫描 + 只读资源访问）
+            commands::wallpaper::we_scan,
+            commands::wallpaper::we_read,
             commands::updater::update_check,
             commands::updater::update_download,
             commands::updater::update_run_installer,

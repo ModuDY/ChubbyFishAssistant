@@ -36,3 +36,37 @@ pub fn evolution_metrics(runtime: State<'_, Mutex<Option<ApiServerRuntime>>>) ->
         }),
     }
 }
+
+/// 观测 2.0 窗口快照（5 分钟 / 1 小时，池汇总 + 账号维度）：
+/// `{ running, windows: { "5m": { windowMinutes, pools }, "1h": {...} } }`
+///
+/// 网关未运行时返回同构空窗口，前端无需分支处理。
+#[tauri::command]
+pub fn evolution_metrics_v2(runtime: State<'_, Mutex<Option<ApiServerRuntime>>>) -> Value {
+    let guard = runtime.lock().unwrap_or_else(|e| e.into_inner());
+    match guard.as_ref() {
+        Some(rt) => {
+            let mut snap = rt.shared.metrics.snapshot_v2();
+            if let Some(obj) = snap.as_object_mut() {
+                obj.insert("running".into(), serde_json::json!(true));
+            }
+            snap
+        }
+        None => serde_json::json!({
+            "running": false,
+            "windows": {
+                "5m": { "windowMinutes": 5, "pools": {} },
+                "1h": { "windowMinutes": 60, "pools": {} },
+            },
+        }),
+    }
+}
+
+/// 进化历史（P2 影子模式才产生数据）。
+///
+/// P1.5 只做观测，不计算建议，因此这里返回空列表并显式标记 `enabled:false`；
+/// 面板据此显示「未启用」而不是渲染空图。历史表结构见方案 §6.4。
+#[tauri::command]
+pub fn evolution_history() -> Value {
+    serde_json::json!({ "enabled": false, "items": [] })
+}

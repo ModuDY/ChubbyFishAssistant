@@ -745,6 +745,7 @@ use crate::models::{
 use crate::api_server::api_keys::ApiKeysFile;
 use crate::api_server::custom_models::CustomModelsFile;
 use crate::api_server::usage::{DayStats, UsageBucket, UsageFile};
+use crate::api_server::metrics::EvolutionMetricRow;
 
 // ── Trae 账号（checkin_accounts.json → accounts 表，seq 保序）────────────────
 
@@ -1558,6 +1559,86 @@ pub fn api_usage_prune(s: &Store, keep_days: i64) -> Result<(), String> {
         c.execute("DELETE FROM api_usage WHERE day < ?1", [cutoff.as_str()])?;
         Ok(())
     })
+}
+
+// ── 自我进化 L1.5 观测 2.0：evolution_metrics 分钟行 ─────────────────────────
+
+/// 批量 UPSERT 分钟行（主键幂等；单次 ≤ 账号数，失败由调用方仅记日志）
+pub fn evolution_metrics_upsert(
+    s: &Store,
+    rows: &[EvolutionMetricRow],
+) -> Result<(), String> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    s.with_conn(|c| {
+        let mut stmt = c.prepare(
+            "INSERT INTO evolution_metrics
+             (minute_ts, pool, uid, ok, upstream_5xx, timeout, rate_limited, auth, local_abort,
+              p50_ttft, p95_ttft, p50_dur, p95_dur, tokens, hedge_fired, hedge_won)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+             ON CONFLICT(minute_ts, pool, uid) DO UPDATE SET
+               ok = excluded.ok, upstream_5xx = excluded.upstream_5xx,
+               timeout = excluded.timeout, rate_limited = excluded.rate_limited,
+               auth = excluded.auth, local_abort = excluded.local_abort,
+               p50_ttft = excluded.p50_ttft, p95_ttft = excluded.p95_ttft,
+               p50_dur = excluded.p50_dur, p95_dur = excluded.p95_dur,
+               tokens = excluded.tokens,
+               hedge_fired = excluded.hedge_fired, hedge_won = excluded.hedge_won",
+        )?;
+        for r in rows {
+            stmt.execute(rusqlite::params![
+                r.minute_ts, r.pool, r.uid, r.ok, r.upstream_5xx, r.timeout, r.rate_limited,
+                r.auth, r.local_abort, r.p50_ttft, r.p95_ttft, r.p50_dur, r.p95_dur,
+                r.tokens, r.hedge_fired, r.hedge_won,
+            ])?;
+        }
+        Ok(())
+    })
+}
+
+/// 读取指定时间点之后的行（启动回填最近 60 分钟）
+pub fn evolution_metrics_load_since(
+    s: &Store,
+    since_ts: i64,
+) -> Result<Vec<EvolutionMetricRow>, String> {
+    s.with_conn(|c| {
+        let mut stmt = c.prepare(
+            "SELECT minute_ts, pool, uid, ok, upstream_5xx, timeout, rate_limited, auth,
+                    local_abort, p50_ttft, p95_ttft, p50_dur, p95_dur, tokens,
+                    hedge_fired, hedge_won
+             FROM evolution_metrics WHERE minute_ts >= ?1 ORDER BY minute_ts",
+        )?;
+        let rows = stmt
+            .query_map([since_ts], |r| {
+                Ok(EvolutionMetricRow {
+                    minute_ts: r.get(0)?,
+                    pool: r.get(1)?,
+                    uid: r.get(2)?,
+                    ok: r.get(3)?,
+                    upstream_5xx: r.get(4)?,
+                    timeout: r.get(5)?,
+                    rate_limited: r.get(6)?,
+                    auth: r.get(7)?,
+                    local_abort: r.get(8)?,
+                    p50_ttft: r.get(9)?,
+                    p95_ttft: r.get(10)?,
+                    p50_dur: r.get(11)?,
+                    p95_dur: r.get(12)?,
+                    tokens: r.get(13)?,
+                    hedge_fired: r.get(14)?,
+                    hedge_won: r.get(15)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })
+}
+
+/// 保留期裁剪（按分钟时间戳；保留 7 天）
+pub fn evolution_metrics_prune(s: &Store, keep_days: i64) -> Result<usize, String> {
+    let cutoff = chrono::Local::now().timestamp() - keep_days * 86_400;
+    s.with_conn(|c| Ok(c.execute("DELETE FROM evolution_metrics WHERE minute_ts < ?1", [cutoff])?))
 }
 
 // ── Qoder 网关会话流水（issue #82 问题5：qoder_sessions 表）──────────────────

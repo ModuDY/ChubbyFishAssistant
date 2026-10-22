@@ -193,6 +193,10 @@ pub struct ApiPool {
     /// 冷却/禁用标记的 app.log 观测上下文：(data_dir, 池标签)。
     /// do_start 装配三池（trae/buddy/qoder）时注入；None（测试/未启动）不落日志
     log_ctx: Mutex<Option<(std::path::PathBuf, String)>>,
+    /// 观测归因上下文（自我进化 L1.5）：(池标签, 观测层)。与 log_ctx 同款注入；
+    /// note_error 拿到精确 ErrKind 后回写观测层（错误归因的单一事实来源），
+    /// None（测试/未启动）时静默。请求记账先落通用 upstream_5xx，这里做精确修正
+    metrics_ctx: Mutex<Option<(String, Arc<super::metrics::Metrics>)>>,
     /// 网关活动事件发射器（设计 §6.5）：与 log_ctx 同款注入模式；
     /// note_error 命中熔断 / 积分耗尽时下发 `degrade` 边沿。
     /// None（测试 / 未启用桌宠联动）时静默
@@ -222,6 +226,7 @@ impl ApiPool {
             concurrency_limit: std::sync::atomic::AtomicU32::new(1),
             reserve_credits: std::sync::atomic::AtomicU64::new(0.0f64.to_bits()),
             log_ctx: Mutex::new(None),
+            metrics_ctx: Mutex::new(None),
             activity: Mutex::new(None),
             paused: Mutex::new(HashSet::new()),
         }
@@ -262,6 +267,12 @@ impl ApiPool {
     /// 未装配（测试/未启动网关）时 note_error 不落 app.log，无副作用
     pub fn set_log_ctx(&self, data_dir: &std::path::Path, label: &str) {
         *safe_lock(&self.log_ctx) = Some((data_dir.to_path_buf(), label.to_string()));
+    }
+
+    /// 装配观测归因上下文（自我进化 L1.5）：与 set_log_ctx 同款注入模式。
+    /// note_error 的 ErrKind 是错误分类的单一事实来源，观测层只做被动归因
+    pub fn set_metrics_ctx(&self, label: &str, metrics: Arc<super::metrics::Metrics>) {
+        *safe_lock(&self.metrics_ctx) = Some((label.to_string(), metrics));
     }
 
     /// 装配网关活动发射器（设计 §6.5）：与 `set_log_ctx` 同款注入模式，
@@ -935,6 +946,15 @@ impl ApiPool {
     /// `account cooldown: pool=<池> acct=<名称> uid=<uid> kind=<错误分类> action=<处置>`，
     /// 排查「账号何时、为何被打冷却→选池 no_healthy_account→跨池回退」链路时可直接定位
     pub fn note_error(&self, uid: &str, kind: ErrKind) {
+        let observed = super::metrics::Outcome::from_err_kind(kind);
+        self.note_error_as(uid, kind, observed);
+    }
+
+    /// 同 `note_error`，但允许显式指定观测归因。
+    ///
+    /// 首字超时这类「冷却按 Server 处理、归因要记 timeout」的场景用它，
+    /// 避免观测口径被冷却口径绑死（单一事实来源，且不做事后改写）。
+    pub fn note_error_as(&self, uid: &str, kind: ErrKind, observed: super::metrics::Outcome) {
         let mut entries = safe_lock(&self.entries);
         let mut cooldown_ev: Option<(String, String)> = None;
         // 网关活动联动（设计 §6.5）：只在熔断 / 积分耗尽这类"上游真出状况"的
@@ -1020,6 +1040,11 @@ impl ApiPool {
                     ),
                 );
             }
+        }
+        // 自我进化 L1.5：尝试级错误归因（note_error 是精确 ErrKind 的单一事实来源；
+        // 终局失败不再写 metrics，避免同一尝试双计）
+        if let Some((label, metrics)) = safe_lock(&self.metrics_ctx).clone() {
+            metrics.record_attempt(&label, uid, observed);
         }
     }
 

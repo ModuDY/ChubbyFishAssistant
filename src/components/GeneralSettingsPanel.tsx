@@ -4,15 +4,7 @@ import { useAppStore } from '../store';
 import { withMinDelay } from '../lib/delay';
 import { api } from '../lib/tauri';
 import { THEMES } from '../lib/themes';
-import {
-  GLASS_LEVELS,
-  SCENES,
-  glassBlur,
-  setAppearance,
-  useAppearance,
-  type GlassLevel,
-  type SceneId,
-} from '../lib/appearance';
+import AppearanceSettings from './AppearanceSettings';
 import { APP_TABS } from './Sidebar';
 import { ICON_CHOICES, resolveAppIcon, DEFAULT_APP_ICONS } from '../lib/appIcons';
 import type {
@@ -20,10 +12,70 @@ import type {
   Settings as SettingsType,
   PetAiMode,
   PetProactiveMode,
-  EvolutionMetrics,
+  EvolutionMetricsV2,
+  EvolutionSeriesMetrics,
 } from '../types';
 import { DEFAULT_VOICE_ID, EDGE_VOICES, localChineseVoices } from '../pet/tts';
 import { previewVoice } from '../pet/usePetSpeak';
+
+/** 分位展示：无样本用 —（避免把 0 误读为「很快」） */
+function fmtMs(v: number | null): string {
+  return v == null ? '—' : `${Math.round(v)} ms`;
+}
+
+/** 错误分布：只列非零项，避免整行被 0 填满 */
+function fmtErrors(e: EvolutionSeriesMetrics['errors']): string {
+  const parts: Array<[string, number]> = [
+    ['5xx', e.upstream5xx],
+    ['超时', e.timeout],
+    ['限流', e.rateLimited],
+    ['鉴权', e.auth],
+    ['中断', e.localAbort],
+  ];
+  const hit = parts.filter(([, n]) => n > 0).map(([k, n]) => `${k} ${n}`);
+  return hit.length ? hit.join(' · ') : '—';
+}
+
+/** 对冲统计：触发次数 / 接管次数（胜率） */
+function fmtHedge(s: EvolutionSeriesMetrics): string {
+  if (s.hedgeFired === 0) return '—';
+  const rate = s.hedgeWinRate == null ? '—' : `${Math.round(s.hedgeWinRate * 100)}%`;
+  return `${s.hedgeFired} / ${s.hedgeWon}（${rate}）`;
+}
+
+/** 观测表一行：池汇总行 + 缩进的账号行（nested） */
+function EvolutionMetricsRow({
+  label,
+  s,
+  nested = false,
+}: {
+  label: string;
+  s: EvolutionSeriesMetrics;
+  nested?: boolean;
+}) {
+  const base = nested
+    ? 'border-t border-slate-200/30 dark:border-zinc-700/30 text-slate-500 dark:text-slate-400'
+    : 'border-t border-slate-200/60 dark:border-zinc-700/60';
+  const first = nested ? 'py-1 pr-3 pl-4' : 'py-1.5 pr-3';
+  const cell = nested ? 'py-1 pr-3' : 'py-1.5 pr-3';
+  return (
+    <tr className={base}>
+      <td className={first}>{label}</td>
+      <td className={cell}>
+        {s.successRate == null ? '—' : `${(s.successRate * 100).toFixed(0)}%`}
+      </td>
+      <td className={cell}>{s.requests}</td>
+      <td className={cell}>
+        {fmtMs(s.ttftP50)} / {fmtMs(s.ttftP95)}
+      </td>
+      <td className={cell}>
+        {fmtMs(s.durP50)} / {fmtMs(s.durP95)}
+      </td>
+      <td className={cell}>{fmtErrors(s.errors)}</td>
+      <td className={nested ? 'py-1' : 'py-1.5'}>{fmtHedge(s)}</td>
+    </tr>
+  );
+}
 
 /**
  * 通用设置面板：外观 / 语言 / 通用与通知 / 代理相关配置。
@@ -38,8 +90,6 @@ export default function GeneralSettingsPanel() {
 
   const [form, setForm] = useState<SettingsType | null>(null);
   const [saving, setSaving] = useState(false);
-  // 壁纸 / 玻璃 / 开屏：设备本地偏好，独立于 Settings 表单（改动即时生效）
-  const appearance = useAppearance();
   // 开机自启（T11）：注册表 Run 项即时生效，不随「保存设置」提交
   const [autostart, setAutostart] = useState(false);
   const [autostartBusy, setAutostartBusy] = useState(false);
@@ -51,8 +101,8 @@ export default function GeneralSettingsPanel() {
   const [packs, setPacks] = useState<Array<{ id: string; name: string; action_count: number }>>([]);
   // 桌宠对话专用模型候选：统一模型目录的 id 列表（加载失败留空 = 只能跟随网关默认）
   const [modelOptions, setModelOptions] = useState<string[]>([]);
-  // 自我进化 P1：网关观测快照（只读，10s 轮询；网关未运行时不显示）
-  const [metrics, setMetrics] = useState<EvolutionMetrics | null>(null);
+  // 自我进化 P1.5：网关观测 2.0 快照（只读，10s 轮询；网关未运行时不显示）
+  const [metrics, setMetrics] = useState<EvolutionMetricsV2 | null>(null);
   // P11：本地中文音色（进入设置分区才枚举；首次 getVoices 常为空，等 voiceschanged）
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   // 枚举是否已出结果（区分「还没加载完」与「确实没有中文语音包」）
@@ -104,7 +154,7 @@ export default function GeneralSettingsPanel() {
   useEffect(() => {
     const load = () => {
       void api.evolution
-        .metrics()
+        .metricsV2()
         .then((m) => setMetrics(m?.running ? m : null))
         .catch(() => setMetrics(null));
     };
@@ -243,72 +293,7 @@ export default function GeneralSettingsPanel() {
       </section>
 
       {/* 壁纸与动效：设备本地的纯视觉偏好，改完立即生效（不走「保存设置」） */}
-      <section className="card p-4">
-        <h3 className="mb-1 font-medium">壁纸与动效</h3>
-        <p className="mb-3 text-xs text-slate-400">
-          场景壁纸常驻在界面最底层，玻璃面板透过它取色。<b>改动即时生效</b>，并保存在本机
-          （只影响外观，不参与账号备份与同步）。
-        </p>
-
-        <label className="mb-3 flex items-center gap-2">
-          <input
-            type="checkbox"
-            checked={appearance.wallpaper}
-            onChange={(e) => setAppearance({ wallpaper: e.target.checked })}
-          />
-          <span>启用场景壁纸</span>
-          <span className="text-xs text-slate-400">（关掉后界面与改造前完全一致）</span>
-        </label>
-
-        <div className="grid gap-3 sm:grid-cols-2">
-          <div>
-            <label className="label">场景</label>
-            <select
-              value={appearance.scene}
-              disabled={!appearance.wallpaper}
-              onChange={(e) => setAppearance({ scene: e.target.value as SceneId })}
-              className="input disabled:opacity-50"
-            >
-              {SCENES.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.name}
-                </option>
-              ))}
-            </select>
-            <p className="mt-1 text-xs text-slate-400">
-              {SCENES.find((s) => s.id === appearance.scene)?.hint}
-            </p>
-          </div>
-          <div>
-            <label className="label">玻璃强度</label>
-            <select
-              value={appearance.glass}
-              disabled={!appearance.wallpaper}
-              onChange={(e) => setAppearance({ glass: e.target.value as GlassLevel })}
-              className="input disabled:opacity-50"
-            >
-              {GLASS_LEVELS.map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name}
-                </option>
-              ))}
-            </select>
-            <p className="mt-1 text-xs text-slate-400">
-              面板模糊 {glassBlur(appearance.glass)}px；强度越高壁纸越透，文字对比度越低。
-            </p>
-          </div>
-        </div>
-
-        <label className="mt-3 flex items-center gap-2">
-          <input
-            type="checkbox"
-            checked={appearance.entryAnim}
-            onChange={(e) => setAppearance({ entryAnim: e.target.checked })}
-          />
-          <span>进应用动画</span>
-          <span className="text-xs text-slate-400">（开屏约 1 秒，点任意处可跳过）</span>
-        </label>
-      </section>
+      <AppearanceSettings />
 
       {/* 应用显示（侧边栏应用 Tab：固定应用单选 + 显示勾选 + 行首图标点击换图标） */}
       <section className="card p-4">
@@ -1130,39 +1115,59 @@ export default function GeneralSettingsPanel() {
         </div>
       </section>
 
-      {/* 自我进化 P1：网关观测（只读）——目前只观测、不参与任何路由决策 */}
+      {/* 自我进化 P1.5：网关观测 2.0（只读）——5 分钟/1 小时窗口 + 账号维度 */}
       {metrics && (
         <section className="card p-4">
           <h3 className="mb-1 font-medium">网关观测</h3>
           <p className="mb-3 text-xs text-slate-400">
-            本次启动以来各上游的成功率与延迟（10 秒刷新）。指数滑动值 EWMA 抗尖峰，样本太少时参考意义有限。
+            最近 5 分钟 / 1 小时的请求分布（10 秒刷新，重启后回填 1 小时）。
+            成功率分母不含「中断」（客户端断开/取消）；首字与总耗时为对数分桶近似分位。
           </p>
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-xs">
-              <thead className="text-slate-400">
-                <tr>
-                  <th className="py-1 pr-3 font-normal">上游</th>
-                  <th className="py-1 pr-3 font-normal">累计成功率</th>
-                  <th className="py-1 pr-3 font-normal">近期成功率</th>
-                  <th className="py-1 pr-3 font-normal">平均耗时</th>
-                  <th className="py-1 pr-3 font-normal">请求数</th>
-                  <th className="py-1 font-normal">Tokens</th>
-                </tr>
-              </thead>
-              <tbody>
-                {Object.entries(metrics.pools).map(([name, p]) => (
-                  <tr key={name} className="border-t border-slate-200/60 dark:border-zinc-700/60">
-                    <td className="py-1.5 pr-3">{name}</td>
-                    <td className="py-1.5 pr-3">{(p.successRate * 100).toFixed(0)}%</td>
-                    <td className="py-1.5 pr-3">{(p.ewmaSuccess * 100).toFixed(0)}%</td>
-                    <td className="py-1.5 pr-3">{Math.round(p.ewmaLatencyMs)} ms</td>
-                    <td className="py-1.5 pr-3">{p.total}</td>
-                    <td className="py-1.5">{p.tokens.toLocaleString()}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          {(['5m', '1h'] as const).map((key) => {
+            const w = metrics.windows[key];
+            const pools = Object.entries(w.pools ?? {});
+            return (
+              <div key={key} className="mb-4 last:mb-0">
+                <h4 className="mb-1 text-xs font-medium text-slate-500 dark:text-slate-400">
+                  最近 {w.windowMinutes} 分钟
+                </h4>
+                {pools.length === 0 ? (
+                  <p className="text-xs text-slate-400">该窗口暂无请求</p>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-xs">
+                      <thead className="text-slate-400">
+                        <tr>
+                          <th className="py-1 pr-3 font-normal">序列</th>
+                          <th className="py-1 pr-3 font-normal">成功率</th>
+                          <th className="py-1 pr-3 font-normal">请求</th>
+                          <th className="py-1 pr-3 font-normal">TTFT P50/P95</th>
+                          <th className="py-1 pr-3 font-normal">耗时 P50/P95</th>
+                          <th className="py-1 pr-3 font-normal">错误分布</th>
+                          <th className="py-1 font-normal">对冲（触发/接管）</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {pools.flatMap(([name, p]) => [
+                          <EvolutionMetricsRow key={name} label={name} s={p} />,
+                          ...Object.entries(p.accounts ?? {})
+                            .filter(([uid]) => uid !== 'none' && uid !== 'custom')
+                            .map(([uid, a]) => (
+                              <EvolutionMetricsRow
+                                key={`${name}:${uid}`}
+                                label={`└ ${uid.slice(0, 8)}`}
+                                s={a}
+                                nested
+                              />
+                            )),
+                        ])}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </section>
       )}
 

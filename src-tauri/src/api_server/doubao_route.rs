@@ -349,9 +349,9 @@ fn run_doubao_stream(
     loop {
         // 客户端断连检测：通道关闭即终止轮换（补记失败用量，防统计缺口）
         if tx.is_closed() {
-            state.record_usage_doubao(
-                model, "none", key_id, false, true,
-                start_ts.elapsed().as_millis() as u64, 0, 0, None,
+            state.record_usage_doubao_abort(
+                model, "none", key_id, true,
+                start_ts.elapsed().as_millis() as u64,
             );
             return;
         }
@@ -453,7 +453,12 @@ fn run_doubao_stream(
                 let lines = match super::wb_upstream::lines_with_first_byte_timeout_interruptible(resp.reader) {
                     Ok(l) => l,
                     Err(()) => {
-                        state.doubao_pool.note_error(&picked.uid, ErrKind::Server);
+                        // 冷却仍按 Server 处理，观测归因单列 timeout
+                        state.doubao_pool.note_error_as(
+                            &picked.uid,
+                            ErrKind::Server,
+                            super::metrics::Outcome::Timeout,
+                        );
                         break;
                     }
                 };
@@ -695,7 +700,12 @@ pub async fn doubao_aggregate_chat(
                     let lines = match super::wb_upstream::lines_with_first_byte_timeout_interruptible(resp.reader) {
                         Ok(l) => l,
                         Err(()) => {
-                            state.doubao_pool.note_error(&picked.uid, ErrKind::Server);
+                            // 冷却仍按 Server 处理，观测归因单列 timeout
+                            state.doubao_pool.note_error_as(
+                                &picked.uid,
+                                ErrKind::Server,
+                                super::metrics::Outcome::Timeout,
+                            );
                             continue;
                         }
                     };

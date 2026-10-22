@@ -375,6 +375,10 @@ fn settle_hedge(
         return guard;
     };
     let hedge_uid = lease.uid.as_str();
+    // 观测 2.0：对冲触发/接管计数（只观测，不影响竞速结果）
+    state
+        .metrics
+        .record_hedge("wb", primary_uid, true, win.takeover);
     if win.takeover {
         state.logger.log_sched_event(&format!(
             "hedge_takeover primary={} hedge={}",
@@ -567,7 +571,7 @@ fn run_wb_stream(
         // 轮换耗尽收尾同口径），防用量页 requests 缺口
         if tx.is_closed() {
             let duration_ms = start_ts.elapsed().as_millis() as u64;
-            state.record_usage(true, model, "none", key_id, false, true, duration_ms, 0, 0);
+            state.record_usage_client_abort(true, model, "none", key_id, true, duration_ms);
             return;
         }
         // ── 取号：粘性/专一命中优先，否则按 Key 约束 + 调度策略；换号后仅走策略 ──
@@ -677,7 +681,7 @@ fn run_wb_stream(
             // 审查 M5：断连为请求终局，补记一行失败用量（已绑定 picked 账号）
             if tx.is_closed() {
                 let duration_ms = start_ts.elapsed().as_millis() as u64;
-                state.record_usage(true, model, &picked.uid, key_id, false, true, duration_ms, 0, 0);
+                state.record_usage_client_abort(true, model, &picked.uid, key_id, true, duration_ms);
                 return;
             }
             let ttfb_start = Instant::now();
@@ -698,7 +702,12 @@ fn run_wb_stream(
                     ) {
                         Ok(w) => w,
                         Err(()) => {
-                            state.wb_pool.note_error(&picked.uid, ErrKind::Server);
+                            // 冷却仍按 Server 处理，观测归因单列 timeout
+                            state.wb_pool.note_error_as(
+                                &picked.uid,
+                                ErrKind::Server,
+                                super::metrics::Outcome::Timeout,
+                            );
                             note_model_failure(state, model);
                             break;
                         }
@@ -751,6 +760,12 @@ fn run_wb_stream(
                                 // 空完成（影子风控/上游异常，issue #57）：不冷却、不透传、
                                 // 不绑定粘性，换号重试（收尾帧未发，重试流可续传）
                                 empty_hits += 1;
+                                // 空完成不走 note_error，补一次上游故障归因
+                                state.metrics.record_attempt(
+                                    "wb",
+                                    win_uid,
+                                    super::metrics::Outcome::Upstream5xx,
+                                );
                                 state.logger.log_request_ttfb(
                                     "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
                                     duration_ms, Some(ttfb_ms), &key_name,
@@ -825,7 +840,7 @@ fn run_wb_stream(
                         converted = super::prompt::apply_degraded_system(&base);
                         if !super::wait_backoff_interruptible(200, || tx.is_closed()) {
                             let duration_ms = start_ts.elapsed().as_millis() as u64;
-                            state.record_usage(true, model, &picked.uid, key_id, false, true, duration_ms, 0, 0);
+                            state.record_usage_client_abort(true, model, &picked.uid, key_id, true, duration_ms);
                             return;
                         }
                         continue;
@@ -846,7 +861,7 @@ fn run_wb_stream(
                             // 断连检测：重试等待期间客户端离开则终止（审查 M5：补记失败终态用量）
                             if tx.is_closed() {
                                 let duration_ms = start_ts.elapsed().as_millis() as u64;
-                                state.record_usage(true, model, &picked.uid, key_id, false, true, duration_ms, 0, 0);
+                                state.record_usage_client_abort(true, model, &picked.uid, key_id, true, duration_ms);
                                 return;
                             }
                             continue;
@@ -875,7 +890,7 @@ fn run_wb_stream(
                             // 可中断 + 有时限的退避（客户端断连即刻退出，不长期占用阻塞线程）
                             if !super::wait_backoff_interruptible(delay_ms, || tx.is_closed()) {
                                 let duration_ms = start_ts.elapsed().as_millis() as u64;
-                                state.record_usage(true, model, &picked.uid, key_id, false, true, duration_ms, 0, 0);
+                                state.record_usage_client_abort(true, model, &picked.uid, key_id, true, duration_ms);
                                 return;
                             }
                             continue;
@@ -1111,7 +1126,12 @@ pub async fn wb_aggregate_chat(
                         ) {
                             Ok(w) => w,
                             Err(()) => {
-                                state.wb_pool.note_error(&picked.uid, ErrKind::Server);
+                                // 冷却仍按 Server 处理，观测归因单列 timeout
+                                state.wb_pool.note_error_as(
+                                    &picked.uid,
+                                    ErrKind::Server,
+                                    super::metrics::Outcome::Timeout,
+                                );
                                 note_model_failure(&state, &model);
                                 break;
                             }
@@ -1502,7 +1522,12 @@ pub async fn wb_tool_exec_chat(
                         let lines = match wb_upstream::lines_with_first_byte_timeout(reader) {
                             Ok(l) => l,
                             Err(()) => {
-                                state.wb_pool.note_error(&picked.uid, ErrKind::Server);
+                                // 冷却仍按 Server 处理，观测归因单列 timeout
+                                state.wb_pool.note_error_as(
+                                    &picked.uid,
+                                    ErrKind::Server,
+                                    super::metrics::Outcome::Timeout,
+                                );
                                 note_model_failure(&state, &model);
                                 break Err("上游首字超时".to_string());
                             }
@@ -1532,6 +1557,12 @@ pub async fn wb_tool_exec_chat(
                             // 口径：同流式路径不冷却（哨兵注释见 mod.rs）；此处补即时
                             // 观测日志，接通「空完成 → 模板命中」反查通道（与其余路径一致）
                             empty_hits += 1;
+                            // 空完成不走 note_error，补一次上游故障归因
+                            state.metrics.record_attempt(
+                                "wb",
+                                &picked.uid,
+                                super::metrics::Outcome::Upstream5xx,
+                            );
                             let duration_ms = start_ts.elapsed().as_millis() as u64;
                             state.logger.log_request_ttfb(
                                 "buddy", "POST", "/v1/responses", &model, stream, 502, &picked.uid,

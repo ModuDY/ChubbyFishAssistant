@@ -98,6 +98,8 @@ import type {
   QoderResetResult,
   QoderSettings,
   EvolutionMetrics,
+  EvolutionMetricsV2,
+  EvolutionHistory,
 } from '../types';
 
 // ---- F1/F11：invoke 统一超时 + 错误源头翻译 ----
@@ -120,6 +122,8 @@ const INVOKE_TIMEOUT_OVERRIDES: Record<string, number | null> = {
   cert_install: null,
   // 桌宠 AI 发言：命令本身立即返回 sessionId，流式结果经 pet-say-* 事件下发；给较短的兜底超时
   pet_say: 15_000,
+  // 在线语音合成：Rust 侧连接 5s + 收包 12s，前端留一点余量
+  pet_tts_synth: 20_000,
 };
 
 /** F11：底层错误在源头翻译为可读文案——剥冗余 "Error: " 前缀、网络类错误转人话；
@@ -330,6 +334,13 @@ export const api = {
         history: history ?? null,
         mode: mode ?? 'monologue',
       }),
+    /**
+     * P11 在线神经语音：把一句话合成为 MP3（base64）。
+     * `voiceId` 只接受 `tts.ts` 里的白名单 ID，Rust 侧会再校验一次。
+     * 断网/超时 reject，调用方回退本地语音或静音。
+     */
+    ttsSynth: (text: string, voiceId: string, rate?: number) =>
+      invoke<string>('pet_tts_synth', { text, voiceId, rate: rate ?? null }),
     /**
      * 上报「可点击格子」掩码（窗口百分比网格，1=角色 0=透明）。
      * Rust 侧据此让角色以外的区域放行鼠标消息，避免透明窗口挡住下层窗口的点击。
@@ -995,6 +1006,10 @@ export const api = {
    */
   evolution: {
     metrics: () => invoke<EvolutionMetrics>('evolution_metrics'),
+    // 观测 2.0：5 分钟 / 1 小时窗口 + 账号维度 + 错误归因 + 对冲计数
+    metricsV2: () => invoke<EvolutionMetricsV2>('evolution_metrics_v2'),
+    // P2 影子模式历史；P1.5 恒返回 enabled=false 与空列表
+    history: () => invoke<EvolutionHistory>('evolution_history'),
   },
   updater: {
     check: () => invoke<UpdateCheckResult>('update_check'),

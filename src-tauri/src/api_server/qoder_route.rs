@@ -506,6 +506,10 @@ fn settle_qoder_hedge(
         return guard;
     };
     let hedge_uid = lease.uid.as_str();
+    // 观测 2.0：对冲触发/接管计数（只观测，不影响竞速结果）
+    state
+        .metrics
+        .record_hedge("qoder", primary_uid, true, win.takeover);
     if win.takeover {
         state
             .logger
@@ -707,9 +711,9 @@ fn run_qoder_stream(
         // 审查 M5：断连也是请求终局，补记一行失败用量（未取号 → "none"，
         // 与下方轮换耗尽收尾同口径），防用量页 requests 缺口
         if tx.is_closed() {
-            state.record_usage_qoder(
-                model, "none", key_id, false, true,
-                start_ts.elapsed().as_millis() as u64, 0, 0, None, None, None,
+            state.record_usage_qoder_abort(
+                model, "none", key_id, true,
+                start_ts.elapsed().as_millis() as u64,
                 &session_ctx(&peek),
             );
             return;
@@ -856,9 +860,9 @@ fn run_qoder_stream(
             // 断连检测：重试等待/长路径期间离开则终止（guard 随 Drop 释放）。
             // 审查 M5：断连为请求终局，补记一行失败用量（已绑定 picked 账号）
             if tx.is_closed() {
-                state.record_usage_qoder(
-                    model, &picked.uid, key_id, false, true,
-                    start_ts.elapsed().as_millis() as u64, 0, 0, None, None, None,
+                state.record_usage_qoder_abort(
+                    model, &picked.uid, key_id, true,
+                    start_ts.elapsed().as_millis() as u64,
                     &session_ctx(&peek),
                 );
                 return;
@@ -892,7 +896,12 @@ fn run_qoder_stream(
                     ) {
                         Ok(w) => w,
                         Err(()) => {
-                            state.qoder_pool.note_error(&picked.uid, ErrKind::Server);
+                            // 冷却仍按 Server 处理，观测归因单列 timeout
+                            state.qoder_pool.note_error_as(
+                                &picked.uid,
+                                ErrKind::Server,
+                                super::metrics::Outcome::Timeout,
+                            );
                             break;
                         }
                     };
@@ -948,6 +957,12 @@ fn run_qoder_stream(
                                         if model_cooling_remaining_secs(model).is_some() {
                                             let duration_ms =
                                                 start_ts.elapsed().as_millis() as u64;
+                                            // 模型冷却短路：本次尝试按限流归因
+                                            state.metrics.record_attempt(
+                                                "qoder",
+                                                &win_uid,
+                                                super::metrics::Outcome::RateLimited,
+                                            );
                                             state.record_usage_qoder(
                                                 model, &win_uid, key_id, false, true,
                                                 duration_ms, 0, 0, None, None, None,
@@ -976,10 +991,10 @@ fn run_qoder_stream(
                                             || tx.is_closed(),
                                         ) {
                                             // 审查 M5：断连为请求终局，补记失败终态用量
-                                            state.record_usage_qoder(
-                                                model, &win_uid, key_id, false, true,
-                                                start_ts.elapsed().as_millis() as u64, 0, 0,
-                                                None, None, None, &session_ctx(&peek),
+                                            state.record_usage_qoder_abort(
+                                                model, &win_uid, key_id, true,
+                                                start_ts.elapsed().as_millis() as u64,
+                                                &session_ctx(&peek),
                                             );
                                             return; // 客户端断连：提前退出
                                         }
@@ -989,6 +1004,12 @@ fn run_qoder_stream(
                                     // （sent_any=true）时换号重发会向同一 SSE 流拼接
                                     // 第二份完整响应；交下方公共收尾（!sent_any→换号，
                                     // sent_any→就地收尾），与其他错误分支口径一致
+                                    // 排队失败无 note_error 通道，这里补一次限流归因
+                                    state.metrics.record_attempt(
+                                        "qoder",
+                                        &win_uid,
+                                        super::metrics::Outcome::RateLimited,
+                                    );
                                 }
                                 Some(kind) => {
                                     let ek = kind.to_err_kind();
@@ -1023,6 +1044,12 @@ fn run_qoder_stream(
                                     // 仅由下方 !sent_any 分支换号重试
                                     if super::is_empty_completion(code, &msg) {
                                         empty_hits += 1; // 空完成计数：耗尽收尾区分指纹拦截
+                                        // 空完成不走 note_error，补一次上游故障归因
+                                        state.metrics.record_attempt(
+                                            "qoder",
+                                            &win_uid,
+                                            super::metrics::Outcome::Upstream5xx,
+                                        );
                                     } else {
                                         state.qoder_pool.note_error(&win_uid, ErrKind::Server);
                                     }
@@ -1112,10 +1139,10 @@ fn run_qoder_stream(
                             // （原整段 sleep 最长 60s，断连后仍空等）
                             if !super::wait_backoff_interruptible(delay_ms, || tx.is_closed()) {
                                 // 审查 M5：断连为请求终局，补记失败终态用量
-                                state.record_usage_qoder(
-                                    model, &picked.uid, key_id, false, true,
-                                    start_ts.elapsed().as_millis() as u64, 0, 0,
-                                    None, None, None, &session_ctx(&peek),
+                                state.record_usage_qoder_abort(
+                                    model, &picked.uid, key_id, true,
+                                    start_ts.elapsed().as_millis() as u64,
+                                    &session_ctx(&peek),
                                 );
                                 return;
                             }
@@ -1165,10 +1192,10 @@ fn run_qoder_stream(
                                     || tx.is_closed(),
                                 ) {
                                     // 审查 M5：断连为请求终局，补记失败终态用量
-                                    state.record_usage_qoder(
-                                        model, &picked.uid, key_id, false, true,
-                                        start_ts.elapsed().as_millis() as u64, 0, 0,
-                                        None, None, None, &session_ctx(&peek),
+                                    state.record_usage_qoder_abort(
+                                        model, &picked.uid, key_id, true,
+                                        start_ts.elapsed().as_millis() as u64,
+                                        &session_ctx(&peek),
                                     );
                                     return; // 客户端断连：提前退出
                                 }
@@ -1455,7 +1482,12 @@ pub async fn qoder_aggregate_chat(
                         ) {
                             Ok(w) => w,
                             Err(()) => {
-                                state.qoder_pool.note_error(&picked.uid, ErrKind::Server);
+                                // 冷却仍按 Server 处理，观测归因单列 timeout
+                                state.qoder_pool.note_error_as(
+                                    &picked.uid,
+                                    ErrKind::Server,
+                                    super::metrics::Outcome::Timeout,
+                                );
                                 break;
                             }
                         };
@@ -1531,6 +1563,12 @@ pub async fn qoder_aggregate_chat(
                                             // 冷却中直接终止轮换返回 429（upstream
                                             // 前缀借助端点状态码透传映射），不再逐账号硬打
                                             if model_cooling_remaining_secs(&model).is_some() {
+                                                // 模型冷却短路：本次尝试按限流归因
+                                                state.metrics.record_attempt(
+                                                    "qoder",
+                                                    &win_uid,
+                                                    super::metrics::Outcome::RateLimited,
+                                                );
                                                 state.record_usage_qoder(
                                                     &model, &win_uid, &key_id, false, stream,
                                                     duration_ms, 0, 0, None, None, None,
@@ -1557,6 +1595,12 @@ pub async fn qoder_aggregate_chat(
                                             );
                                             continue;
                                         }
+                                        // 排队超限/对冲接管：无 note_error 通道，补一次限流归因
+                                        state.metrics.record_attempt(
+                                            "qoder",
+                                            &win_uid,
+                                            super::metrics::Outcome::RateLimited,
+                                        );
                                         break; // 超限换号
                                     }
                                     Some(kind) => {

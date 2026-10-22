@@ -33,6 +33,31 @@ export type SpeechFlags = {
   proactive: boolean;
 };
 
+/** Edge 在线音色（P11 增补）：音质优于系统 SAPI，但需要联网 */
+export type EdgeVoiceId = 'edge-xiaoyi' | 'edge-xiaoyi-cute';
+
+export type EdgeVoice = {
+  id: EdgeVoiceId;
+  label: string;
+  hint: string;
+};
+
+/**
+ * 与 Rust `edge_voice_spec` 一一对应的音色白名单。
+ * 02 = 活泼本音（原速原调），03 = 元气少女（+6% 语速、+25Hz 音调）。
+ */
+export const EDGE_VOICES: readonly EdgeVoice[] = [
+  { id: 'edge-xiaoyi', label: '晓伊 · 活泼本音（在线）', hint: '原声，语速自然' },
+  { id: 'edge-xiaoyi-cute', label: '晓伊 · 元气少女（在线）', hint: '音调略高、语速稍快' },
+];
+
+export const DEFAULT_VOICE_ID: EdgeVoiceId = 'edge-xiaoyi-cute';
+
+/** 是否是内置的在线音色 ID（本地 voiceURI 与它互斥） */
+export function isEdgeVoiceId(id?: string | null): id is EdgeVoiceId {
+  return EDGE_VOICES.some((v) => v.id === id);
+}
+
 /**
  * 是否允许朗读某类来源。
  *

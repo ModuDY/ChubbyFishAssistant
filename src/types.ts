@@ -707,6 +707,78 @@ export interface EvolutionMetrics {
   total: { ok: number; fail: number; tokens: number };
 }
 
+// ---- 自我进化 P1.5：观测 2.0（窗口聚合 + 账号维度 + 错误归因）----
+/** 单个序列（池汇总或账号）在一个窗口内的指标 */
+export interface EvolutionSeriesMetrics {
+  requests: number;
+  ok: number;
+  /** 成功率 0~1（三位小数）；分母不含 localAbort；分母为 0 时为 null */
+  successRate: number | null;
+  errors: {
+    upstream5xx: number;
+    timeout: number;
+    rateLimited: number;
+    auth: number;
+    /** 客户端断连/取消：不计入成功率 */
+    localAbort: number;
+  };
+  /** 首字耗时分位（ms）；无样本为 null */
+  ttftP50: number | null;
+  ttftP95: number | null;
+  /** 总耗时分位（ms）；无样本为 null */
+  durP50: number | null;
+  durP95: number | null;
+  tokens: number;
+  /** 对冲触发次数 / 对冲接管胜出次数 */
+  hedgeFired: number;
+  hedgeWon: number;
+  /** 对冲胜率 0~1；未触发为 null */
+  hedgeWinRate: number | null;
+}
+
+/** 池汇总序列：accounts 为账号 uid → 指标 */
+export interface EvolutionPoolSeries extends EvolutionSeriesMetrics {
+  accounts?: Record<string, EvolutionSeriesMetrics>;
+}
+
+/** 一个时间窗口（5m / 1h）的池指标 */
+export interface EvolutionWindowMetrics {
+  windowMinutes: number;
+  pools: Record<string, EvolutionPoolSeries>;
+}
+
+/** 观测 2.0 快照：网关未运行时 windows 为空池 */
+export interface EvolutionMetricsV2 {
+  running: boolean;
+  windows: {
+    '5m': EvolutionWindowMetrics;
+    '1h': EvolutionWindowMetrics;
+  };
+}
+
+/** 进化历史条目（P2 影子模式；P1.5 恒为空） */
+export interface EvolutionHistoryItem {
+  id: number;
+  ts: number;
+  pool: string;
+  param: string;
+  old: number | string | null;
+  new: number | string | null;
+  ruleId: string;
+  samples: number;
+  snapshotJson: string;
+  applied: boolean;
+  shadow: boolean;
+  rollbackAt: number | null;
+  rollbackReason: string | null;
+}
+
+/** 进化历史：P1.5 返回 enabled=false 与空列表 */
+export interface EvolutionHistory {
+  enabled: boolean;
+  items: EvolutionHistoryItem[];
+}
+
 // ---- 统一网关（unified-api-gateway-design §3.1/§8.1）----
 /** 统一模型目录来源池标记（enabled 为运行时派生，不落盘） */
 export interface UnifiedModelSource {

@@ -90,6 +90,8 @@ pub async fn start_api_server(
     })?;
 
     let app = build_router(state.clone());
+    // 观测 2.0：重启后回填最近 60 分钟，避免「刚启动没有基线」
+    state.restore_evolution_metrics();
     spawn_wb_health_probe(state.clone());
     spawn_persistence_flusher(state.clone());
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -118,13 +120,21 @@ fn spawn_persistence_flusher(state: Arc<ApiSharedState>) {
     drop(state);
     let _ = std::thread::Builder::new()
         .name("api-persist-flush".into())
-        .spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            let Some(state) = weak.upgrade() else {
-                return; // ApiSharedState 已释放（服务停止且运行时句柄移除）
-            };
-            state.flush_usage_dirty();
-            crate::api_server::api_keys::flush_dirty(&state.data_dir);
+        .spawn(move || {
+            let mut ticks: u64 = 0;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let Some(state) = weak.upgrade() else {
+                    return; // ApiSharedState 已释放（服务停止且运行时句柄移除）
+                };
+                state.flush_usage_dirty();
+                crate::api_server::api_keys::flush_dirty(&state.data_dir);
+                // 观测 2.0：每 60s 落一次已闭合的分钟桶（单次 ≤ 账号数行）
+                ticks += 1;
+                if ticks % 30 == 0 {
+                    state.flush_evolution_metrics(false);
+                }
+            }
         });
 }
 

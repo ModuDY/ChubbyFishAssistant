@@ -290,7 +290,8 @@ pub async fn custom_aggregate_chat(
             Ok(l) => l,
             Err(()) => {
                 let duration_ms = start_ts.elapsed().as_millis() as u64;
-                state.record_usage_custom(&model, &key_id, false, stream, duration_ms, 0, 0);
+                // 首字超时单列 timeout 归因，不落成通用上游错误
+                state.record_usage_custom_timeout(&model, &key_id, stream, duration_ms);
                 state.logger.log_request(
                     "custom", "POST", proto.log_path(), &model, stream, 504, "custom",
                     duration_ms, &key_name, &acct_name, Some("first byte timeout"),

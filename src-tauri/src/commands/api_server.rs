@@ -577,6 +577,21 @@ pub async fn do_start(
         doubao_quota: crate::api_server::doubao_route::DoubaoQuota::new(),
     });
 
+    // 自我进化 L1.5：给各池装配观测归因上下文（note_error 的 ErrKind 回写
+    // 观测层，池标签用于快照分组；标签与 metrics.record 调用点保持一致）
+    shared
+        .pool
+        .set_metrics_ctx("trae", shared.metrics.clone());
+    shared
+        .wb_pool
+        .set_metrics_ctx("wb", shared.metrics.clone());
+    shared
+        .qoder_pool
+        .set_metrics_ctx("qoder", shared.metrics.clone());
+    shared
+        .doubao_pool
+        .set_metrics_ctx("doubao", shared.metrics.clone());
+
     // per-pool 三参数热应用（F-76②/F-77 拆分版）：账号并发上限 / 池粘性 TTL /
     // 显式会话粘性 TTL 三池各自配置，启动时从 api_pool.json 读入
     shared

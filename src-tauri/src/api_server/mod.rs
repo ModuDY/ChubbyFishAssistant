@@ -137,9 +137,9 @@ pub struct ApiSharedState {
     pub activity_tx: Option<ActivityEmitter>,
     /// 累计 token（prompt+completion，仅在记账咽喉点累加）：milestone 事件阈值判定（§6.5）
     pub activity_tokens: AtomicU64,
-    /// 观测层（自我进化 P1）：按池累计成功/失败/耗时/token，只读快照给设置页，
-    /// 不参与任何路由决策（见 docs/pending/自我进化方案.md）
-    pub metrics: metrics::Metrics,
+    /// 观测层（自我进化 L1.5 观测 2.0）：按 (pool, uid) 维护分钟环，
+    /// 只读快照给设置页；不参与任何路由决策。Arc 便于注入各账号池做错误归因
+    pub metrics: Arc<metrics::Metrics>,
     pub active_uid: Mutex<Option<String>>,
     pub last_error: Mutex<Option<String>>,
     pub logger: ApiLogger,
@@ -326,13 +326,66 @@ impl ApiSharedState {
         completion_tokens: u64,
         ttfb_ms: Option<u64>,
     ) {
-        // 自我进化 P1：观测层采样（纯累加，不参与任何路由决策）
-        self.metrics.record(
-            if is_wb { "wb" } else { "trae" },
-            ok,
-            duration_ms,
-            prompt_tokens + completion_tokens,
+        let outcome = if ok {
+            metrics::Outcome::Ok
+        } else {
+            metrics::Outcome::Upstream5xx
+        };
+        self.record_usage_ttfb_outcome(
+            is_wb, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
+            completion_tokens, ttfb_ms, outcome,
         );
+    }
+
+    /// 客户端断连 / 用户取消的终局记账：用量口径与失败请求一致，但观测归因
+    /// 记为 `local_abort`——不计入成功率与后续权重（方案 §5.2）
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_usage_client_abort(
+        &self,
+        is_wb: bool,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        is_stream: bool,
+        duration_ms: u64,
+    ) {
+        self.record_usage_ttfb_outcome(
+            is_wb, model, uid, key_id, false, is_stream, duration_ms, 0, 0, None,
+            metrics::Outcome::LocalAbort,
+        );
+    }
+
+    /// 请求记账唯一落点：用量统计 + 观测层（归因由调用方给定）
+    #[allow(clippy::too_many_arguments)]
+    fn record_usage_ttfb_outcome(
+        &self,
+        is_wb: bool,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        ttfb_ms: Option<u64>,
+        outcome: metrics::Outcome,
+    ) {
+        // 自我进化 L1.5：终局只记成功 / 客户端中断；失败已由 pool.note_error
+        // 在尝试级落账（精确归因），这里再记会让同一尝试双计
+        if matches!(
+            outcome,
+            metrics::Outcome::Ok | metrics::Outcome::LocalAbort
+        ) {
+            self.metrics.record(
+                if is_wb { "wb" } else { "trae" },
+                uid,
+                outcome,
+                ttfb_ms,
+                duration_ms,
+                prompt_tokens + completion_tokens,
+            );
+        }
         let mut guard = self
             .usage
             .lock()
@@ -365,8 +418,51 @@ impl ApiSharedState {
         prompt_tokens: u64,
         completion_tokens: u64,
     ) {
-        self.metrics
-            .record("custom", ok, duration_ms, prompt_tokens + completion_tokens);
+        let outcome = if ok {
+            metrics::Outcome::Ok
+        } else {
+            metrics::Outcome::Upstream5xx
+        };
+        self.record_usage_custom_outcome(
+            model, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens, outcome,
+        );
+    }
+
+    /// 自定义模型首字超时：用量按失败计，观测归因记 `timeout`。
+    /// custom 没有账号池/`note_error` 入口，终局即归因。
+    pub fn record_usage_custom_timeout(
+        &self,
+        model: &str,
+        key_id: &str,
+        is_stream: bool,
+        duration_ms: u64,
+    ) {
+        self.record_usage_custom_outcome(
+            model, key_id, false, is_stream, duration_ms, 0, 0,
+            metrics::Outcome::Timeout,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_usage_custom_outcome(
+        &self,
+        model: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        outcome: metrics::Outcome,
+    ) {
+        self.metrics.record(
+            "custom",
+            "custom",
+            outcome,
+            None,
+            duration_ms,
+            prompt_tokens + completion_tokens,
+        );
         let mut guard = self
             .usage
             .lock()
@@ -400,8 +496,59 @@ impl ApiSharedState {
         completion_tokens: u64,
         ttfb_ms: Option<u64>,
     ) {
-        self.metrics
-            .record("doubao", ok, duration_ms, prompt_tokens + completion_tokens);
+        let outcome = if ok {
+            metrics::Outcome::Ok
+        } else {
+            metrics::Outcome::Upstream5xx
+        };
+        self.record_usage_doubao_outcome(
+            model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
+            completion_tokens, ttfb_ms, outcome,
+        );
+    }
+
+    /// 豆包客户端断连终局记账：用量口径同失败请求，观测归因 local_abort
+    pub fn record_usage_doubao_abort(
+        &self,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        is_stream: bool,
+        duration_ms: u64,
+    ) {
+        self.record_usage_doubao_outcome(
+            model, uid, key_id, false, is_stream, duration_ms, 0, 0, None,
+            metrics::Outcome::LocalAbort,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_usage_doubao_outcome(
+        &self,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        ttfb_ms: Option<u64>,
+        outcome: metrics::Outcome,
+    ) {
+        if matches!(
+            outcome,
+            metrics::Outcome::Ok | metrics::Outcome::LocalAbort
+        ) {
+            self.metrics.record(
+                "doubao",
+                uid,
+                outcome,
+                ttfb_ms,
+                duration_ms,
+                prompt_tokens + completion_tokens,
+            );
+        }
         let day = usage::today_key();
         let mut guard = self
             .usage
@@ -467,8 +614,63 @@ impl ApiSharedState {
         original_credits: Option<f64>,
         session: &usage::QoderSessionCtx,
     ) {
-        self.metrics
-            .record("qoder", ok, duration_ms, prompt_tokens + completion_tokens);
+        let outcome = if ok {
+            metrics::Outcome::Ok
+        } else {
+            metrics::Outcome::Upstream5xx
+        };
+        self.record_usage_qoder_outcome(
+            model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
+            completion_tokens, ttfb_ms, credits, original_credits, session, outcome,
+        );
+    }
+
+    /// Qoder 客户端断连终局记账：用量/流水口径同失败请求，观测归因 local_abort
+    pub fn record_usage_qoder_abort(
+        &self,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        is_stream: bool,
+        duration_ms: u64,
+        session: &usage::QoderSessionCtx,
+    ) {
+        self.record_usage_qoder_outcome(
+            model, uid, key_id, false, is_stream, duration_ms, 0, 0, None, None, None,
+            session, metrics::Outcome::LocalAbort,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_usage_qoder_outcome(
+        &self,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        ttfb_ms: Option<u64>,
+        credits: Option<f64>,
+        original_credits: Option<f64>,
+        session: &usage::QoderSessionCtx,
+        outcome: metrics::Outcome,
+    ) {
+        if matches!(
+            outcome,
+            metrics::Outcome::Ok | metrics::Outcome::LocalAbort
+        ) {
+            self.metrics.record(
+                "qoder",
+                uid,
+                outcome,
+                ttfb_ms,
+                duration_ms,
+                prompt_tokens + completion_tokens,
+            );
+        }
         let day = usage::today_key();
         let mut guard = self
             .usage
@@ -550,10 +752,56 @@ impl ApiSharedState {
         }
     }
 
+    /// 观测 2.0 分钟落盘（flusher 每 60s 一次 + stop 时 include_current）：
+    /// 只写「已闭合的分钟」，主键幂等；失败只记日志，不阻断网关
+    pub fn flush_evolution_metrics(&self, include_current: bool) {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let now_min = now_secs / 60;
+        let after = self.metrics.flushed_minute();
+        // 开区间 (after, before)：默认只写 now_min 之前已闭合的桶
+        let before = if include_current { now_min + 1 } else { now_min.max(after + 1) };
+        if before <= after + 1 {
+            return;
+        }
+        let rows = self.metrics.rows_to_persist(after, before);
+        if rows.is_empty() {
+            self.metrics.mark_flushed(before - 1);
+            return;
+        }
+        let db = crate::store::db(&self.data_dir);
+        match crate::store::docs::evolution_metrics_upsert(&db, &rows) {
+            Ok(()) => self.metrics.mark_flushed(before - 1),
+            Err(e) => self
+                .logger
+                .log_debug_line(format!("[WARN] 观测指标落盘失败（下轮重试）: {e}")),
+        }
+    }
+
+    /// 启动回填：最近 60 分钟的持久化行合并回环形缓冲 + 清理 7 天前数据
+    pub fn restore_evolution_metrics(&self) {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let db = crate::store::db(&self.data_dir);
+        let since = (now_secs / 60 - metrics::WINDOW_BUCKETS as i64) * 60;
+        match crate::store::docs::evolution_metrics_load_since(&db, since) {
+            Ok(rows) => self.metrics.restore_rows(&rows),
+            Err(e) => self
+                .logger
+                .log_debug_line(format!("[WARN] 观测指标回填失败: {e}")),
+        }
+        let _ = crate::store::docs::evolution_metrics_prune(&db, metrics::RETENTION_DAYS);
+    }
+
     /// 全量持久化收尾（服务 stop / 应用退出时调用）：
     /// 用量脏队列 + api_keys 计数 + API 日志队列一次性排空
     pub fn flush_pending_writes(&self) {
         self.flush_usage_dirty();
+        self.flush_evolution_metrics(true);
         api_keys::flush_dirty(&self.data_dir);
         self.logger.flush();
     }
