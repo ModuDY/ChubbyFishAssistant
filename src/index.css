@@ -195,9 +195,20 @@ html.dark a:focus-visible {
    ============================================================================ */
 
 :root {
-  /* JS 会覆盖这两个值（src/lib/appearance.ts），这里是缺省兜底 */
+  /* JS 会把下面这些写进 <html> 的行内样式（src/lib/appearance.ts），
+     这里只是首帧兜底：行内样式优先级更高，一旦写入即覆盖。 */
   --wp-blur: 10px;
   --wp-alpha: 0.72;
+  --wp-blur-titlebar: 10px;
+  --wp-alpha-titlebar: 0.72;
+  --wp-blur-topbar: 10px;
+  --wp-alpha-topbar: 0.72;
+  --wp-blur-sidebar: 10px;
+  --wp-alpha-sidebar: 0.72;
+  --wp-blur-card: 10px;
+  --wp-alpha-card: 0.66;
+  --wp-px-wallpaper: 1.2;
+  --wp-px-ui: 0.5;
 }
 
 /* ---------- 壁纸层 ---------- */
@@ -208,7 +219,9 @@ html.dark a:focus-visible {
   z-index: -2;
   overflow: hidden;
   pointer-events: none;
-  contain: strict;
+  /* 不用 `contain: strict`：它含 size containment，而 WebGL 库要量容器的真实尺寸 ——
+     尺寸被"隔离"掉时引擎拿到的可能是 0，装配直接失败。只做布局与绘制的隔离。 */
+  contain: layout paint;
 }
 
 /* 深色底：比"看着舒服"的一档再亮约 40%。
@@ -289,6 +302,65 @@ html:not(.dark)[data-wallpaper='on'] .wp-bubble {
 
 html:not(.dark)[data-wallpaper='on'] .wp-dust {
   background: rgba(74, 126, 176, 0.6);
+}
+
+/* ---------- 真实 WE 壁纸（webwallgl 渲染） ---------- */
+
+.wp-we,
+.wp-layer-scene {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+/* 引擎会往宿主里塞一个 canvas；铺满并裁剪 */
+.wp-we > canvas,
+.wp-we-host canvas {
+  position: absolute;
+  inset: 0;
+  width: 100% !important;
+  height: 100% !important;
+  display: block;
+}
+
+.wp-we-slot,
+.wp-we-host {
+  position: absolute;
+  inset: 0;
+}
+
+.wp-we-host {
+  opacity: 0;
+  transition: opacity 520ms ease;
+}
+
+.wp-we-host--ready {
+  opacity: 1;
+}
+
+.wp-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0.92;
+}
+
+/* ---------- 点击 / 拖尾光效画布 ---------- */
+
+.fx-canvas {
+  position: fixed;
+  inset: 0;
+  z-index: 45;
+  pointer-events: none;
+  /* 混合模式让光效"加"在界面上而不是盖住它 */
+  mix-blend-mode: screen;
+}
+
+html:not(.dark) .fx-canvas {
+  /* 浅色底上 screen 会把白色冲成一片死白，改用 normal + 低透明度由 JS 控制 */
+  mix-blend-mode: normal;
 }
 
 /* 顶底压暗：保证任何壁纸上前景文字都有对比度 */
@@ -551,51 +623,49 @@ html[data-wallpaper='on'] .app-shell {
   background-color: transparent;
 }
 
-/* 玻璃面·模糊组：只有三个结构性大面板吃 backdrop-filter。
-   为什么卡片不吃：`backdrop-filter` 在背景**变化时**要重算模糊，而壁纸是持续动的
-   （气泡上浮、鲸鱼漂浮）。一张页面十来张卡片各自重算，等于把最贵的一档逐帧跑十遍；
-   而卡片底下本来就是柔和的渐变，模糊与否肉眼几乎无差。 */
-html[data-wallpaper='on'] .app-titlebar,
-html[data-wallpaper='on'] .app-topbar,
+/* 玻璃面·分面变量 -----------------------------------------------------------
+   每个面读自己的 `--wp-blur-<面>` / `--wp-alpha-<面>`（由 appearance.ts 按
+   "跟随全局 / 独立配置" 解析后写进 <html> 的行内样式）。这样四个面可以各调各的，
+   而不是全局一刀切。
+   `glass=off` 不需要单独兜底：那一档解析出来就是 blur=0 + alpha=1，天然是实心面板。 */
+html[data-wallpaper='on'] .app-titlebar {
+  background-color: rgba(255, 255, 255, var(--wp-alpha-titlebar));
+  -webkit-backdrop-filter: blur(var(--wp-blur-titlebar)) saturate(1.35);
+  backdrop-filter: blur(var(--wp-blur-titlebar)) saturate(1.35);
+}
+
+html[data-wallpaper='on'] .app-topbar {
+  background-color: rgba(255, 255, 255, var(--wp-alpha-topbar));
+  -webkit-backdrop-filter: blur(var(--wp-blur-topbar)) saturate(1.35);
+  backdrop-filter: blur(var(--wp-blur-topbar)) saturate(1.35);
+}
+
 html[data-wallpaper='on'] .app-sidebar {
-  background-color: rgba(255, 255, 255, var(--wp-alpha));
-  -webkit-backdrop-filter: blur(var(--wp-blur)) saturate(1.35);
-  backdrop-filter: blur(var(--wp-blur)) saturate(1.35);
+  background-color: rgba(255, 255, 255, var(--wp-alpha-sidebar));
+  -webkit-backdrop-filter: blur(var(--wp-blur-sidebar)) saturate(1.35);
+  backdrop-filter: blur(var(--wp-blur-sidebar)) saturate(1.35);
 }
 
-html.dark[data-wallpaper='on'] .app-titlebar,
-html.dark[data-wallpaper='on'] .app-topbar,
-html.dark[data-wallpaper='on'] .app-sidebar {
-  background-color: rgba(11, 19, 34, var(--wp-alpha));
-}
-
-/* 玻璃面·半透组：卡片只做半透明，不加模糊。
-   浅色档刻意比深色更透一档：白卡叠在浅蓝壁纸上，0.76 的不透明度足够把壁纸压成
-   "界面有点发蓝"，卡片底下的鲸鱼会完全消失。0.66 仍能把 slate-600 的正文衬在
-   7:1 以上对比度，但壁纸的形体读得出来。 */
+/* 卡片只做半透明、不加模糊：`backdrop-filter` 在背景变化时要重算模糊，而壁纸是
+   持续动的；一页十来张卡片各自重算等于把最贵的一档逐帧跑十遍，肉眼几乎无差。 */
 html[data-wallpaper='on'] .card {
-  background-color: rgba(255, 255, 255, calc(var(--wp-alpha) * 0.92));
+  background-color: rgba(255, 255, 255, var(--wp-alpha-card));
+}
+
+html.dark[data-wallpaper='on'] .app-titlebar {
+  background-color: rgba(11, 19, 34, var(--wp-alpha-titlebar));
+}
+
+html.dark[data-wallpaper='on'] .app-topbar {
+  background-color: rgba(11, 19, 34, var(--wp-alpha-topbar));
+}
+
+html.dark[data-wallpaper='on'] .app-sidebar {
+  background-color: rgba(11, 19, 34, var(--wp-alpha-sidebar));
 }
 
 html.dark[data-wallpaper='on'] .card {
-  background-color: rgba(13, 22, 38, calc(var(--wp-alpha) * 0.98));
-}
-
-/* glass=off：明确退回实心面板（不是"不写"，是写回不透明 + 去掉模糊） */
-html[data-wallpaper='on'][data-glass='off'] .app-titlebar,
-html[data-wallpaper='on'][data-glass='off'] .app-topbar,
-html[data-wallpaper='on'][data-glass='off'] .app-sidebar,
-html[data-wallpaper='on'][data-glass='off'] .card {
-  background-color: rgb(255 255 255);
-  -webkit-backdrop-filter: none;
-  backdrop-filter: none;
-}
-
-html.dark[data-wallpaper='on'][data-glass='off'] .app-titlebar,
-html.dark[data-wallpaper='on'][data-glass='off'] .app-topbar,
-html.dark[data-wallpaper='on'][data-glass='off'] .app-sidebar,
-html.dark[data-wallpaper='on'][data-glass='off'] .card {
-  background-color: rgb(9 9 11);
+  background-color: rgba(13, 22, 38, var(--wp-alpha-card));
 }
 
 /* 内容区轻纱：壁纸之上压一层淡色，正文直接落在壁纸上时也能读。
@@ -618,6 +688,64 @@ html.dark[data-wallpaper='on'] .app-content {
     rgba(8, 14, 26, 0.2) 40%,
     rgba(8, 14, 26, 0.1) 100%
   );
+}
+
+/* 真实 WE 壁纸：画面是照片/3D 场景，明暗与细节都比内置渐变复杂得多 ——
+   同一套遮罩压不住，正文会糊在枪械纹理上（实测）。所以单独加强一档：
+   遮罩更实、面板更不透、画布自身略压暗并去一点饱和，保证字仍然读得清。 */
+html[data-wkind='we'][data-wallpaper='on'] .app-content {
+  background-image: linear-gradient(
+    180deg,
+    rgba(248, 250, 252, 0.6) 0%,
+    rgba(248, 250, 252, 0.44) 45%,
+    rgba(248, 250, 252, 0.32) 100%
+  );
+}
+
+html.dark[data-wkind='we'][data-wallpaper='on'] .app-content {
+  background-image: linear-gradient(
+    180deg,
+    rgba(8, 14, 26, 0.6) 0%,
+    rgba(8, 14, 26, 0.46) 45%,
+    rgba(8, 14, 26, 0.34) 100%
+  );
+}
+
+.wp-layer[data-kind='we'] .wp-we {
+  opacity: 0.94;
+  filter: saturate(0.92);
+}
+
+html[data-wkind='we'][data-wallpaper='on'] .app-titlebar {
+  background-color: rgba(255, 255, 255, calc(var(--wp-alpha-titlebar) * 1.12));
+}
+
+html[data-wkind='we'][data-wallpaper='on'] .app-topbar {
+  background-color: rgba(255, 255, 255, calc(var(--wp-alpha-topbar) * 1.12));
+}
+
+html[data-wkind='we'][data-wallpaper='on'] .app-sidebar {
+  background-color: rgba(255, 255, 255, calc(var(--wp-alpha-sidebar) * 1.12));
+}
+
+html[data-wkind='we'][data-wallpaper='on'] .card {
+  background-color: rgba(255, 255, 255, calc(var(--wp-alpha-card) * 1.25));
+}
+
+html.dark[data-wkind='we'][data-wallpaper='on'] .app-titlebar {
+  background-color: rgba(11, 19, 34, calc(var(--wp-alpha-titlebar) * 1.12));
+}
+
+html.dark[data-wkind='we'][data-wallpaper='on'] .app-topbar {
+  background-color: rgba(11, 19, 34, calc(var(--wp-alpha-topbar) * 1.12));
+}
+
+html.dark[data-wkind='we'][data-wallpaper='on'] .app-sidebar {
+  background-color: rgba(11, 19, 34, calc(var(--wp-alpha-sidebar) * 1.12));
+}
+
+html.dark[data-wkind='we'][data-wallpaper='on'] .card {
+  background-color: rgba(13, 22, 38, calc(var(--wp-alpha-card) * 1.25));
 }
 
 /* ---------- 进应用动画 ---------- */

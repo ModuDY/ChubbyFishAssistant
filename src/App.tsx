@@ -6,6 +6,7 @@ import Toaster from './components/Toaster';
 import StorageHealthBanner from './components/StorageHealthBanner';
 import WallpaperLayer from './components/WallpaperLayer';
 import EntrySplash from './components/EntrySplash';
+import EffectsHost from './components/EffectsHost';
 import { useAppStore } from './store';
 import { resolveTheme } from './lib/themes';
 import Dashboard from './pages/Dashboard';
@@ -155,6 +156,7 @@ export default function App() {
     <>
       <WallpaperLayer />
       {shell}
+      <EffectsHost />
       <EntrySplash ready={ready} />
     </>
   );

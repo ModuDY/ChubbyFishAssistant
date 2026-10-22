@@ -1,20 +1,25 @@
 /**
- * 壁纸层：常驻在应用最底层的一张「场景」。
+ * 壁纸层：常驻在应用最底层的一张"场景"。
+ *
+ * 两种来源：
+ * - `kind === 'css'`：内置场景（纯 CSS + 内联 SVG，零素材、零依赖）
+ * - `kind === 'we'`：本机 Wallpaper Engine 工程，交给 webwallgl 实时渲染
  *
  * 设计约束（都来自本项目既有约定）：
  * 1. **不占布局**：`position: fixed; inset: 0; z-index: -2`，不走 flex 流，
  *    所以 App 的骨架（TitleBar / Sidebar / TopBar / main）一行都不用改。
  * 2. **不吃事件**：`pointer-events: none`，滚轮、拖拽、右键全部穿透到下层的真实 UI。
- * 3. **只在需要时存在**：壁纸关闭时整层不挂载，DOM 零成本，观感与改造前完全一致。
- * 4. **省电优先**：所有动效只用 `transform` / `opacity`（合成器属性，不触发布局与重绘）；
- *    不做 `filter: blur()` 的全屏逐帧动画（那是最贵的一档）；`prefers-reduced-motion`
- *    下全部静止。
- * 5. **零图片资源**：场景与鲸鱼全部用 CSS 渐变 + 内联 SVG 画，不新增任何二进制文件，
- *    不牵动 `scripts/gen_asset_base64.mjs` 的素材基线。
+ * 3. **只在需要时存在**：壁纸关闭时整层不挂载，DOM 零成本。
+ * 4. **失败必回落**：WE 场景渲染不出来时立刻退回内置场景，绝不留空白。
+ * 5. **零图片资源**（内置场景）：场景与鲸鱼全部用 CSS 渐变 + 内联 SVG 画。
  */
 
+import { useEffect, useMemo, useState } from 'react';
 import { useAppearance } from '../lib/appearance';
 import type { SceneId } from '../lib/appearance';
+import { useWeLibrary } from '../lib/useWeLibrary';
+import { weVideoUrl } from '../lib/we';
+import SceneWallpaper from './SceneWallpaper';
 
 /** 气泡参数表：写死而不用 Math.random —— 渲染必须确定性，否则每次重挂载都跳一次 */
 const BUBBLES: ReadonlyArray<{ x: number; size: number; delay: number; dur: number }> = [
@@ -35,12 +40,7 @@ const BUBBLES: ReadonlyArray<{ x: number; size: number; delay: number; dur: numb
 /** 大肥鱼：蓝鲸造型的吉祥物剪影（纯 SVG，无水印无字样） */
 function Whale() {
   return (
-    <svg
-      className="wp-whale"
-      viewBox="0 0 260 160"
-      aria-hidden
-      focusable="false"
-    >
+    <svg className="wp-whale" viewBox="0 0 260 160" aria-hidden focusable="false">
       <defs>
         <linearGradient id="wp-whale-body" x1="0" y1="0" x2="0.35" y2="1">
           <stop offset="0%" stopColor="#5ea8ff" />
@@ -99,7 +99,7 @@ function Whale() {
   );
 }
 
-function SceneArt({ scene }: { scene: SceneId }) {
+function CssSceneArt({ scene }: { scene: SceneId }) {
   if (scene === 'aurora') {
     return (
       <div className="wp-aurora-wrap" aria-hidden>
@@ -128,7 +128,6 @@ function SceneArt({ scene }: { scene: SceneId }) {
       </div>
     );
   }
-  // deep-sea（默认）
   return (
     <>
       <div className="wp-rays" aria-hidden>
@@ -157,15 +156,75 @@ function SceneArt({ scene }: { scene: SceneId }) {
 }
 
 export default function WallpaperLayer() {
-  const { wallpaper, scene } = useAppearance();
+  const { wallpaper, kind, scene, weId } = useAppearance();
+  const lib = useWeLibrary(wallpaper && kind === 'we');
+  const [failed, setFailed] = useState<string | null>(null);
+  const [videoUrl, setVideoUrl] = useState<string | null>(null);
+
+  const target = useMemo(
+    () => lib.data?.items.find((w) => w.id === weId) ?? null,
+    [lib.data, weId],
+  );
+
+  // 换壁纸时清掉上一张的失败记忆，否则一次失败会让这张永远回退
+  useEffect(() => {
+    setFailed(null);
+  }, [weId]);
+
+  // 视频类壁纸：读整段 mp4 生成 blob URL
+  useEffect(() => {
+    let alive = true;
+    setVideoUrl(null);
+    if (kind === 'we' && target?.kind === 'video' && !failed) {
+      void weVideoUrl(target).then((url) => {
+        if (alive) setVideoUrl(url);
+      });
+    }
+    return () => {
+      alive = false;
+    };
+  }, [kind, target, failed]);
+
   if (!wallpaper) return null;
+
+  const usingWe = kind === 'we' && target && !failed;
+  const weScene = usingWe && target.kind === 'scene';
+  const weVideo = usingWe && target.kind === 'video' && videoUrl;
+  const cssFallback = !weScene && !weVideo;
+
   return (
-    <div className="wp-layer" data-scene={scene} aria-hidden>
-      {/* 底色：所有场景共用，随主题（data-theme）换色相 */}
+    <div
+      className="wp-layer"
+      data-kind={weScene ? 'we' : cssFallback ? 'css' : 'we-video'}
+      data-scene={scene}
+      aria-hidden
+    >
+      {/* 底色：所有来源共用，保证首帧前不是白板 */}
       <div className="wp-base" />
-      <SceneArt scene={scene} />
-      {/* 顶/底压暗，保证前景文字在任何壁纸上都有对比度 */}
-      <div className="wp-vignette" />
+      {weScene && (
+        <div className="wp-we">
+          <SceneWallpaper
+            wallpaper={target}
+            onFail={(reason) => {
+              // 只在调试信息里留一句，不弹窗打扰
+              console.warn('[wallpaper] WE 场景渲染失败，回退内置场景：', reason);
+              setFailed(reason);
+            }}
+          />
+        </div>
+      )}
+      {weVideo && (
+        <video className="wp-video" src={videoUrl} autoPlay muted loop playsInline />
+      )}
+      {cssFallback && (
+        <>
+          <div className="wp-layer-scene" data-scene={scene}>
+            <CssSceneArt scene={scene} />
+          </div>
+          <div className="wp-vignette" />
+        </>
+      )}
+      {!cssFallback && <div className="wp-vignette" />}
     </div>
   );
 }
