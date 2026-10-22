@@ -778,7 +778,9 @@ html.dark[data-wkind='we'][data-wallpaper='on'] .card {
 }
 
 .entry-splash--leaving {
-  animation: entry-fade-out 0.44s cubic-bezier(0.4, 0, 1, 1) both;
+  /* 时长须与 EntrySplash.tsx 的 LEAVE_MS 一致：视频形态按"时长 − LEAVE_MS"提前退场，
+     让淡出和视频回到开头重叠，避免最后一帧突然跳回第一帧 */
+  animation: entry-fade-out 0.62s cubic-bezier(0.4, 0, 1, 1) both;
   pointer-events: none;
 }
 

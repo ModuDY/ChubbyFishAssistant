@@ -24,13 +24,19 @@ import { APP_NAME } from '../lib/about';
 /** 最短展示时长：低于动画自身时长（约 0.62s + 0.56s 延迟）会看到"闪一下" */
 const MIN_VISIBLE_MS = 900;
 /** 淡出时长，须与 index.css 的 entry-fade-out 一致 */
-const LEAVE_MS = 440;
+const LEAVE_MS = 620;
 /**
  * 最长展示时长：初始化卡住（网络、磁盘、后端超时）时必须让路。
  * 否则用户盯着的是一段循环动画，看不到下面的「正在加载…」、错误原因与重试按钮 ——
  * 装饰不该挡住诊断信息。
  */
 const MAX_VISIBLE_MS = 4000;
+/**
+ * 视频形态的最长展示：按视频时长走，但封顶 10 秒。
+ * 壁纸视频可能是几分钟的循环素材，照它播完等于把启动卡死；10 秒足够覆盖
+ * 常见的"入场动画"型视频（本机那条 DeepSeek 的是 7 秒）。
+ */
+const MAX_VIDEO_BOOT_MS = 10_000;
 
 function prefersReducedMotion(): boolean {
   if (typeof window === 'undefined' || !window.matchMedia) return false;
@@ -54,6 +60,9 @@ export default function EntrySplash({ ready }: { ready: boolean }) {
   // ready 可能在首次渲染之前就已为 true（本地缓存命中），此时仍要凑满最短时长
   const readyRef = useRef(ready);
   readyRef.current = ready;
+  // effect 里要读最新的形态（壁纸库晚一点扫完会切到视频形态），用 ref 传出去
+  const overVideoRef = useRef(overVideo);
+  overVideoRef.current = overVideo;
 
   // 组件挂载时就记时，避免 StrictMode 双调用时用 effect 里的新时间戳
   useEffect(() => {
@@ -85,17 +94,32 @@ export default function EntrySplash({ ready }: { ready: boolean }) {
       }, LEAVE_MS);
     };
 
+    /**
+     * 本次开屏要展示多久。
+     * - 非视频形态：原来的 900ms。
+     * - 视频形态：**按视频时长**（提前一个淡出时长开始退场，让淡出与视频回到开头重叠，
+     *   否则会在最后一帧突然跳回第一帧），下限 900ms、上限 10s。
+     *   视频还没解出时长（readyState < 1）时退回 900ms，绝不干等一个未知值。
+     */
+    const targetMs = () => {
+      if (!overVideoRef.current) return MIN_VISIBLE_MS;
+      const v = document.querySelector<HTMLVideoElement>('video.wp-video');
+      const d = v?.duration;
+      if (!v || !d || !Number.isFinite(d) || v.readyState < 1) return MIN_VISIBLE_MS;
+      return Math.min(Math.max(d * 1000 - LEAVE_MS, MIN_VISIBLE_MS), MAX_VIDEO_BOOT_MS);
+    };
+
     const tick = () => {
       if (stopped) return;
       const elapsed = Date.now() - mountedAt.current;
-      // 就绪且凑满最短时长 → 走；或者已经超过上限（初始化卡住）→ 也必须让路
-      if ((readyRef.current && elapsed >= MIN_VISIBLE_MS) || elapsed >= MAX_VISIBLE_MS) {
+      const target = targetMs();
+      // 未就绪时最多等 MAX_VISIBLE_MS：必须让用户看见「正在加载 / 初始化失败」
+      const hardCap = readyRef.current ? Math.max(target, MAX_VIDEO_BOOT_MS) : MAX_VISIBLE_MS;
+      if ((readyRef.current && elapsed >= target) || elapsed >= hardCap) {
         finish();
         return;
       }
-      // 未就绪 → 继续等；已就绪但不足最短时长 → 补足剩余时间
-      const wait = readyRef.current ? MIN_VISIBLE_MS - elapsed : 120;
-      window.setTimeout(tick, wait);
+      window.setTimeout(tick, 120);
     };
 
     tick();
