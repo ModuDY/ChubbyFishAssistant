@@ -25,7 +25,6 @@ import {
 import PageHeader from '../components/PageHeader';
 import SwitchProgressPanel from '../components/SwitchProgressPanel';
 import { Badge, EmptyState, Modal } from '../components/ui';
-import { open, save } from '@tauri-apps/plugin-dialog';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 import { withMinDelay } from '../lib/delay';
@@ -296,13 +295,9 @@ export default function Accounts() {
       const payload = await api.accounts.exportRaw();
       const content = JSON.stringify(payload, null, 2);
       const fileStamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
-      const filePath = await save({
-        defaultPath: `trae-accounts-${fileStamp}.json`,
-        filters: [{ name: 'JSON', extensions: ['json'] }],
-      });
-      if (!filePath) return;
-      await api.misc.writeTextFile(filePath, content);
-      toast('success', `已导出 ${accounts.length} 个账号到 ${filePath}`);
+      const savedPath = await api.misc.saveTextFileDialog(`trae-accounts-${fileStamp}.json`, content);
+      if (!savedPath) return;
+      toast('success', `已导出 ${accounts.length} 个账号到 ${savedPath}`);
     } catch (err) {
       toast('error', `导出失败：${String(err)}`);
     }
@@ -312,12 +307,9 @@ export default function Accounts() {
     if (importing) return;
     setImporting(true);
     try {
-      const filePath = await open({
-        multiple: false,
-        filters: [{ name: 'JSON', extensions: ['json'] }],
-      });
-      if (!filePath || typeof filePath !== 'string') return;
-      const content = await api.misc.readTextFile(filePath);
+      // 文件必须由用户在系统对话框中选择（Rust 侧弹窗并读取，不再传任意路径）
+      const content = await api.misc.readTextFileDialog();
+      if (!content) return;
       // F-46：先预览解析，再由用户勾选确认后按索引导入
       const preview = await api.accounts.importPreview(content);
       if (preview.total === 0) {

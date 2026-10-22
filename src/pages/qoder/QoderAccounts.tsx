@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type MouseEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { listen } from '@tauri-apps/api/event';
-import { save } from '@tauri-apps/plugin-dialog';
 import {
   AppWindow,
   Archive,
@@ -650,23 +649,22 @@ export default function QoderAccounts() {
       // 本地日期命名（对齐 QoderCheckin/Dashboard：toISOString 为 UTC，跨日会错一天）
       const now = new Date();
       const localDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-      // 原生另存为对话框：用户可选保存位置（对齐 Accounts.tsx 导出，替代 WebView 伪下载）
-      const filePath = await save({
-        defaultPath: `qoder_accounts_${localDate}.json`,
-        filters: [{ name: 'JSON', extensions: ['json'] }],
-      });
-      if (!filePath) {
+      // 原生另存为对话框（Rust 侧弹窗并落盘）：用户可选保存位置
+      const savedPath = await api.misc.saveTextFileDialog(
+        `qoder_accounts_${localDate}.json`,
+        JSON.stringify(data, null, 2),
+      );
+      if (!savedPath) {
         // 取消保存对话框视同关闭弹框：清空密码残留，避免下次导出被预填（审查 F2 同语义）
         setExportPwd('');
         setExportPwd2('');
         return;
       }
-      await api.misc.writeTextFile(filePath, JSON.stringify(data, null, 2));
       pushToast(
         'success',
         exportWithCreds
-          ? `账号池已导出（含凭证，已用导出密码加密；导入时需输入同一密码）：${filePath}`
-          : `账号元数据已导出（凭证不导出）：${filePath}`,
+          ? `账号池已导出（含凭证，已用导出密码加密；导入时需输入同一密码）：${savedPath}`
+          : `账号元数据已导出（凭证不导出）：${savedPath}`,
       );
       setExportOpen(false);
       setExportPwd('');

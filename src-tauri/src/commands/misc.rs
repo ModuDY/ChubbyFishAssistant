@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
+use tauri_plugin_dialog::DialogExt;
 
 use crate::jwt;
 use crate::models::{CreditRecord, DeviceMap, Settings};
@@ -1022,24 +1023,56 @@ fn check_export_path(
     Ok(())
 }
 
-#[tauri::command]
-pub fn write_text_file(state: State<AppState>, path: String, content: String) -> Result<(), String> {
+/// 导出文本文件：保存路径只能由系统「另存为」对话框产生（审查 F3）——
+/// 原 write_text_file 接受渲染层传入的任意路径，前端被攻陷即可覆盖用户任意数据文件。
+/// 返回 None = 用户取消；Some(路径) = 已写入。
+#[tauri::command(async)]
+pub fn save_text_file_dialog(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    default_name: String,
+    content: String,
+) -> Result<Option<String>, String> {
+    let picked = app
+        .dialog()
+        .file()
+        .set_title("导出文件")
+        .set_file_name(default_name)
+        .add_filter("JSON", &["json"])
+        .blocking_save_file();
+    let Some(fp) = picked else { return Ok(None) };
+    let path = fp.into_path().map_err(|e| format!("保存路径无效: {e}"))?;
     let p = std::path::PathBuf::from(&path);
     check_export_path(&p, &state.data_dir, &blocked_system_dirs())?;
-    std::fs::write(&p, content.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))
+    std::fs::write(&p, content.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))?;
+    Ok(Some(path.to_string_lossy().to_string()))
 }
 
-/// 读取允许的文本扩展名白名单（小写无点）：read_text_file 面向「导入账号/配置」
-/// 场景（前端 open 对话框过滤 JSON）。白名单防止渲染层被攻陷后读取任意敏感文件
-///（SSH 私钥/`.env` 等多为无扩展名或专用扩展名，天然不在白名单内；审查 P1-1）
+/// 读取允许的文本扩展名白名单（小写无点）：面向「导入账号/配置」场景。
+/// 兜底防误选：即使对话框过滤器被绕过，也只读取文本类文件（SSH 私钥/`.env`
+/// 等多为无扩展名或专用扩展名，天然不在白名单内）
 const ALLOWED_READ_EXTS: &[&str] = &["json", "txt", "log", "csv", "md"];
 
-/// 读取本地文本文件（配合导入账号：文件选择后由 Rust 侧读取，避免前端路径权限问题）
-#[tauri::command]
-pub fn read_text_file(path: String) -> Result<String, String> {
-    let p = std::path::PathBuf::from(&path);
+/// 读取本地文本文件（导入账号/配置）：文件必须由用户通过系统「打开」对话框
+/// 显式选择（审查 F3）——原 read_text_file 接受任意路径，前端被攻陷即可读取
+/// 同用户目录下任意 json/txt/log/csv/md 文件。返回 None = 用户取消。
+#[tauri::command(async)]
+pub fn read_text_file_dialog(app: AppHandle) -> Result<Option<String>, String> {
+    let picked = app
+        .dialog()
+        .file()
+        .set_title("选择要导入的文本文件")
+        .add_filter("JSON", &["json"])
+        .add_filter("文本", &["txt", "log", "csv", "md"])
+        .blocking_pick_file();
+    let Some(fp) = picked else { return Ok(None) };
+    let path = fp.into_path().map_err(|e| format!("读取路径无效: {e}"))?;
+    read_text_file_checked(&path).map(Some)
+}
+
+fn read_text_file_checked(path: &std::path::Path) -> Result<String, String> {
     // 扩展名白名单（大小写不敏感）：无扩展名/未知扩展名一律拒绝
-    let ext_ok = p
+    let ext_ok = path
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| ALLOWED_READ_EXTS.contains(&e.to_lowercase().as_str()))
@@ -1047,7 +1080,7 @@ pub fn read_text_file(path: String) -> Result<String, String> {
     if !ext_ok {
         return Err("仅允许读取文本类文件（json/txt/log/csv/md）".into());
     }
-    let meta = std::fs::metadata(&path).map_err(|e| format!("读取文件失败: {e}"))?;
+    let meta = std::fs::metadata(path).map_err(|e| format!("读取文件失败: {e}"))?;
     if !meta.is_file() {
         return Err("路径不是常规文件".into());
     }
@@ -1055,8 +1088,7 @@ pub fn read_text_file(path: String) -> Result<String, String> {
     if meta.len() > 10 * 1024 * 1024 {
         return Err("文件过大（超过 10MB），请确认选择的是账号/配置 JSON 文件".into());
     }
-    let bytes =
-        std::fs::read(&path).map_err(|e| format!("读取文件失败: {e}"))?;
+    let bytes = std::fs::read(path).map_err(|e| format!("读取文件失败: {e}"))?;
     String::from_utf8(bytes).map_err(|_| "文件不是有效的 UTF-8 文本".into())
 }
 

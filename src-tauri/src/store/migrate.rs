@@ -567,9 +567,25 @@ fn import_api_keys(store: &Store, path: &Path) -> ImportStatus {
 }
 
 fn import_custom_models(store: &Store, path: &Path) -> ImportStatus {
+    use crate::api_server::custom_models as cm;
     match std::fs::read_to_string(path) {
-        Ok(text) => match serde_json::from_str::<crate::api_server::custom_models::CustomModelsFile>(&text) {
-            Ok(f) => wrap(docs::custom_models_save(store, &f)),
+        Ok(text) => match serde_json::from_str::<cm::CustomModelsFile>(&text) {
+            Ok(mut f) => {
+                // 审查 F1：旧版 JSON 迁移不得绕过 upsert 校验——构造文件可借此
+                // 注入任意上游地址（含本机/内网）并让网关把 api_key 送过去。
+                // 逐条按保存口径复检并归一化，不合规条目丢弃；全被丢弃视为损坏文件。
+                let total = f.models.len();
+                f.models.retain_mut(|m| {
+                    m.base_url = m.base_url.trim().trim_end_matches('/').to_string();
+                    cm::validate_base_url(&m.base_url).is_ok()
+                });
+                if total > 0 && f.models.is_empty() {
+                    return ImportStatus::Corrupt(
+                        "自定义模型地址均未通过安全校验（本机/内网地址已拒绝）".into(),
+                    );
+                }
+                wrap(docs::custom_models_save(store, &f))
+            }
             Err(e) => ImportStatus::Corrupt(e.to_string()),
         },
         Err(e) => ImportStatus::Error(e.to_string()),

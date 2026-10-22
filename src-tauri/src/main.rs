@@ -290,8 +290,8 @@ fn main() {
             commands::misc::task_unregister,
             commands::misc::proxy_logs_list,
             commands::misc::proxy_log_detail,
-            commands::misc::write_text_file,
-            commands::misc::read_text_file,
+            commands::misc::save_text_file_dialog,
+            commands::misc::read_text_file_dialog,
             // issue #46：前端「最小化到托盘」走此命令，hide 前记录最大化状态
             commands::misc::minimize_to_tray,
             commands::api_server::api_server_start,

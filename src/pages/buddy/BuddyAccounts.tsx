@@ -36,7 +36,6 @@ import { TagChips } from '../accounts/TagSelect';
 import { AccountTagsEditModal, TagsModal } from '../accounts/TagsModal';
 import { CreditsExpireBadge } from '../accounts/CreditsExpireBadge';
 import { listen } from '@tauri-apps/api/event';
-import { save } from '@tauri-apps/plugin-dialog';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
@@ -715,17 +714,16 @@ export default function BuddyAccounts() {
       const data = await withMinDelay(api.workbuddy.accountsExport(exportWithCreds), 1000);
       // 原生另存为对话框：用户可选保存位置，defaultPath 给出默认文件名
       //（对齐 Accounts.tsx 导出；不再走 WebView 伪下载——落盘位置不可控且不弹对话框）
-      const filePath = await save({
-        defaultPath: `workbuddy_accounts_${new Date().toISOString().slice(0, 10)}.json`,
-        filters: [{ name: 'JSON', extensions: ['json'] }],
-      });
-      if (!filePath) return;
-      await api.misc.writeTextFile(filePath, JSON.stringify(data, null, 2));
+      const savedPath = await api.misc.saveTextFileDialog(
+        `workbuddy_accounts_${new Date().toISOString().slice(0, 10)}.json`,
+        JSON.stringify(data, null, 2),
+      );
+      if (!savedPath) return;
       pushToast(
         'success',
         exportWithCreds
-          ? `账号池已导出（含凭证，文件等同密码请妥善保管）：${filePath}`
-          : `账号元数据已导出（凭证不导出）：${filePath}`,
+          ? `账号池已导出（含凭证，文件等同密码请妥善保管）：${savedPath}`
+          : `账号元数据已导出（凭证不导出）：${savedPath}`,
       );
       setExportOpen(false);
     } catch (err) {

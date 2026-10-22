@@ -435,9 +435,10 @@ export const api = {
       },
     }),
     proxyLogDetail: (id: string) => invoke<string>('proxy_log_detail', { id }),
-    writeTextFile: (path: string, content: string) =>
-      invoke('write_text_file', { path, content }),
-    readTextFile: (path: string) => invoke<string>('read_text_file', { path }),
+    // 文件读写只走 Rust 侧系统对话框（路径由用户显式选择，不接受前端传任意路径）
+    saveTextFileDialog: (defaultName: string, content: string) =>
+      invoke<string | null>('save_text_file_dialog', { defaultName, content }),
+    readTextFileDialog: () => invoke<string | null>('read_text_file_dialog'),
   },
   switchAccount: (
     userId: string,

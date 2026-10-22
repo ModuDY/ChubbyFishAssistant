@@ -2151,9 +2151,9 @@ pub async fn custom_model_test(
     if cm.name.is_empty() {
         return Err("请先填写模型名称".into());
     }
-    if !cm.base_url.starts_with("http://") && !cm.base_url.starts_with("https://") {
-        return Err("API 地址必须以 http:// 或 https:// 开头".into());
-    }
+    // 与保存同口径的安全校验（审查 F1）：测试请求同样会携带 api_key，
+    // 不能对任意/内网地址发起
+    crate::api_server::custom_models::validate_base_url(&cm.base_url)?;
     let handle = tokio::task::spawn_blocking(move || crate::api_server::custom_route::probe(&cm));
     match tokio::time::timeout(std::time::Duration::from_secs(30), handle).await {
         Ok(Ok(result)) => result,

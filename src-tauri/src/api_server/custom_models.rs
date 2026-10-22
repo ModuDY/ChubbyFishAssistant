@@ -113,8 +113,78 @@ pub fn save_list(data_dir: &Path, models: Vec<CustomModel>) -> Result<(), String
     r
 }
 
+/// base_url 安全校验（审查 F1）：保存、旧版迁移、请求三处共用同一口径。
+/// 仅 http/https；拒绝 userinfo（`user:pass@host` 会混淆真实主机并可夹带凭据）；
+/// 拒绝环回、私网、链路本地、未指定/组播地址。
+///
+/// 关键点：判定必须基于 `url::Url` **解析后的 host**（与 ureq 请求层同源），
+/// 不能再走字符串切分——`http://127.0.0.1\@example.com` 在 WHATWG 解析中
+/// 主机是 `127.0.0.1`（反斜杠等价于 `/`），字符串 `rsplit('@')` 却会误判为
+/// `example.com`，形成校验与请求层不一致的绕过。
+pub fn validate_base_url(base_url: &str) -> Result<(), String> {
+    let raw = base_url.trim();
+    let u = url::Url::parse(raw)
+        .map_err(|_| "API 地址格式无效（需为完整 URL，如 https://api.example.com）".to_string())?;
+    if u.scheme() != "http" && u.scheme() != "https" {
+        return Err("API 地址必须以 http:// 或 https:// 开头".into());
+    }
+    if !u.username().is_empty() || u.password().is_some() {
+        return Err("API 地址不允许包含用户名/密码，请把凭据填到 API Key".into());
+    }
+    let Some(host) = u.host() else {
+        return Err("API 地址缺少主机名".into());
+    };
+    if !host_is_public(&host) {
+        return Err("API 地址不允许指向本机/内网/链路本地地址".into());
+    }
+    Ok(())
+}
+
+/// 解析后 host 的公网判定：域名只拦 localhost/local/internal 后缀，
+/// IP 字面量按网段精确比对（IPv4 变体由 WHATWG 解析统一归一，天然覆盖
+/// `0x7f.1` / `2130706433` / `192.168.0.1.` 等写法）
+fn host_is_public(host: &url::Host<&str>) -> bool {
+    match host {
+        url::Host::Domain(d) => {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            !(d == "localhost"
+                || d.ends_with(".localhost")
+                || d.ends_with(".local")
+                || d.ends_with(".internal"))
+        }
+        url::Host::Ipv4(ip) => ipv4_is_public(*ip),
+        url::Host::Ipv6(ip) => ipv6_is_public(*ip),
+    }
+}
+
+fn ipv4_is_public(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    !(o[0] == 0
+        || o[0] == 10
+        || o[0] == 127
+        || (o[0] == 100 && (64..=127).contains(&o[1]))  // CGNAT 100.64/10
+        || (o[0] == 169 && o[1] == 254)                 // 链路本地
+        || (o[0] == 172 && (16..=31).contains(&o[1]))
+        || (o[0] == 192 && o[1] == 168)
+        || o[0] >= 224)                                  // 组播/保留/广播
+}
+
+fn ipv6_is_public(ip: std::net::Ipv6Addr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return false;
+    }
+    // IPv4-mapped / IPv4-compatible（::ffff:127.0.0.1）按 IPv4 网段规则
+    if let Some(v4) = ip.to_ipv4() {
+        return ipv4_is_public(v4);
+    }
+    let seg = ip.segments();
+    // fc00::/7 唯一本地；fe80::/10 链路本地
+    !((seg[0] & 0xfe00) == 0xfc00 || (seg[0] & 0xffc0) == 0xfe80)
+}
+
 /// upsert 单条：id 为空或不存在则新增（生成 cm-<12hex> id），存在则整条覆盖。
-/// 返回保存后的完整列表。校验：name / base_url 必填；name canonical 不得与其他条目重复。
+/// 返回保存后的完整列表。校验：name / base_url 必填并过安全校验；
+/// name canonical 不得与其他条目重复。
 pub fn upsert(data_dir: &Path, mut m: CustomModel) -> Result<Vec<CustomModel>, String> {
     m.name = m.name.trim().to_string();
     m.base_url = m.base_url.trim().trim_end_matches('/').to_string();
@@ -122,11 +192,10 @@ pub fn upsert(data_dir: &Path, mut m: CustomModel) -> Result<Vec<CustomModel>, S
     if m.name.is_empty() {
         return Err("模型名称不能为空".into());
     }
-    if m.base_url.is_empty()
-        || (!m.base_url.starts_with("http://") && !m.base_url.starts_with("https://"))
-    {
+    if m.base_url.is_empty() {
         return Err("API 地址必须以 http:// 或 https:// 开头".into());
     }
+    validate_base_url(&m.base_url)?;
     let mut list = load(data_dir);
     let canonical = canonical_id(&m.name);
     // 名称唯一性：canonical 冲突即拒绝（同一路由键两个上游无确定性语义）
@@ -288,5 +357,49 @@ mod tests {
         let f = Fixture::new();
         assert!(upsert(&f.0, CustomModel { name: "".to_string(), base_url: "https://a.com".into(), ..Default::default() }).is_err());
         assert!(upsert(&f.0, CustomModel { name: "x".into(), base_url: "ftp://a.com".into(), ..Default::default() }).is_err());
+    }
+
+    /// base_url 安全校验（审查 F1）：环回/私网/链路本地/userinfo 拒绝，公网放行
+    #[test]
+    fn t05_base_url_rejects_private_and_userinfo() {
+        for bad in [
+            "http://127.0.0.1:8080",
+            "http://localhost:11434",
+            "http://10.1.2.3",
+            "http://192.168.1.5/v1",
+            "http://172.16.0.1",
+            "http://169.254.169.254/latest/meta-data",
+            "http://100.64.0.1",
+            "http://0.0.0.0",
+            "http://[::1]:8080",
+            "http://[::ffff:127.0.0.1]",
+            "http://[fd00::1]",
+            "http://[fe80::1]",
+            "https://user:pass@api.example.com",
+            "ftp://api.example.com",
+            "http://foo.local",
+            "http://foo.internal",
+            // 解析差异绕过：WHATWG 把 '\' 当路径分隔，真实 host 是 127.0.0.1/localhost，
+            // 字符串 rsplit('@') 却会误读成 example.com（历史 url_allowed 的洞）
+            "http://127.0.0.1\\@example.com",
+            "http://localhost\\@example.com",
+            "http://2130706433",
+            "http://0x7f.1",
+            "http://192.168.0.1.",
+        ] {
+            assert!(validate_base_url(bad).is_err(), "应拒绝 {bad}");
+        }
+        assert!(validate_base_url("https://api.example.com").is_ok());
+        assert!(validate_base_url("https://api.example.com/v1").is_ok());
+        assert!(validate_base_url("https://api.example.com:443/v1").is_ok());
+        assert!(validate_base_url("http://8.8.8.8/v1").is_ok());
+        // 保存入口同口径：内网地址不能落库
+        let f = Fixture::new();
+        assert!(upsert(&f.0, CustomModel {
+            name: "x".into(),
+            base_url: "http://127.0.0.1:8080".into(),
+            ..Default::default()
+        })
+        .is_err());
     }
 }

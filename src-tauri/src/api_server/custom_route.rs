@@ -33,17 +33,49 @@ fn prep_body(body_vec: &[u8], cm: &CustomModel) -> Vec<u8> {
     v.to_string().into_bytes()
 }
 
-/// 发起自定义上游请求（Bearer 鉴权；连接 10s / 空闲读 300s，复用 WB agent）
+/// 自定义上游专用 Agent：超时口径与 wb_agent 一致，但**不跟随重定向**（审查 F1）——
+/// 首跳 host 已在保存/迁移/请求三处校验，若继续跟随 302，可被引导到内网地址，
+/// 且 Authorization 会随跳转带到异站。
+fn custom_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_read(std::time::Duration::from_secs(300))
+        .timeout_write(std::time::Duration::from_secs(30))
+        .timeout_connect(std::time::Duration::from_secs(10))
+        .max_idle_connections(20)
+        .max_idle_connections_per_host(20)
+        .redirects(0)
+        .build()
+}
+
+/// 发起自定义上游请求（Bearer 鉴权；连接 10s / 空闲读 300s）
 fn make_custom_request(cm: &CustomModel, body: &[u8]) -> Result<Box<dyn std::io::Read + Send>, (u16, String)> {
+    // 请求层兜底复检（审查 F1）：历史配置/迁移旁路写入的条目在此再次拦截，
+    // 校验不通过绝不发起请求、也不外送 api_key
+    if let Err(e) = custom_models::validate_base_url(&cm.base_url) {
+        return Err((400, e));
+    }
     let url = custom_models::chat_url(&cm.base_url);
-    let mut req = wb_upstream::wb_agent().post(&url);
+    let mut req = custom_agent().post(&url);
     req = req.set("content-type", "application/json");
     req = req.set("accept", "text/event-stream");
     if !cm.api_key.is_empty() {
         req = req.set("Authorization", &format!("Bearer {}", cm.api_key));
     }
     match req.send_bytes(body) {
-        Ok(r) => Ok(Box::new(r.into_reader())),
+        Ok(r) => {
+            // redirects(0) 时 ureq 对 3xx 返回 Ok(resp) 而非 Err：必须显式当失败处理，
+            // 否则空响应会被当成正常 SSE 流，客户端只看到「成功但无内容」
+            let code = r.status();
+            if (300..400).contains(&code) {
+                let loc = r.header("location").unwrap_or("").to_string();
+                // 对外统一按上游失败（502）返回，避免把 3xx 直接透传给客户端
+                return Err((
+                    502,
+                    format!("上游返回 status {code} 重定向（已拒绝跟随，防止跳转到内网或异站外送凭据）：{loc}"),
+                ));
+            }
+            Ok(Box::new(r.into_reader()))
+        }
         Err(ureq::Error::Status(code, resp)) => {
             let body_text = resp.into_string().unwrap_or_default();
             Err((code, body_text))

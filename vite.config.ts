@@ -19,4 +19,16 @@ export default defineConfig({
     target: 'esnext',
     sourcemap: false,
   },
+  test: {
+    // 技能目录里的 *.test.cjs 是 node:test 用例，不是 vitest 用例；
+    // 不排除会被 vitest 收集并报 "No test suite found"
+    exclude: [
+      '**/node_modules/**',
+      '**/dist/**',
+      '**/src-tauri/**',
+      '**/release/**',
+      '.agents/**',
+      '.trae/**',
+    ],
+  },
 });
