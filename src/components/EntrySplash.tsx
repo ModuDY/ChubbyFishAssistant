@@ -110,33 +110,56 @@ export default function EntrySplash({ ready }: { ready: boolean }) {
       }, LEAVE_MS);
     };
 
-    /**
-     * 本次开屏要展示多久。
-     * - 非视频形态：原来的 900ms。
-     * - 视频形态：**按视频时长**（提前一个淡出时长开始退场，让淡出与视频回到开头重叠，
-     *   否则会在最后一帧突然跳回第一帧），下限 900ms、上限 10s。
-     *   视频还没解出时长（readyState < 1）时退回 900ms，绝不干等一个未知值。
-     */
-    const targetMs = () => {
-      if (!overVideoRef.current) return MIN_VISIBLE_MS;
-      const v = document.querySelector<HTMLVideoElement>('video.wp-video');
-      const d = v?.duration;
-      if (!v || !d || !Number.isFinite(d) || v.readyState < 1) return MIN_VISIBLE_MS;
-      return Math.min(Math.max(d * 1000 - LEAVE_MS, MIN_VISIBLE_MS), MAX_VIDEO_BOOT_MS);
-    };
+    const videoEl = () =>
+      overVideoRef.current ? document.querySelector<HTMLVideoElement>('video.wp-video') : null;
 
+    /**
+     * 退场判定。
+     * - **视频形态：以"播到最后一帧"为准，不按墙钟。**
+     *   之前按"时长 − 淡出时长"提前开始淡出，结果是最后 0.6 秒主页面盖在还在播的视频上，
+     *   观感就是"没播完就进去了"。现在改为：**播到结尾先定住那一帧**，再淡出 ——
+     *   用户看到的是完整播完，交接点落在一张静止的尾帧上，而不是一帧被切掉。
+     * - 非视频形态：原来的 900ms。
+     * - 两种形态都有墙钟兜底，避免视频卡死/遮挡暂停时无限等待。
+     */
     const tick = () => {
       if (stopped) return;
       const elapsed = Date.now() - mountedAt.current;
+
       // 类型还没定（旧条目的 weKind 缺失 / 库还没扫完）：先别急着走
       if (undecidedRef.current && elapsed < PENDING_MAX_MS) {
         window.setTimeout(tick, 120);
         return;
       }
-      const target = targetMs();
-      // 未就绪时最多等 MAX_VISIBLE_MS：必须让用户看见「正在加载 / 初始化失败」
-      const hardCap = readyRef.current ? Math.max(target, MAX_VIDEO_BOOT_MS) : MAX_VISIBLE_MS;
-      if ((readyRef.current && elapsed >= target) || elapsed >= hardCap) {
+
+      const v = videoEl();
+      const dur = v && Number.isFinite(v.duration) ? v.duration : 0;
+
+      if (v && dur > 0) {
+        const atEnd = v.currentTime >= dur - 0.12;
+        if (atEnd) {
+          if (readyRef.current) {
+            // 定住尾帧再淡出：既保证"播完"，也避免淡出期间视频跳回第一帧穿帮
+            try {
+              v.pause();
+            } catch {
+              /* 忽略 */
+            }
+            finish();
+            return;
+          }
+          // 视频已播完但应用还没就绪：让它循环继续，等就绪（仍受兜底上限约束）
+        }
+        if (elapsed >= MAX_VIDEO_BOOT_MS) {
+          finish();
+          return;
+        }
+        window.setTimeout(tick, 120);
+        return;
+      }
+
+      // 非视频形态
+      if ((readyRef.current && elapsed >= MIN_VISIBLE_MS) || elapsed >= MAX_VISIBLE_MS) {
         finish();
         return;
       }
@@ -156,6 +179,14 @@ export default function EntrySplash({ ready }: { ready: boolean }) {
       window.removeEventListener('keydown', skip);
     };
   }, [enabled]);
+
+  // 退场时为了让用户看到完整尾帧，曾把壁纸视频暂停住；开屏彻底消失后必须恢复播放，
+  // 否则壁纸会停在最后一帧（看起来像"卡住了"）。
+  useEffect(() => {
+    if (phase !== 'gone') return;
+    const v = document.querySelector<HTMLVideoElement>('video.wp-video');
+    if (v && v.paused) void v.play().catch(() => {});
+  }, [phase]);
 
   if (phase === 'gone') return null;
 
